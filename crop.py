@@ -1,0 +1,556 @@
+"""Interactive ROI crop tool.
+
+Install:  pip install PySide6 Pillow
+Run:      python crop.py
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+from PIL import Image, ImageOps
+from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtGui import QBrush, QImage, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QGraphicsItem,
+    QGraphicsPixmapItem,
+    QGraphicsRectItem,
+    QGraphicsScene,
+    QGraphicsView,
+    QHBoxLayout,
+    QCheckBox,
+    QLabel,
+    QListWidget,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+IMAGE_FILTER = "Images (*.bmp *.jpg *.jpeg *.png *.tif *.tiff *.webp)"
+SUPPORTED_SUFFIXES = {".bmp", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
+
+
+@dataclass
+class ImageEntry:
+    path: Path
+    size: tuple[int, int]
+    rois: list[tuple[int, int, int, int]] | None = None
+
+    def __post_init__(self):
+        if self.rois is None:
+            self.rois = []
+
+
+def load_image(path: Path) -> Image.Image:
+    with Image.open(path) as image:
+        return ImageOps.exif_transpose(image).copy()
+
+
+def pixmap_from_pil(image: Image.Image) -> QPixmap:
+    rgba = image.convert("RGBA")
+    data = rgba.tobytes("raw", "RGBA")
+    qimage = QImage(data, rgba.width, rgba.height, QImage.Format.Format_RGBA8888).copy()
+    return QPixmap.fromImage(qimage)
+
+
+class RoiItem(QGraphicsRectItem):
+    """Movable rectangle with four resize handles."""
+
+    HANDLE_SIZE = 10.0
+
+    def __init__(self, rect: QRectF, bounds: QRectF, label: str, changed):
+        super().__init__(QRectF(0, 0, rect.width(), rect.height()))
+        self.setPos(rect.topLeft())
+        self.bounds = bounds
+        self.changed = changed
+        self.label = label
+        self.resize_corner: str | None = None
+        self.press_scene_pos = QPointF()
+        self.start_scene_rect = QRectF()
+        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
+        self.setAcceptHoverEvents(True)
+        self.setPen(QPen(Qt.GlobalColor.red, 2))
+        self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self.setZValue(1)
+
+    def scene_roi(self) -> QRectF:
+        return QRectF(self.pos(), self.rect().size()).normalized()
+
+    def _handles(self) -> dict[str, QRectF]:
+        half = self.HANDLE_SIZE / 2
+        r = self.rect()
+        return {
+            "tl": QRectF(r.left() - half, r.top() - half, self.HANDLE_SIZE, self.HANDLE_SIZE),
+            "tr": QRectF(r.right() - half, r.top() - half, self.HANDLE_SIZE, self.HANDLE_SIZE),
+            "bl": QRectF(r.left() - half, r.bottom() - half, self.HANDLE_SIZE, self.HANDLE_SIZE),
+            "br": QRectF(r.right() - half, r.bottom() - half, self.HANDLE_SIZE, self.HANDLE_SIZE),
+        }
+
+    def boundingRect(self) -> QRectF:
+        half = self.HANDLE_SIZE / 2 + 2
+        return self.rect().adjusted(-half, -half, half, half)
+
+    def shape(self) -> QPainterPath:
+        path = QPainterPath()
+        path.addRect(self.rect())
+        for handle in self._handles().values():
+            path.addRect(handle)
+        return path
+
+    def paint(self, painter: QPainter, option, widget=None):
+        painter.setPen(self.pen())
+        painter.setBrush(self.brush())
+        painter.drawRect(self.rect())
+        painter.setPen(QPen(Qt.GlobalColor.white, 1))
+        painter.setBrush(QBrush(Qt.GlobalColor.red))
+        for handle in self._handles().values():
+            painter.drawRect(handle)
+        painter.setPen(QPen(Qt.GlobalColor.yellow))
+        painter.drawText(self.rect().adjusted(5, 3, -3, -3), self.label)
+
+    def hoverMoveEvent(self, event):
+        corner = next((name for name, rect in self._handles().items() if rect.contains(event.pos())), None)
+        cursors = {
+            "tl": Qt.CursorShape.SizeFDiagCursor,
+            "br": Qt.CursorShape.SizeFDiagCursor,
+            "tr": Qt.CursorShape.SizeBDiagCursor,
+            "bl": Qt.CursorShape.SizeBDiagCursor,
+        }
+        self.setCursor(cursors.get(corner, Qt.CursorShape.SizeAllCursor))
+        super().hoverMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        self.resize_corner = next(
+            (name for name, rect in self._handles().items() if rect.contains(event.pos())), None
+        )
+        self.press_scene_pos = event.scenePos()
+        self.start_scene_rect = self.scene_roi()
+        if self.resize_corner:
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if not self.resize_corner:
+            super().mouseMoveEvent(event)
+            self._clamp_position()
+            self.changed(self.scene_roi())
+            return
+
+        delta = event.scenePos() - self.press_scene_pos
+        r = QRectF(self.start_scene_rect)
+        if "l" in self.resize_corner:
+            r.setLeft(r.left() + delta.x())
+        else:
+            r.setRight(r.right() + delta.x())
+        if "t" in self.resize_corner:
+            r.setTop(r.top() + delta.y())
+        else:
+            r.setBottom(r.bottom() + delta.y())
+        r = r.normalized().intersected(self.bounds)
+        if r.width() >= 1 and r.height() >= 1:
+            self.prepareGeometryChange()
+            self.setPos(r.topLeft())
+            self.setRect(0, 0, r.width(), r.height())
+            self.changed(r)
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        was_resizing = self.resize_corner is not None
+        self.resize_corner = None
+        self.changed(self.scene_roi())
+        if was_resizing:
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def _clamp_position(self):
+        r = self.scene_roi()
+        x = min(max(r.left(), self.bounds.left()), self.bounds.right() - r.width())
+        y = min(max(r.top(), self.bounds.top()), self.bounds.bottom() - r.height())
+        self.setPos(x, y)
+
+
+class ImageView(QGraphicsView):
+    def __init__(self, roi_created):
+        super().__init__()
+        self.roi_created = roi_created
+        self.image_bounds = QRectF()
+        self.drawing = False
+        self.start = QPointF()
+        self.draft: QGraphicsRectItem | None = None
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+
+    def mousePressEvent(self, event):
+        scene_pos = self.mapToScene(event.position().toPoint())
+        item = self.itemAt(event.position().toPoint())
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self.image_bounds.contains(scene_pos)
+            and not isinstance(item, RoiItem)
+        ):
+            self.drawing = True
+            self.start = scene_pos
+            self.draft = QGraphicsRectItem()
+            self.draft.setPen(QPen(Qt.GlobalColor.yellow, 2, Qt.PenStyle.DashLine))
+            self.scene().addItem(self.draft)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.drawing and self.draft:
+            end = self._bounded(self.mapToScene(event.position().toPoint()))
+            self.draft.setRect(QRectF(self.start, end).normalized())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self.drawing and self.draft:
+            rect = self.draft.rect().intersected(self.image_bounds)
+            self.scene().removeItem(self.draft)
+            self.draft = None
+            self.drawing = False
+            if rect.width() >= 1 and rect.height() >= 1:
+                self.roi_created(rect)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event):
+        factor = 1.2 if event.angleDelta().y() > 0 else 1 / 1.2
+        self.scale(factor, factor)
+
+    def _bounded(self, point: QPointF) -> QPointF:
+        return QPointF(
+            min(max(point.x(), self.image_bounds.left()), self.image_bounds.right()),
+            min(max(point.y(), self.image_bounds.top()), self.image_bounds.bottom()),
+        )
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("ROI Crop Tool")
+        self.resize(1200, 760)
+        self.entries: list[ImageEntry] = []
+        self.current_index = -1
+        self.roi_items: list[RoiItem] = []
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QHBoxLayout(central)
+
+        left = QVBoxLayout()
+        self.image_list = QListWidget()
+        self.image_list.currentRowChanged.connect(self.select_image)
+        left.addWidget(self.image_list, 1)
+        open_button = QPushButton("Open images...")
+        open_button.clicked.connect(self.open_images)
+        left.addWidget(open_button)
+        open_folder_button = QPushButton("Open folder...")
+        open_folder_button.clicked.connect(self.open_folder)
+        left.addWidget(open_folder_button)
+        clear_images_button = QPushButton("Clear all images")
+        clear_images_button.clicked.connect(self.clear_all_images)
+        left.addWidget(clear_images_button)
+        layout.addLayout(left, 1)
+
+        right = QVBoxLayout()
+        self.scene = QGraphicsScene()
+        self.view = ImageView(self.set_roi)
+        self.view.setScene(self.scene)
+        self.pixmap_item = QGraphicsPixmapItem()
+        self.scene.addItem(self.pixmap_item)
+        right.addWidget(self.view, 1)
+
+        controls = QHBoxLayout()
+        apply_all = QPushButton("Apply ROI to all")
+        apply_all.clicked.connect(self.apply_roi_to_all)
+        controls.addWidget(apply_all)
+        clear_rois = QPushButton("Clear ROIs on current")
+        clear_rois.clicked.connect(self.clear_rois)
+        controls.addWidget(clear_rois)
+        controls.addStretch()
+        crop_current = QPushButton("Crop current...")
+        crop_current.clicked.connect(lambda: self.choose_crop(False))
+        controls.addWidget(crop_current)
+        crop_all = QPushButton("Crop all...")
+        crop_all.clicked.connect(lambda: self.choose_crop(True))
+        controls.addWidget(crop_all)
+        right.addLayout(controls)
+
+        options = QHBoxLayout()
+        self.auto_number = QCheckBox("Auto-number cropped files (1_A, 1_B, ...)")
+        self.auto_number.setChecked(True)
+        options.addWidget(self.auto_number)
+        options.addStretch()
+        right.addLayout(options)
+
+        self.status = QLabel("Open images or a folder, then drag on an image to create an ROI.")
+        right.addWidget(self.status)
+        layout.addLayout(right, 4)
+
+    def open_images(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Open images", "", IMAGE_FILTER)
+        self.add_paths([Path(path) for path in files])
+
+    def open_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Open image folder")
+        if folder:
+            paths = sorted(path for path in Path(folder).iterdir() if path.suffix.lower() in SUPPORTED_SUFFIXES)
+            self.add_paths(paths)
+
+    def add_paths(self, paths: list[Path]):
+        known = {entry.path.resolve() for entry in self.entries}
+        failures: list[str] = []
+        for path in paths:
+            if path.resolve() in known:
+                continue
+            try:
+                with Image.open(path) as image:
+                    size = ImageOps.exif_transpose(image).size
+                self.entries.append(ImageEntry(path, size))
+                self.image_list.addItem(path.name)
+                known.add(path.resolve())
+            except Exception as error:
+                failures.append(f"{path.name}: {error}")
+        if self.current_index < 0 and self.entries:
+            self.image_list.setCurrentRow(0)
+        if failures:
+            QMessageBox.warning(self, "Some images could not be opened", "\n".join(failures))
+
+    def select_image(self, index: int):
+        if not 0 <= index < len(self.entries):
+            return
+        self.current_index = index
+        try:
+            image = load_image(self.entries[index].path)
+        except Exception as error:
+            QMessageBox.critical(self, "Open failed", str(error))
+            return
+        self.remove_roi_items()
+        pixmap = pixmap_from_pil(image)
+        self.pixmap_item.setPixmap(pixmap)
+        self.view.image_bounds = QRectF(0, 0, pixmap.width(), pixmap.height())
+        self.scene.setSceneRect(self.view.image_bounds)
+        for roi_index, roi in enumerate(self.entries[index].rois or []):
+            self.create_roi_item(QRectF(*roi), roi_index)
+        self.view.resetTransform()
+        self.view.fitInView(self.view.image_bounds, Qt.AspectRatioMode.KeepAspectRatio)
+        self.update_status()
+
+    def set_roi(self, rect: QRectF):
+        if self.current_index < 0:
+            return
+        roi_index = len(self.entries[self.current_index].rois or [])
+        self.store_roi(roi_index, rect)
+        self.create_roi_item(rect, roi_index)
+
+    def create_roi_item(self, rect: QRectF, roi_index: int):
+        item = RoiItem(
+            rect,
+            self.view.image_bounds,
+            self.roi_label(roi_index),
+            lambda changed_rect, index=roi_index: self.store_roi(index, changed_rect),
+        )
+        self.roi_items.append(item)
+        self.scene.addItem(item)
+
+    def remove_roi_items(self):
+        for item in self.roi_items:
+            self.scene.removeItem(item)
+        self.roi_items.clear()
+
+    def store_roi(self, roi_index: int, rect: QRectF):
+        if self.current_index < 0:
+            return
+        r = rect.normalized().intersected(self.view.image_bounds)
+        x1, y1 = round(r.left()), round(r.top())
+        x2, y2 = round(r.right()), round(r.bottom())
+        if x2 > x1 and y2 > y1:
+            rois = self.entries[self.current_index].rois
+            assert rois is not None
+            value = (x1, y1, x2 - x1, y2 - y1)
+            if roi_index == len(rois):
+                rois.append(value)
+            elif 0 <= roi_index < len(rois):
+                rois[roi_index] = value
+        self.update_status()
+
+    def clear_rois(self):
+        if self.current_index >= 0:
+            self.entries[self.current_index].rois = []
+            self.remove_roi_items()
+            self.update_status()
+
+    def clear_all_images(self):
+        if not self.entries:
+            return
+        answer = QMessageBox.question(self, "Clear all images?", "Remove every image from this batch?")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.remove_roi_items()
+        self.entries.clear()
+        self.image_list.clear()
+        self.current_index = -1
+        self.pixmap_item.setPixmap(QPixmap())
+        self.view.image_bounds = QRectF()
+        self.scene.setSceneRect(QRectF())
+        self.update_status()
+
+    def apply_roi_to_all(self):
+        rois = self.current_rois()
+        if not rois:
+            self.no_roi_message()
+            return
+        incompatible = [
+            entry.path.name
+            for entry in self.entries
+            if any(x + width > entry.size[0] or y + height > entry.size[1] for x, y, width, height in rois)
+        ]
+        if incompatible:
+            QMessageBox.warning(
+                self,
+                "ROI does not fit all images",
+                "The ROI was not applied. It falls outside:\n" + "\n".join(incompatible[:12]),
+            )
+            return
+        for entry in self.entries:
+            entry.rois = list(rois)
+        self.update_status(f"Applied {len(rois)} ROI(s) to {len(self.entries)} images.")
+
+    def choose_crop(self, all_images: bool):
+        targets = self.entries if all_images else ([self.entries[self.current_index]] if self.current_index >= 0 else [])
+        if not targets:
+            QMessageBox.information(self, "No images", "Open at least one image first.")
+            return
+        missing = [entry.path.name for entry in targets if not entry.rois]
+        if missing:
+            QMessageBox.warning(self, "Missing ROI", "Set an ROI for:\n" + "\n".join(missing[:12]))
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Crop destination")
+        box.setText(f"Where should the cropped {'images' if all_images else 'image'} be saved?")
+        in_place = box.addButton("Crop in place", QMessageBox.ButtonRole.DestructiveRole)
+        another_folder = box.addButton("Another folder...", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked == in_place:
+            answer = QMessageBox.question(
+                self,
+                "Write crops beside originals?",
+                "Single, non-numbered crops replace their originals. Multiple or auto-numbered crops are written beside them and may replace files with the same output names. Continue?",
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self.crop_entries(targets, None, self.auto_number.isChecked())
+        elif clicked == another_folder:
+            folder = QFileDialog.getExistingDirectory(self, "Select output folder")
+            if folder:
+                self.crop_entries(targets, Path(folder), self.auto_number.isChecked())
+
+    def crop_entries(self, entries: list[ImageEntry], output_folder: Path | None, auto_number: bool):
+        failures: list[str] = []
+        completed = 0
+        for entry in entries:
+            try:
+                image_index = self.entries.index(entry) + 1
+                image = load_image(entry.path)
+                rois = entry.rois or []
+                base_folder = output_folder or entry.path.parent
+                for roi_index, (x, y, width, height) in enumerate(rois):
+                    cropped = image.crop((x, y, x + width, y + height))
+                    destination = self.crop_destination(
+                        entry, base_folder, image_index, roi_index, len(rois), auto_number, output_folder is None
+                    )
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    temp = destination.with_name(f".{destination.stem}.crop-temp{destination.suffix}")
+                    save_kwargs = {}
+                    if image.info.get("icc_profile"):
+                        save_kwargs["icc_profile"] = image.info["icc_profile"]
+                    cropped.save(temp, **save_kwargs)
+                    os.replace(temp, destination)
+                    completed += 1
+                if output_folder is None and len(rois) == 1 and not auto_number:
+                    entry.size = (rois[0][2], rois[0][3])
+                    entry.rois = [(0, 0, *entry.size)]
+            except Exception as error:
+                failures.append(f"{entry.path.name}: {error}")
+        if output_folder is None and self.current_index >= 0:
+            self.select_image(self.current_index)
+        message = f"Created {completed} cropped file(s)."
+        if output_folder:
+            message += f"\nSaved to: {output_folder}"
+        if failures:
+            QMessageBox.warning(self, "Crop completed with errors", message + "\n\n" + "\n".join(failures))
+        else:
+            QMessageBox.information(self, "Crop complete", message)
+
+    def crop_destination(
+        self,
+        entry: ImageEntry,
+        folder: Path,
+        image_index: int,
+        roi_index: int,
+        roi_count: int,
+        auto_number: bool,
+        in_place: bool,
+    ) -> Path:
+        suffix = entry.path.suffix
+        roi_suffix = f"_{self.roi_label(roi_index)}" if roi_count > 1 else ""
+        if auto_number:
+            return folder / f"{image_index}{roi_suffix}{suffix}"
+        if in_place and roi_count == 1:
+            return entry.path
+        return folder / f"{entry.path.stem}{roi_suffix}{suffix}"
+
+    def current_rois(self) -> list[tuple[int, int, int, int]]:
+        if self.current_index < 0:
+            return []
+        return self.entries[self.current_index].rois or []
+
+    @staticmethod
+    def roi_label(index: int) -> str:
+        label = ""
+        value = index + 1
+        while value:
+            value, remainder = divmod(value - 1, 26)
+            label = chr(ord("A") + remainder) + label
+        return label
+
+    def no_roi_message(self):
+        QMessageBox.information(self, "No ROI", "Drag on the current image to create an ROI first.")
+
+    def update_status(self, message: str | None = None):
+        if message:
+            self.status.setText(message)
+            return
+        if self.current_index < 0:
+            self.status.setText("Open images or a folder, then drag on an image to create an ROI.")
+            return
+        rois = self.current_rois()
+        suffix = "No ROI — drag to create one." if not rois else f"{len(rois)} ROI(s): " + ", ".join(
+            f"{self.roi_label(i)}={roi[2]}x{roi[3]} at ({roi[0]}, {roi[1]})" for i, roi in enumerate(rois)
+        )
+        self.status.setText(f"{self.current_index + 1} / {len(self.entries)} — {self.entries[self.current_index].path.name} — {suffix}")
+
+
+def main():
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
