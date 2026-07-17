@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QHBoxLayout,
     QCheckBox,
+    QDoubleSpinBox,
     QLabel,
     QListWidget,
     QMainWindow,
@@ -35,6 +36,38 @@ from PySide6.QtWidgets import (
 
 IMAGE_FILTER = "Images (*.bmp *.jpg *.jpeg *.png *.tif *.tiff *.webp)"
 SUPPORTED_SUFFIXES = {".bmp", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
+ROI_ASPECT_RATIO = 3 / 4  # width / height
+
+
+def aspect_ratio_rect(
+    anchor: QPointF,
+    pointer: QPointF,
+    bounds: QRectF,
+    horizontal_direction: int | None = None,
+    vertical_direction: int | None = None,
+    aspect_ratio: float = ROI_ASPECT_RATIO,
+) -> QRectF:
+    """Build a bounds-limited ROI anchored at one corner with a 3:4 ratio."""
+    dx = pointer.x() - anchor.x()
+    dy = pointer.y() - anchor.y()
+    horizontal_direction = horizontal_direction or (1 if dx >= 0 else -1)
+    vertical_direction = vertical_direction or (1 if dy >= 0 else -1)
+
+    width = abs(dx)
+    height = abs(dy)
+    if width / aspect_ratio >= height:
+        height = width / aspect_ratio
+    else:
+        width = height * aspect_ratio
+
+    max_width = bounds.right() - anchor.x() if horizontal_direction > 0 else anchor.x() - bounds.left()
+    max_height = bounds.bottom() - anchor.y() if vertical_direction > 0 else anchor.y() - bounds.top()
+    scale = min(1.0, max_width / width if width else 1.0, max_height / height if height else 1.0)
+    opposite = QPointF(
+        anchor.x() + horizontal_direction * width * scale,
+        anchor.y() + vertical_direction * height * scale,
+    )
+    return QRectF(anchor, opposite).normalized()
 
 
 @dataclass
@@ -65,12 +98,13 @@ class RoiItem(QGraphicsRectItem):
 
     HANDLE_SIZE = 10.0
 
-    def __init__(self, rect: QRectF, bounds: QRectF, label: str, changed):
+    def __init__(self, rect: QRectF, bounds: QRectF, label: str, changed, aspect_ratio=ROI_ASPECT_RATIO):
         super().__init__(QRectF(0, 0, rect.width(), rect.height()))
         self.setPos(rect.topLeft())
         self.bounds = bounds
         self.changed = changed
         self.label = label
+        self.aspect_ratio = aspect_ratio
         self.resize_corner: str | None = None
         self.press_scene_pos = QPointF()
         self.start_scene_rect = QRectF()
@@ -144,17 +178,27 @@ class RoiItem(QGraphicsRectItem):
             self.changed(self.scene_roi())
             return
 
-        delta = event.scenePos() - self.press_scene_pos
-        r = QRectF(self.start_scene_rect)
-        if "l" in self.resize_corner:
-            r.setLeft(r.left() + delta.x())
-        else:
-            r.setRight(r.right() + delta.x())
-        if "t" in self.resize_corner:
-            r.setTop(r.top() + delta.y())
-        else:
-            r.setBottom(r.bottom() + delta.y())
-        r = r.normalized().intersected(self.bounds)
+        anchors = {
+            "tl": self.start_scene_rect.bottomRight(),
+            "tr": self.start_scene_rect.bottomLeft(),
+            "bl": self.start_scene_rect.topRight(),
+            "br": self.start_scene_rect.topLeft(),
+        }
+        directions = {
+            "tl": (-1, -1),
+            "tr": (1, -1),
+            "bl": (-1, 1),
+            "br": (1, 1),
+        }
+        horizontal_direction, vertical_direction = directions[self.resize_corner]
+        r = aspect_ratio_rect(
+            anchors[self.resize_corner],
+            event.scenePos(),
+            self.bounds,
+            horizontal_direction,
+            vertical_direction,
+            self.aspect_ratio,
+        )
         if r.width() >= 1 and r.height() >= 1:
             self.prepareGeometryChange()
             self.setPos(r.topLeft())
@@ -183,6 +227,7 @@ class ImageView(QGraphicsView):
         super().__init__()
         self.roi_created = roi_created
         self.image_bounds = QRectF()
+        self.aspect_ratio = ROI_ASPECT_RATIO
         self.drawing = False
         self.start = QPointF()
         self.draft: QGraphicsRectItem | None = None
@@ -209,7 +254,14 @@ class ImageView(QGraphicsView):
     def mouseMoveEvent(self, event):
         if self.drawing and self.draft:
             end = self._bounded(self.mapToScene(event.position().toPoint()))
-            self.draft.setRect(QRectF(self.start, end).normalized())
+            self.draft.setRect(
+                aspect_ratio_rect(
+                    self.start,
+                    end,
+                    self.image_bounds,
+                    aspect_ratio=self.aspect_ratio,
+                )
+            )
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -290,6 +342,14 @@ class MainWindow(QMainWindow):
         right.addLayout(controls)
 
         options = QHBoxLayout()
+        options.addWidget(QLabel("ROI width / height:"))
+        self.aspect_ratio = QDoubleSpinBox()
+        self.aspect_ratio.setRange(0.25, 4.0)
+        self.aspect_ratio.setDecimals(3)
+        self.aspect_ratio.setSingleStep(0.05)
+        self.aspect_ratio.setValue(ROI_ASPECT_RATIO)
+        self.aspect_ratio.valueChanged.connect(self.set_aspect_ratio)
+        options.addWidget(self.aspect_ratio)
         self.auto_number = QCheckBox("Auto-number cropped files (1_A, 1_B, ...)")
         self.auto_number.setChecked(True)
         options.addWidget(self.auto_number)
@@ -362,9 +422,15 @@ class MainWindow(QMainWindow):
             self.view.image_bounds,
             self.roi_label(roi_index),
             lambda changed_rect, index=roi_index: self.store_roi(index, changed_rect),
+            self.view.aspect_ratio,
         )
         self.roi_items.append(item)
         self.scene.addItem(item)
+
+    def set_aspect_ratio(self, value: float):
+        self.view.aspect_ratio = value
+        for item in self.roi_items:
+            item.aspect_ratio = value
 
     def remove_roi_items(self):
         for item in self.roi_items:

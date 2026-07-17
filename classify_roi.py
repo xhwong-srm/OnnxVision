@@ -17,6 +17,7 @@ from PySide6.QtCore import QRectF, Qt
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QDoubleSpinBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -79,6 +80,14 @@ class ClassificationWindow(QMainWindow):
         right.addWidget(self.view, 1)
 
         roi_controls = QHBoxLayout()
+        roi_controls.addWidget(QLabel("ROI width / height:"))
+        self.aspect_ratio = QDoubleSpinBox()
+        self.aspect_ratio.setRange(0.25, 4.0)
+        self.aspect_ratio.setDecimals(3)
+        self.aspect_ratio.setSingleStep(0.05)
+        self.aspect_ratio.setValue(0.75)
+        self.aspect_ratio.valueChanged.connect(self.set_aspect_ratio)
+        roi_controls.addWidget(self.aspect_ratio)
         apply_all = QPushButton("Apply ROIs to all")
         apply_all.clicked.connect(self.apply_roi_to_all)
         roi_controls.addWidget(apply_all)
@@ -171,9 +180,15 @@ class ClassificationWindow(QMainWindow):
             self.view.image_bounds,
             self.result_text(roi_index),
             lambda changed, index=roi_index: self.store_roi(index, changed),
+            self.view.aspect_ratio,
         )
         self.roi_items.append(item)
         self.scene.addItem(item)
+
+    def set_aspect_ratio(self, value: float):
+        self.view.aspect_ratio = value
+        for item in self.roi_items:
+            item.aspect_ratio = value
 
     def store_roi(self, roi_index: int, rect: QRectF):
         if self.current_index < 0:
