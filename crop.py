@@ -11,6 +11,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import cv2
+import numpy as np
 from PIL import Image, ImageOps
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QBrush, QImage, QPainter, QPainterPath, QPen, QPixmap
@@ -75,6 +77,8 @@ class ImageEntry:
     path: Path
     size: tuple[int, int]
     rois: list[tuple[int, int, int, int]] | None = None
+    pattern_rect: tuple[int, int, int, int] | None = None
+    pattern_score: float | None = None
 
     def __post_init__(self):
         if self.rois is None:
@@ -228,6 +232,7 @@ class ImageView(QGraphicsView):
         self.roi_created = roi_created
         self.image_bounds = QRectF()
         self.aspect_ratio = ROI_ASPECT_RATIO
+        self.constrain_aspect_ratio = True
         self.drawing = False
         self.start = QPointF()
         self.draft: QGraphicsRectItem | None = None
@@ -254,14 +259,15 @@ class ImageView(QGraphicsView):
     def mouseMoveEvent(self, event):
         if self.drawing and self.draft:
             end = self._bounded(self.mapToScene(event.position().toPoint()))
-            self.draft.setRect(
-                aspect_ratio_rect(
+            rect = QRectF(self.start, end).normalized()
+            if self.constrain_aspect_ratio:
+                rect = aspect_ratio_rect(
                     self.start,
                     end,
                     self.image_bounds,
                     aspect_ratio=self.aspect_ratio,
                 )
-            )
+            self.draft.setRect(rect)
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -297,6 +303,10 @@ class MainWindow(QMainWindow):
         self.entries: list[ImageEntry] = []
         self.current_index = -1
         self.roi_items: list[RoiItem] = []
+        self.pattern_item: QGraphicsRectItem | None = None
+        self.pattern_template: np.ndarray | None = None
+        self.pattern_reference_path: Path | None = None
+        self.drawing_pattern = False
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -326,6 +336,12 @@ class MainWindow(QMainWindow):
         right.addWidget(self.view, 1)
 
         controls = QHBoxLayout()
+        learn_pattern = QPushButton("Draw/Learn pattern")
+        learn_pattern.clicked.connect(self.begin_pattern)
+        controls.addWidget(learn_pattern)
+        clear_pattern = QPushButton("Clear pattern")
+        clear_pattern.clicked.connect(self.clear_pattern)
+        controls.addWidget(clear_pattern)
         apply_all = QPushButton("Apply ROI to all")
         apply_all.clicked.connect(self.apply_roi_to_all)
         controls.addWidget(apply_all)
@@ -350,6 +366,13 @@ class MainWindow(QMainWindow):
         self.aspect_ratio.setValue(ROI_ASPECT_RATIO)
         self.aspect_ratio.valueChanged.connect(self.set_aspect_ratio)
         options.addWidget(self.aspect_ratio)
+        options.addWidget(QLabel("Pattern threshold:"))
+        self.pattern_threshold = QDoubleSpinBox()
+        self.pattern_threshold.setRange(0.0, 1.0)
+        self.pattern_threshold.setDecimals(2)
+        self.pattern_threshold.setSingleStep(0.05)
+        self.pattern_threshold.setValue(0.75)
+        options.addWidget(self.pattern_threshold)
         self.auto_number = QCheckBox("Auto-number cropped files (1_A, 1_B, ...)")
         self.auto_number.setChecked(True)
         options.addWidget(self.auto_number)
@@ -405,12 +428,16 @@ class MainWindow(QMainWindow):
         self.scene.setSceneRect(self.view.image_bounds)
         for roi_index, roi in enumerate(self.entries[index].rois or []):
             self.create_roi_item(QRectF(*roi), roi_index)
+        self.show_pattern(self.entries[index])
         self.view.resetTransform()
         self.view.fitInView(self.view.image_bounds, Qt.AspectRatioMode.KeepAspectRatio)
         self.update_status()
 
     def set_roi(self, rect: QRectF):
         if self.current_index < 0:
+            return
+        if self.drawing_pattern:
+            self.learn_pattern(rect)
             return
         roi_index = len(self.entries[self.current_index].rois or [])
         self.store_roi(roi_index, rect)
@@ -436,6 +463,58 @@ class MainWindow(QMainWindow):
         for item in self.roi_items:
             self.scene.removeItem(item)
         self.roi_items.clear()
+        if self.pattern_item is not None:
+            self.scene.removeItem(self.pattern_item)
+            self.pattern_item = None
+
+    def begin_pattern(self):
+        if self.current_index < 0:
+            QMessageBox.information(self, "No image", "Open and select a reference image first.")
+            return
+        self.drawing_pattern = True
+        self.view.constrain_aspect_ratio = False
+        self.status.setText("Draw a distinctive pattern on the reference image.")
+
+    def learn_pattern(self, rect: QRectF):
+        self.drawing_pattern = False
+        self.view.constrain_aspect_ratio = True
+        r = rect.normalized().intersected(self.view.image_bounds)
+        x1, y1, x2, y2 = round(r.left()), round(r.top()), round(r.right()), round(r.bottom())
+        if x2 <= x1 or y2 <= y1:
+            return
+        entry = self.entries[self.current_index]
+        image = load_image(entry.path).convert("L")
+        self.pattern_template = np.asarray(image.crop((x1, y1, x2, y2))).copy()
+        self.pattern_reference_path = entry.path.resolve()
+        entry.pattern_rect = (x1, y1, x2 - x1, y2 - y1)
+        entry.pattern_score = 1.0
+        self.show_pattern(entry)
+        self.update_status("Pattern learned. Apply ROI to all will align each image before placing ROIs.")
+
+    def clear_pattern(self):
+        self.pattern_template = None
+        self.pattern_reference_path = None
+        self.drawing_pattern = False
+        self.view.constrain_aspect_ratio = True
+        for entry in self.entries:
+            entry.pattern_rect = None
+            entry.pattern_score = None
+        if self.pattern_item is not None:
+            self.scene.removeItem(self.pattern_item)
+            self.pattern_item = None
+        self.update_status("Pattern cleared; Apply ROI to all will copy absolute ROI positions.")
+
+    def show_pattern(self, entry: ImageEntry):
+        if self.pattern_item is not None:
+            self.scene.removeItem(self.pattern_item)
+            self.pattern_item = None
+        if entry.pattern_rect is None:
+            return
+        self.pattern_item = QGraphicsRectItem(QRectF(*entry.pattern_rect))
+        self.pattern_item.setPen(QPen(Qt.GlobalColor.cyan, 3))
+        self.pattern_item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self.pattern_item.setZValue(2)
+        self.scene.addItem(self.pattern_item)
 
     def store_roi(self, roi_index: int, rect: QRectF):
         if self.current_index < 0:
@@ -467,6 +546,10 @@ class MainWindow(QMainWindow):
             return
         self.remove_roi_items()
         self.entries.clear()
+        self.pattern_template = None
+        self.pattern_reference_path = None
+        self.drawing_pattern = False
+        self.view.constrain_aspect_ratio = True
         self.image_list.clear()
         self.current_index = -1
         self.pixmap_item.setPixmap(QPixmap())
@@ -475,6 +558,20 @@ class MainWindow(QMainWindow):
         self.update_status()
 
     def apply_roi_to_all(self):
+        if self.pattern_template is not None and self.pattern_reference_path is not None:
+            reference = next(
+                (entry for entry in self.entries if entry.path.resolve() == self.pattern_reference_path),
+                None,
+            )
+            if reference is None or not reference.rois:
+                QMessageBox.information(
+                    self,
+                    "Reference ROI required",
+                    "Draw at least one inspection ROI on the image where the pattern was learned.",
+                )
+                return
+            self.apply_pattern_aligned_rois(reference, list(reference.rois))
+            return
         rois = self.current_rois()
         if not rois:
             self.no_roi_message()
@@ -494,6 +591,54 @@ class MainWindow(QMainWindow):
         for entry in self.entries:
             entry.rois = list(rois)
         self.update_status(f"Applied {len(rois)} ROI(s) to {len(self.entries)} images.")
+
+    def apply_pattern_aligned_rois(
+        self,
+        reference: ImageEntry,
+        rois: list[tuple[int, int, int, int]],
+    ):
+        if reference.pattern_rect is None or self.pattern_template is None:
+            return
+        reference_x, reference_y, template_width, template_height = reference.pattern_rect
+        threshold = self.pattern_threshold.value()
+        failures: list[str] = []
+        applied = 0
+        skipped_rois = 0
+
+        for entry in self.entries:
+            try:
+                image = np.asarray(load_image(entry.path).convert("L"))
+                if image.shape[0] < template_height or image.shape[1] < template_width:
+                    raise ValueError("image is smaller than the learned pattern")
+                result = cv2.matchTemplate(image, self.pattern_template, cv2.TM_CCOEFF_NORMED)
+                _, score, _, match = cv2.minMaxLoc(result)
+                if not np.isfinite(score) or score < threshold:
+                    raise ValueError(f"match {score:.2f} is below threshold {threshold:.2f}")
+                dx, dy = match[0] - reference_x, match[1] - reference_y
+                translated = [(x + dx, y + dy, width, height) for x, y, width, height in rois]
+                valid_rois = [
+                    (x, y, width, height)
+                    for x, y, width, height in translated
+                    if x >= 0
+                    and y >= 0
+                    and x + width <= entry.size[0]
+                    and y + height <= entry.size[1]
+                ]
+                skipped_rois += len(translated) - len(valid_rois)
+                entry.rois = valid_rois
+                entry.pattern_rect = (match[0], match[1], template_width, template_height)
+                entry.pattern_score = score
+                applied += 1
+            except Exception as error:
+                failures.append(f"{entry.path.name}: {error}")
+
+        self.select_image(self.current_index)
+        message = f"Pattern-aligned ROI(s) on {applied} of {len(self.entries)} images."
+        if skipped_rois:
+            message += f" Skipped {skipped_rois} out-of-bounds ROI(s)."
+        self.update_status(message)
+        if failures:
+            QMessageBox.warning(self, "Some pattern matches failed", message + "\n\n" + "\n".join(failures[:12]))
 
     def choose_crop(self, all_images: bool):
         targets = self.entries if all_images else ([self.entries[self.current_index]] if self.current_index >= 0 else [])
