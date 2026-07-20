@@ -10,10 +10,13 @@ import sys
 from argparse import ArgumentParser
 from pathlib import Path
 
+import cv2
+import numpy as np
 import torch
 import torchvision.transforms as transforms
 from PIL import Image
 from PySide6.QtCore import QRectF, Qt
+from PySide6.QtGui import QBrush, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -33,11 +36,11 @@ from crop import (
     ImageEntry,
     ImageView,
     RoiItem,
+    auto_populated_rois,
     load_image,
     pixmap_from_pil,
 )
-from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QListWidget
+from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsScene, QListWidget
 
 
 class ClassificationWindow(QMainWindow):
@@ -48,6 +51,10 @@ class ClassificationWindow(QMainWindow):
         self.entries: list[ImageEntry] = []
         self.current_index = -1
         self.roi_items: list[RoiItem] = []
+        self.pattern_item: QGraphicsRectItem | None = None
+        self.pattern_template: np.ndarray | None = None
+        self.pattern_reference_path: Path | None = None
+        self.drawing_pattern = False
         self.results: dict[tuple[Path, int], tuple[str, float]] = {}
         self.model_path = initial_model
         self.model: YOLO | None = None
@@ -80,22 +87,52 @@ class ClassificationWindow(QMainWindow):
         right.addWidget(self.view, 1)
 
         roi_controls = QHBoxLayout()
-        roi_controls.addWidget(QLabel("ROI width / height:"))
+        learn_pattern = QPushButton("Draw/Learn pattern")
+        learn_pattern.clicked.connect(self.begin_pattern)
+        roi_controls.addWidget(learn_pattern)
+        clear_pattern = QPushButton("Clear pattern")
+        clear_pattern.clicked.connect(self.clear_pattern)
+        roi_controls.addWidget(clear_pattern)
+        apply_all = QPushButton("Apply ROIs to all")
+        apply_all.clicked.connect(self.apply_roi_to_all)
+        roi_controls.addWidget(apply_all)
+        populate_current = QPushButton("Auto-populate current")
+        populate_current.clicked.connect(self.auto_populate_current)
+        roi_controls.addWidget(populate_current)
+        populate_all = QPushButton("Auto-populate all")
+        populate_all.clicked.connect(self.auto_populate_all)
+        roi_controls.addWidget(populate_all)
+        clear_rois = QPushButton("Clear ROIs on current")
+        clear_rois.clicked.connect(self.clear_rois)
+        roi_controls.addWidget(clear_rois)
+        roi_controls.addStretch()
+        right.addLayout(roi_controls)
+
+        roi_options = QHBoxLayout()
+        roi_options.addWidget(QLabel("ROI width / height:"))
         self.aspect_ratio = QDoubleSpinBox()
         self.aspect_ratio.setRange(0.25, 4.0)
         self.aspect_ratio.setDecimals(3)
         self.aspect_ratio.setSingleStep(0.05)
         self.aspect_ratio.setValue(0.75)
         self.aspect_ratio.valueChanged.connect(self.set_aspect_ratio)
-        roi_controls.addWidget(self.aspect_ratio)
-        apply_all = QPushButton("Apply ROIs to all")
-        apply_all.clicked.connect(self.apply_roi_to_all)
-        roi_controls.addWidget(apply_all)
-        clear_rois = QPushButton("Clear ROIs on current")
-        clear_rois.clicked.connect(self.clear_rois)
-        roi_controls.addWidget(clear_rois)
-        roi_controls.addStretch()
-        right.addLayout(roi_controls)
+        roi_options.addWidget(self.aspect_ratio)
+        roi_options.addWidget(QLabel("Pattern threshold:"))
+        self.pattern_threshold = QDoubleSpinBox()
+        self.pattern_threshold.setRange(0.0, 1.0)
+        self.pattern_threshold.setDecimals(2)
+        self.pattern_threshold.setSingleStep(0.05)
+        self.pattern_threshold.setValue(0.75)
+        roi_options.addWidget(self.pattern_threshold)
+        roi_options.addWidget(QLabel("Auto size variation (+/- %):"))
+        self.size_variation = QDoubleSpinBox()
+        self.size_variation.setRange(0.0, 95.0)
+        self.size_variation.setDecimals(1)
+        self.size_variation.setSingleStep(1.0)
+        self.size_variation.setValue(0.0)
+        roi_options.addWidget(self.size_variation)
+        roi_options.addStretch()
+        right.addLayout(roi_options)
 
         model_controls = QHBoxLayout()
         choose_model = QPushButton("Choose trained model...")
@@ -163,12 +200,16 @@ class ClassificationWindow(QMainWindow):
         self.scene.setSceneRect(self.view.image_bounds)
         for roi_index, roi in enumerate(self.entries[index].rois or []):
             self.create_roi_item(QRectF(*roi), roi_index)
+        self.show_pattern(self.entries[index])
         self.view.resetTransform()
         self.view.fitInView(self.view.image_bounds, Qt.AspectRatioMode.KeepAspectRatio)
         self.update_status()
 
     def set_roi(self, rect: QRectF):
         if self.current_index < 0:
+            return
+        if self.drawing_pattern:
+            self.learn_pattern(rect)
             return
         index = len(self.entries[self.current_index].rois or [])
         self.store_roi(index, rect)
@@ -216,6 +257,58 @@ class ClassificationWindow(QMainWindow):
         for item in self.roi_items:
             self.scene.removeItem(item)
         self.roi_items.clear()
+        if self.pattern_item is not None:
+            self.scene.removeItem(self.pattern_item)
+            self.pattern_item = None
+
+    def begin_pattern(self):
+        if self.current_index < 0:
+            QMessageBox.information(self, "No image", "Open and select a reference image first.")
+            return
+        self.drawing_pattern = True
+        self.view.constrain_aspect_ratio = False
+        self.status.setText("Draw a distinctive pattern on the reference image.")
+
+    def learn_pattern(self, rect: QRectF):
+        self.drawing_pattern = False
+        self.view.constrain_aspect_ratio = True
+        r = rect.normalized().intersected(self.view.image_bounds)
+        x1, y1, x2, y2 = round(r.left()), round(r.top()), round(r.right()), round(r.bottom())
+        if x2 <= x1 or y2 <= y1:
+            return
+        entry = self.entries[self.current_index]
+        image = load_image(entry.path).convert("L")
+        self.pattern_template = np.asarray(image.crop((x1, y1, x2, y2))).copy()
+        self.pattern_reference_path = entry.path.resolve()
+        entry.pattern_rect = (x1, y1, x2 - x1, y2 - y1)
+        entry.pattern_score = 1.0
+        self.show_pattern(entry)
+        self.update_status("Pattern learned. Apply or auto-populate all will align ROIs by pattern.")
+
+    def clear_pattern(self):
+        self.pattern_template = None
+        self.pattern_reference_path = None
+        self.drawing_pattern = False
+        self.view.constrain_aspect_ratio = True
+        for entry in self.entries:
+            entry.pattern_rect = None
+            entry.pattern_score = None
+        if self.pattern_item is not None:
+            self.scene.removeItem(self.pattern_item)
+            self.pattern_item = None
+        self.update_status("Pattern cleared; applying ROIs will use absolute positions.")
+
+    def show_pattern(self, entry: ImageEntry):
+        if self.pattern_item is not None:
+            self.scene.removeItem(self.pattern_item)
+            self.pattern_item = None
+        if entry.pattern_rect is None:
+            return
+        self.pattern_item = QGraphicsRectItem(QRectF(*entry.pattern_rect))
+        self.pattern_item.setPen(QPen(Qt.GlobalColor.cyan, 3))
+        self.pattern_item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self.pattern_item.setZValue(2)
+        self.scene.addItem(self.pattern_item)
 
     def clear_rois(self):
         if self.current_index < 0:
@@ -234,6 +327,10 @@ class ClassificationWindow(QMainWindow):
         self.remove_roi_items()
         self.entries.clear()
         self.results.clear()
+        self.pattern_template = None
+        self.pattern_reference_path = None
+        self.drawing_pattern = False
+        self.view.constrain_aspect_ratio = True
         self.image_list.clear()
         self.current_index = -1
         self.pixmap_item.setPixmap(QPixmap())
@@ -242,6 +339,17 @@ class ClassificationWindow(QMainWindow):
         self.update_status()
 
     def apply_roi_to_all(self):
+        if self.pattern_template is not None and self.pattern_reference_path is not None:
+            reference = next(
+                (entry for entry in self.entries if entry.path.resolve() == self.pattern_reference_path), None
+            )
+            if reference is None or not reference.rois:
+                QMessageBox.information(
+                    self, "Reference ROI required", "Draw at least one ROI on the pattern reference image."
+                )
+                return
+            self.apply_pattern_aligned_rois(reference, list(reference.rois))
+            return
         if self.current_index < 0 or not self.entries[self.current_index].rois:
             QMessageBox.information(self, "No ROI", "Draw at least one ROI first.")
             return
@@ -258,6 +366,127 @@ class ClassificationWindow(QMainWindow):
             self.clear_results_for(entry)
             entry.rois = list(rois)
         self.select_image(self.current_index)
+
+    def auto_populate_current(self) -> bool:
+        if self.current_index < 0:
+            QMessageBox.information(self, "No image", "Open and select an image first.")
+            return False
+        rois = self.current_rois()
+        if len(rois) < 2:
+            QMessageBox.information(
+                self, "Two ROIs required", "Draw at least two ROIs to determine their average spacing."
+            )
+            return False
+        try:
+            populated = auto_populated_rois(rois, self.entries[self.current_index].size, self.size_variation.value())
+        except ValueError as error:
+            QMessageBox.warning(self, "Cannot auto-populate ROIs", str(error))
+            return False
+        entry = self.entries[self.current_index]
+        self.clear_results_for(entry)
+        added = len(populated) - len(rois)
+        entry.rois = populated
+        self.select_image(self.current_index)
+        self.update_status(f"Added {added} ROI(s) to the current image; {len(populated)} total.")
+        return True
+
+    def auto_populate_all(self):
+        if self.current_index < 0:
+            QMessageBox.information(self, "No image", "Open and select an image first.")
+            return
+        seed_rois = list(self.current_rois())
+        if len(seed_rois) < 2:
+            QMessageBox.information(
+                self, "Two ROIs required", "Draw at least two ROIs to determine their average spacing."
+            )
+            return
+        if self.pattern_reference_path is not None and self.entries[self.current_index].path.resolve() != self.pattern_reference_path:
+            QMessageBox.information(
+                self, "Select pattern reference", "Select the image where the pattern was learned first."
+            )
+            return
+
+        if self.pattern_template is not None and self.pattern_reference_path is not None:
+            targets = self.apply_pattern_aligned_rois(self.entries[self.current_index], seed_rois)
+        else:
+            incompatible = [
+                entry.path.name
+                for entry in self.entries
+                if any(x + width > entry.size[0] or y + height > entry.size[1] for x, y, width, height in seed_rois)
+            ]
+            if incompatible:
+                QMessageBox.warning(
+                    self, "ROI does not fit all images", "Outside image bounds:\n" + "\n".join(incompatible[:12])
+                )
+                return
+            for entry in self.entries:
+                self.clear_results_for(entry)
+                entry.rois = list(seed_rois)
+            targets = list(self.entries)
+
+        populated = 0
+        added = 0
+        failures: list[str] = []
+        for entry in targets:
+            try:
+                before = len(entry.rois or [])
+                entry.rois = auto_populated_rois(list(entry.rois or []), entry.size, self.size_variation.value())
+                added += len(entry.rois) - before
+                populated += 1
+            except ValueError as error:
+                failures.append(f"{entry.path.name}: {error}")
+        self.select_image(self.current_index)
+        message = f"Auto-populated {populated} image(s) to their boundaries; added {added} ROI(s)."
+        self.update_status(message)
+        if failures:
+            QMessageBox.warning(self, "Some images could not be populated", message + "\n\n" + "\n".join(failures[:12]))
+
+    def apply_pattern_aligned_rois(
+        self, reference: ImageEntry, rois: list[tuple[int, int, int, int]]
+    ) -> list[ImageEntry]:
+        if reference.pattern_rect is None or self.pattern_template is None:
+            return []
+        reference_x, reference_y, template_width, template_height = reference.pattern_rect
+        threshold = self.pattern_threshold.value()
+        failures: list[str] = []
+        matched_entries: list[ImageEntry] = []
+        skipped_rois = 0
+        for entry in self.entries:
+            try:
+                image = np.asarray(load_image(entry.path).convert("L"))
+                if image.shape[0] < template_height or image.shape[1] < template_width:
+                    raise ValueError("image is smaller than the learned pattern")
+                result = cv2.matchTemplate(image, self.pattern_template, cv2.TM_CCOEFF_NORMED)
+                _, score, _, match = cv2.minMaxLoc(result)
+                if not np.isfinite(score) or score < threshold:
+                    raise ValueError(f"match {score:.2f} is below threshold {threshold:.2f}")
+                dx, dy = match[0] - reference_x, match[1] - reference_y
+                translated = [(x + dx, y + dy, width, height) for x, y, width, height in rois]
+                valid = [
+                    roi for roi in translated
+                    if roi[0] >= 0 and roi[1] >= 0 and roi[0] + roi[2] <= entry.size[0] and roi[1] + roi[3] <= entry.size[1]
+                ]
+                skipped_rois += len(translated) - len(valid)
+                self.clear_results_for(entry)
+                entry.rois = valid
+                entry.pattern_rect = (match[0], match[1], template_width, template_height)
+                entry.pattern_score = score
+                matched_entries.append(entry)
+            except Exception as error:
+                failures.append(f"{entry.path.name}: {error}")
+        self.select_image(self.current_index)
+        message = f"Pattern-aligned ROI(s) on {len(matched_entries)} of {len(self.entries)} images."
+        if skipped_rois:
+            message += f" Skipped {skipped_rois} out-of-bounds ROI(s)."
+        self.update_status(message)
+        if failures:
+            QMessageBox.warning(self, "Some pattern matches failed", message + "\n\n" + "\n".join(failures[:12]))
+        return matched_entries
+
+    def current_rois(self) -> list[tuple[int, int, int, int]]:
+        if self.current_index < 0:
+            return []
+        return self.entries[self.current_index].rois or []
 
     def choose_model(self):
         filename, _ = QFileDialog.getOpenFileName(self, "Choose trained classification model", "", "PyTorch model (*.pt)")
