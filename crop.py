@@ -7,6 +7,7 @@ Run:      python crop.py
 from __future__ import annotations
 
 import os
+import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,6 +71,57 @@ def aspect_ratio_rect(
         anchor.y() + vertical_direction * height * scale,
     )
     return QRectF(anchor, opposite).normalized()
+
+
+def auto_populated_rois(
+    rois: list[tuple[int, int, int, int]],
+    image_size: tuple[int, int],
+    size_variation_percent: float = 0.0,
+    rng: random.Random | None = None,
+) -> list[tuple[int, int, int, int]]:
+    """Extend a left-to-right ROI sequence to both image boundaries."""
+    if len(rois) < 2:
+        raise ValueError("At least two ROIs are required to determine the spacing.")
+
+    ordered = sorted(rois, key=lambda roi: roi[0] + roi[2] / 2)
+    centers = [(x + width / 2, y + height / 2) for x, y, width, height in ordered]
+    steps = [
+        (right_x - left_x, right_y - left_y)
+        for (left_x, left_y), (right_x, right_y) in zip(centers, centers[1:])
+    ]
+    step_x = sum(step[0] for step in steps) / len(steps)
+    step_y = sum(step[1] for step in steps) / len(steps)
+    if step_x < 1:
+        raise ValueError("The ROIs need distinct horizontal positions.")
+
+    variation = max(0.0, size_variation_percent) / 100.0
+    randomizer = rng or random.Random()
+    image_width, image_height = image_size
+
+    def extend(edge_index: int, direction: int) -> list[tuple[int, int, int, int]]:
+        edge_roi = ordered[edge_index]
+        center_x, center_y = centers[edge_index]
+        generated: list[tuple[int, int, int, int]] = []
+        position = 1
+        while True:
+            target_x = center_x + direction * step_x * position
+            target_y = center_y + direction * step_y * position
+            if target_x < 0 or target_x > image_width or target_y < 0 or target_y > image_height:
+                break
+            scale = randomizer.uniform(1.0 - variation, 1.0 + variation)
+            width = max(1, round(edge_roi[2] * scale))
+            height = max(1, round(edge_roi[3] * scale))
+            x = round(target_x - width / 2)
+            y = round(target_y - height / 2)
+            if x < 0 or y < 0 or x + width > image_width or y + height > image_height:
+                break
+            generated.append((x, y, width, height))
+            position += 1
+        return generated
+
+    left = extend(0, -1)
+    right = extend(-1, 1)
+    return list(reversed(left)) + ordered + right
 
 
 @dataclass
@@ -345,6 +397,12 @@ class MainWindow(QMainWindow):
         apply_all = QPushButton("Apply ROI to all")
         apply_all.clicked.connect(self.apply_roi_to_all)
         controls.addWidget(apply_all)
+        populate_current = QPushButton("Auto-populate current")
+        populate_current.clicked.connect(self.auto_populate_current)
+        controls.addWidget(populate_current)
+        populate_all = QPushButton("Auto-populate all")
+        populate_all.clicked.connect(self.auto_populate_all)
+        controls.addWidget(populate_all)
         clear_rois = QPushButton("Clear ROIs on current")
         clear_rois.clicked.connect(self.clear_rois)
         controls.addWidget(clear_rois)
@@ -373,6 +431,14 @@ class MainWindow(QMainWindow):
         self.pattern_threshold.setSingleStep(0.05)
         self.pattern_threshold.setValue(0.75)
         options.addWidget(self.pattern_threshold)
+        options.addWidget(QLabel("Auto size variation (+/- %):"))
+        self.size_variation = QDoubleSpinBox()
+        self.size_variation.setRange(0.0, 95.0)
+        self.size_variation.setDecimals(1)
+        self.size_variation.setSingleStep(1.0)
+        self.size_variation.setValue(0.0)
+        self.size_variation.setToolTip("Randomly scale each generated ROI while preserving its aspect ratio.")
+        options.addWidget(self.size_variation)
         self.auto_number = QCheckBox("Auto-number cropped files (1_A, 1_B, ...)")
         self.auto_number.setChecked(True)
         options.addWidget(self.auto_number)
@@ -557,6 +623,98 @@ class MainWindow(QMainWindow):
         self.scene.setSceneRect(QRectF())
         self.update_status()
 
+    def auto_populate_current(self) -> bool:
+        if self.current_index < 0:
+            QMessageBox.information(self, "No image", "Open and select an image first.")
+            return False
+        rois = self.current_rois()
+        if len(rois) < 2:
+            QMessageBox.information(
+                self,
+                "Two ROIs required",
+                "Draw at least two ROIs on the current image to determine their average spacing.",
+            )
+            return False
+        try:
+            populated = auto_populated_rois(
+                rois,
+                self.entries[self.current_index].size,
+                self.size_variation.value(),
+            )
+        except ValueError as error:
+            QMessageBox.warning(self, "Cannot auto-populate ROIs", str(error))
+            return False
+        added = len(populated) - len(rois)
+        self.entries[self.current_index].rois = populated
+        self.select_image(self.current_index)
+        self.update_status(f"Added {added} ROI(s) to the current image; {len(populated)} total.")
+        return True
+
+    def auto_populate_all(self):
+        if self.current_index < 0:
+            QMessageBox.information(self, "No image", "Open and select an image first.")
+            return
+        seed_rois = list(self.current_rois())
+        if len(seed_rois) < 2:
+            QMessageBox.information(
+                self,
+                "Two ROIs required",
+                "Draw at least two ROIs on the current image to determine their average spacing.",
+            )
+            return
+        if (
+            self.pattern_reference_path is not None
+            and self.entries[self.current_index].path.resolve() != self.pattern_reference_path
+        ):
+            QMessageBox.information(
+                self,
+                "Select pattern reference",
+                "Select the image where the pattern was learned before auto-populating all images.",
+            )
+            return
+
+        if self.pattern_template is not None and self.pattern_reference_path is not None:
+            reference = self.entries[self.current_index]
+            targets = self.apply_pattern_aligned_rois(reference, seed_rois)
+        else:
+            incompatible = [
+                entry.path.name
+                for entry in self.entries
+                if any(x + width > entry.size[0] or y + height > entry.size[1] for x, y, width, height in seed_rois)
+            ]
+            if incompatible:
+                QMessageBox.warning(
+                    self,
+                    "ROI does not fit all images",
+                    "The ROI was not applied. It falls outside:\n" + "\n".join(incompatible[:12]),
+                )
+                return
+            for entry in self.entries:
+                entry.rois = list(seed_rois)
+            targets = list(self.entries)
+
+        populated = 0
+        added = 0
+        failures: list[str] = []
+        for entry in targets:
+            try:
+                aligned_count = len(entry.rois or [])
+                entry.rois = auto_populated_rois(
+                    list(entry.rois or []),
+                    entry.size,
+                    self.size_variation.value(),
+                )
+                added += len(entry.rois) - aligned_count
+                populated += 1
+            except ValueError as error:
+                failures.append(f"{entry.path.name}: {error}")
+
+        self.select_image(self.current_index)
+        message = f"Auto-populated {populated} image(s) to their boundaries; added {added} ROI(s)."
+        self.update_status(message)
+        if failures:
+            QMessageBox.warning(self, "Some images could not be populated", message + "\n\n" + "\n".join(failures[:12]))
+
     def apply_roi_to_all(self):
         if self.pattern_template is not None and self.pattern_reference_path is not None:
             reference = next(
@@ -596,14 +754,15 @@ class MainWindow(QMainWindow):
         self,
         reference: ImageEntry,
         rois: list[tuple[int, int, int, int]],
-    ):
+    ) -> list[ImageEntry]:
         if reference.pattern_rect is None or self.pattern_template is None:
-            return
+            return []
         reference_x, reference_y, template_width, template_height = reference.pattern_rect
         threshold = self.pattern_threshold.value()
         failures: list[str] = []
         applied = 0
         skipped_rois = 0
+        matched_entries: list[ImageEntry] = []
 
         for entry in self.entries:
             try:
@@ -629,6 +788,7 @@ class MainWindow(QMainWindow):
                 entry.pattern_rect = (match[0], match[1], template_width, template_height)
                 entry.pattern_score = score
                 applied += 1
+                matched_entries.append(entry)
             except Exception as error:
                 failures.append(f"{entry.path.name}: {error}")
 
@@ -639,6 +799,7 @@ class MainWindow(QMainWindow):
         self.update_status(message)
         if failures:
             QMessageBox.warning(self, "Some pattern matches failed", message + "\n\n" + "\n".join(failures[:12]))
+        return matched_entries
 
     def choose_crop(self, all_images: bool):
         targets = self.entries if all_images else ([self.entries[self.current_index]] if self.current_index >= 0 else [])
