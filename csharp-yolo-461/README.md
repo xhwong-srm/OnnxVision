@@ -22,7 +22,27 @@ With a fixed production ROI, append `x y width height`:
   100 80 640 640
 ```
 
-When the production pipeline already owns an image, call `Classifier.Predict(EImageBW8)` or `Classifier.Predict(EImageC24)` directly. The file-based test overload selects the matching Euresys image type from the ONNX input metadata. Both paths attach a reusable ROI, apply the configured placement, copy rows through `GetImagePtr(0, y)`, and detach the ROI before the source image can be disposed.
+The code is split into two assemblies:
+
+- `CSharpYolo461.Backend.csproj` contains the reusable `YoloClassifier`, model lifetime, preprocessing, and inference API.
+- `CSharpYolo461.csproj` is only the console/dataset frontend.
+
+Reference the backend project from another .NET Framework application and keep one classifier alive:
+
+```csharp
+using (var classifier = new YoloClassifier(
+    modelPath,
+    new[] { "flipped", "normal" }))
+{
+    Prediction fullImage = classifier.Predict(eImageBw8);
+    Prediction placedRoi = classifier.Predict(
+        eImageBw8,
+        new RoiPlacement(100, 80, 640, 640));
+    Prediction existingRoi = classifier.Predict(eRoiBw8);
+}
+```
+
+The consistent `Predict(...)` interface accepts a file path, `EImageBW8`, `EImageC24`, `EROIBW8`, or `EROIC24`. Full-image overloads may use the default ROI passed to the constructor; direct ROI overloads infer exactly the supplied ROI. The backend selects the required BW8/C24 input family from the ONNX metadata and rejects an incompatible input type. It reuses tensor buffers and attached ROIs, so a classifier instance is intentionally not safe for concurrent `Predict` calls.
 
 Generate and validate both embedded-preprocessing wrappers:
 
