@@ -44,12 +44,17 @@ using (var classifier = new YoloClassifier(
 
 The consistent `Predict(...)` interface accepts a file path, `EImageBW8`, `EImageC24`, `EROIBW8`, or `EROIC24`. Full-image overloads may use the default ROI passed to the constructor; direct ROI overloads infer exactly the supplied ROI. The backend selects the required BW8/C24 input family from the ONNX metadata and rejects an incompatible input type. It reuses tensor buffers and attached ROIs, so a classifier instance is intentionally not safe for concurrent `Predict` calls.
 
-Generate and validate both embedded-preprocessing wrappers:
+Export the regular float RGB ONNX model, or add `--embedded-preprocessing` to
+also generate and validate both raw-image input wrappers:
 
 ```powershell
-uv run python python-scripts\experiment_embedded_preprocessing.py `
-  runs\classify\yolo26-seal-260721\weights\best.onnx `
-  images\seal_dataset_v2\test `
+uv run python python-scripts\export_yolo_classification.py `
+  runs\classify\yolo26-seal-260721\weights\best.pt
+
+uv run python python-scripts\export_yolo_classification.py `
+  runs\classify\yolo26-seal-260721\weights\best.pt `
+  --embedded-preprocessing `
+  --dataset images\seal_dataset_v2\test `
   --bw8-output artifacts\best-embedded-preprocess-bw8.onnx `
   --c24-output artifacts\best-embedded-preprocess-c24.onnx
 ```
@@ -109,24 +114,27 @@ Measured with `Intel.ML.OnnxRuntime.OpenVino` 1.20.0 and the original float-inpu
 - OpenVINO Intel GPU median: 11.266 ms/image end-to-end and 2.619 ms/image inference
 - Intel GPU improvement: approximately 16.5% end-to-end and 41.6% for inference
 
-Do not use the embedded `uint8` preprocessing wrapper with this OpenVINO GPU provider: it measured 124.680 ms/image because that graph shape causes expensive execution or device-transfer behavior. Use the original float-input model for OpenVINO; resizing and normalization remain in C#.
+Dynamic embedded preprocessing is suitable for OpenVINO GPU when each lot keeps one stable ROI size. Performance collapses only when the input dimensions change continually: the standard embedded graph measured 124.680 ms/image and the float-resize graph measured 179.030 ms/image across the many changing shapes in the full test folder. Warm the session after a lot introduces a new ROI size, then reuse that size for inspection.
 
-### Static-shape embedded preprocessing for OpenVINO GPU
+### Fixed-size lot matrices
 
-For a production ROI whose dimensions never change, the export script can create an OpenVINO-oriented BW8 model. It casts and normalizes before float resize and fixes the raw input shape so the GPU does not compile kernels for changing dimensions:
+The standard sequence (`Resize uint8`, then cast and normalize) and float-resize sequence (cast and normalize, then `Resize float`) were tested on every available C# provider. The benchmark repeated the 48 unique `125x167` images ten times, giving 480 sequential executions per run, after 20 warm-ups. Each combination ran three complete passes; the tables report medians.
 
-```powershell
-uv run python python-scripts\experiment_embedded_preprocessing.py `
-  runs\classify\yolo26-seal-260721\weights\best.onnx `
-  images\seal_dataset_v2\test `
-  --openvino-bw8-output artifacts\best-embedded-preprocess-openvino-bw8.onnx `
-  --openvino-input-width 125 --openvino-input-height 167 `
-  --skip-validation
-```
+BW8:
 
-The width and height must match the production ROI exactly. On the 48 test images sharing the measured `125x167` shape, the static model produced 48/48 correct predictions and a median 2.869 ms/image end-to-end across three runs (median 2.408 ms/image inside ONNX). The same graph with dynamic dimensions had a 3.069 ms/image median when every input remained `125x167`, but processing the full test set with many changing shapes took 179.030 ms/image. Stable input dimensions are therefore the important requirement; static model metadata provides a smaller additional improvement.
+| Embedded sequence | CPU | DirectML | OpenVINO CPU | OpenVINO GPU |
+|---|---:|---:|---:|---:|
+| Standard | 4.169 ms | 4.550 ms | 4.169 ms | 2.792 ms |
+| Float resize | **3.914 ms** | **4.485 ms** | **4.126 ms** | **2.764 ms** |
 
-These subset accuracy numbers do not replace the 400-image validation. Export the static model using the real production ROI dimensions and validate it on a representative dataset normalized to that exact shape before deployment.
+C24:
+
+| Embedded sequence | CPU | DirectML | OpenVINO CPU | OpenVINO GPU |
+|---|---:|---:|---:|---:|
+| Standard | **4.474 ms** | **5.945 ms** | **4.743 ms** | **2.886 ms** |
+| Float resize | 4.882 ms | 6.433 ms | 4.914 ms | 3.674 ms |
+
+All runs produced 480/480 correct repeated predictions (48/48 unique images). Float resize helps BW8 slightly, but it makes C24 approximately 3.6-27.3% slower because the full-resolution three-channel input is converted to float before reduction to `224x224`. For one consistent export policy, the standard sequence is the final recommendation: it keeps both input families fast and avoids maintaining provider-specific graphs. OpenVINO GPU remains the recommended primary provider on this Intel machine; keep CPU available as fallback and warm the GPU provider whenever a lot changes ROI dimensions.
 
 ## Measured result on this machine
 

@@ -2,6 +2,7 @@
 
 Install:  pip install PySide6 Pillow
 Run:      python crop.py
+Classify: python crop.py --model path/to/best.pt
 """
 
 from __future__ import annotations
@@ -9,11 +10,14 @@ from __future__ import annotations
 import os
 import random
 import sys
+from argparse import ArgumentParser
 from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
+import torchvision.transforms as transforms
 from PIL import Image, ImageOps
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QBrush, QImage, QPainter, QPainterPath, QPen, QPixmap
@@ -36,6 +40,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from ultralytics import YOLO
 
 IMAGE_FILTER = "Images (*.bmp *.jpg *.jpeg *.png *.tif *.tiff *.webp)"
 SUPPORTED_SUFFIXES = {".bmp", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
@@ -348,9 +353,10 @@ class ImageView(QGraphicsView):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, initial_model: Path | None = None):
         super().__init__()
-        self.setWindowTitle("ROI Crop Tool")
+        self.classification_mode = True
+        self.setWindowTitle("ROI Crop and Classification Tool")
         self.resize(1200, 760)
         self.entries: list[ImageEntry] = []
         self.current_index = -1
@@ -359,6 +365,9 @@ class MainWindow(QMainWindow):
         self.pattern_template: np.ndarray | None = None
         self.pattern_reference_path: Path | None = None
         self.drawing_pattern = False
+        self.results: dict[tuple[Path, int], tuple[str, float]] = {}
+        self.model_path = initial_model
+        self.model: YOLO | None = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -445,9 +454,27 @@ class MainWindow(QMainWindow):
         options.addStretch()
         right.addLayout(options)
 
-        self.status = QLabel("Open images or a folder, then drag on an image to create an ROI.")
+        model_controls = QHBoxLayout()
+        choose_model = QPushButton("Choose trained model...")
+        choose_model.clicked.connect(self.choose_model)
+        model_controls.addWidget(choose_model)
+        self.model_label = QLabel()
+        self.model_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        model_controls.addWidget(self.model_label, 1)
+        self.classify_current_button = QPushButton("Classify current")
+        self.classify_current_button.clicked.connect(lambda: self.classify(False))
+        model_controls.addWidget(self.classify_current_button)
+        self.classify_all_button = QPushButton("Classify all")
+        self.classify_all_button.clicked.connect(lambda: self.classify(True))
+        model_controls.addWidget(self.classify_all_button)
+        right.addLayout(model_controls)
+
+        self.status = QLabel(
+            "Open images, draw ROIs, then choose a trained model or crop them."
+        )
         right.addWidget(self.status)
         layout.addLayout(right, 4)
+        self.update_model_label()
 
     def open_images(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Open images", "", IMAGE_FILTER)
@@ -513,7 +540,7 @@ class MainWindow(QMainWindow):
         item = RoiItem(
             rect,
             self.view.image_bounds,
-            self.roi_label(roi_index),
+            self.result_text(roi_index) if self.classification_mode else self.roi_label(roi_index),
             lambda changed_rect, index=roi_index: self.store_roi(index, changed_rect),
             self.view.aspect_ratio,
         )
@@ -592,14 +619,22 @@ class MainWindow(QMainWindow):
             rois = self.entries[self.current_index].rois
             assert rois is not None
             value = (x1, y1, x2 - x1, y2 - y1)
+            old = rois[roi_index] if roi_index < len(rois) else None
             if roi_index == len(rois):
                 rois.append(value)
             elif 0 <= roi_index < len(rois):
                 rois[roi_index] = value
+            if self.classification_mode and old != value:
+                self.results.pop(self.result_key(self.entries[self.current_index], roi_index), None)
+            if self.classification_mode and roi_index < len(self.roi_items):
+                self.roi_items[roi_index].label = self.result_text(roi_index)
+                self.roi_items[roi_index].update()
         self.update_status()
 
     def clear_rois(self):
         if self.current_index >= 0:
+            if self.classification_mode:
+                self.clear_results_for(self.entries[self.current_index])
             self.entries[self.current_index].rois = []
             self.remove_roi_items()
             self.update_status()
@@ -612,6 +647,7 @@ class MainWindow(QMainWindow):
             return
         self.remove_roi_items()
         self.entries.clear()
+        self.results.clear()
         self.pattern_template = None
         self.pattern_reference_path = None
         self.drawing_pattern = False
@@ -645,6 +681,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Cannot auto-populate ROIs", str(error))
             return False
         added = len(populated) - len(rois)
+        if self.classification_mode:
+            self.clear_results_for(self.entries[self.current_index])
         self.entries[self.current_index].rois = populated
         self.select_image(self.current_index)
         self.update_status(f"Added {added} ROI(s) to the current image; {len(populated)} total.")
@@ -690,6 +728,8 @@ class MainWindow(QMainWindow):
                 )
                 return
             for entry in self.entries:
+                if self.classification_mode:
+                    self.clear_results_for(entry)
                 entry.rois = list(seed_rois)
             targets = list(self.entries)
 
@@ -699,6 +739,8 @@ class MainWindow(QMainWindow):
         for entry in targets:
             try:
                 aligned_count = len(entry.rois or [])
+                if self.classification_mode:
+                    self.clear_results_for(entry)
                 entry.rois = auto_populated_rois(
                     list(entry.rois or []),
                     entry.size,
@@ -747,6 +789,8 @@ class MainWindow(QMainWindow):
             )
             return
         for entry in self.entries:
+            if self.classification_mode:
+                self.clear_results_for(entry)
             entry.rois = list(rois)
         self.update_status(f"Applied {len(rois)} ROI(s) to {len(self.entries)} images.")
 
@@ -766,6 +810,8 @@ class MainWindow(QMainWindow):
 
         for entry in self.entries:
             try:
+                if self.classification_mode:
+                    self.clear_results_for(entry)
                 image = np.asarray(load_image(entry.path).convert("L"))
                 if image.shape[0] < template_height or image.shape[1] < template_width:
                     raise ValueError("image is smaller than the learned pattern")
@@ -800,6 +846,104 @@ class MainWindow(QMainWindow):
         if failures:
             QMessageBox.warning(self, "Some pattern matches failed", message + "\n\n" + "\n".join(failures[:12]))
         return matched_entries
+
+    def choose_model(self):
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Choose trained classification model", "", "PyTorch model (*.pt)"
+        )
+        if filename:
+            self.model_path = Path(filename).resolve()
+            self.model = None
+            self.results.clear()
+            self.update_model_label()
+            if self.current_index >= 0:
+                self.select_image(self.current_index)
+
+    def classify(self, all_images: bool):
+        targets = self.entries if all_images else (
+            [self.entries[self.current_index]] if self.current_index >= 0 else []
+        )
+        if not targets:
+            QMessageBox.information(self, "No images", "Open at least one image first.")
+            return
+        if not self.model_path or not self.model_path.is_file():
+            QMessageBox.information(self, "Model required", "Choose your trained best.pt model first.")
+            self.choose_model()
+            if not self.model_path or not self.model_path.is_file():
+                return
+        missing = [entry.path.name for entry in targets if not entry.rois]
+        if missing:
+            QMessageBox.warning(self, "Missing ROI", "Draw an ROI for:\n" + "\n".join(missing[:12]))
+            return
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.status.setText("Loading model and classifying ROI(s)...")
+        QApplication.processEvents()
+        try:
+            if self.model is None:
+                self.model = YOLO(str(self.model_path), task="classify")
+            crops: list[Image.Image] = []
+            keys: list[tuple[Path, int]] = []
+            for entry in targets:
+                image = load_image(entry.path).convert("RGB")
+                for index, (x, y, width, height) in enumerate(entry.rois or []):
+                    crops.append(image.crop((x, y, x + width, y + height)))
+                    keys.append(self.result_key(entry, index))
+            probabilities = self.predict_full_frame(crops)
+            names = self.model.names
+            for key, probs in zip(keys, probabilities):
+                confidence, class_index = probs.max(dim=0)
+                self.results[key] = (str(names[int(class_index)]), float(confidence))
+            if self.current_index >= 0:
+                self.select_image(self.current_index)
+            self.update_status(f"Classified {len(crops)} ROI(s).")
+        except Exception as error:
+            QMessageBox.critical(self, "Classification failed", str(error))
+            self.update_status()
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def predict_full_frame(self, images: list[Image.Image]) -> torch.Tensor:
+        """Use the same full-frame resize and scaling as the training dataset."""
+        assert self.model is not None
+        core = self.model.model
+        imgsz_value = getattr(core, "args", {}).get("imgsz", 224)
+        imgsz = int(imgsz_value[0] if isinstance(imgsz_value, (tuple, list)) else imgsz_value)
+        preprocessing = transforms.Compose([
+            transforms.Resize((imgsz, imgsz), antialias=True),
+            transforms.ToTensor(),
+        ])
+        batch = torch.stack([preprocessing(image) for image in images])
+        device = next(core.parameters()).device
+        core.eval()
+        with torch.inference_mode():
+            output = core(batch.to(device))
+            if isinstance(output, (tuple, list)):
+                output = output[0]
+            return output.cpu()
+
+    def result_text(self, roi_index: int) -> str:
+        if not self.classification_mode or self.current_index < 0:
+            return self.roi_label(roi_index)
+        result = self.results.get(self.result_key(self.entries[self.current_index], roi_index))
+        return self.roi_label(roi_index) if result is None else f"{result[0]}  {result[1]:.1%}"
+
+    def result_key(self, entry: ImageEntry, roi_index: int) -> tuple[Path, int]:
+        return entry.path.resolve(), roi_index
+
+    def clear_results_for(self, entry: ImageEntry):
+        path = entry.path.resolve()
+        self.results = {key: value for key, value in self.results.items() if key[0] != path}
+
+    def update_model_label(self):
+        self.model_label.setText(
+            f"Model: {self.model_path}" if self.model_path else "Model: not selected"
+        )
+        enabled = self.model_path is not None
+        self.classify_current_button.setEnabled(enabled)
+        self.classify_all_button.setEnabled(enabled)
+        self.classify_current_button.setVisible(enabled)
+        self.classify_all_button.setVisible(enabled)
 
     def choose_crop(self, all_images: bool):
         targets = self.entries if all_images else ([self.entries[self.current_index]] if self.current_index >= 0 else [])
@@ -908,18 +1052,37 @@ class MainWindow(QMainWindow):
             self.status.setText(message)
             return
         if self.current_index < 0:
-            self.status.setText("Open images or a folder, then drag on an image to create an ROI.")
+            self.status.setText(
+                "Open images, draw ROIs, then choose a trained model or crop them."
+            )
             return
         rois = self.current_rois()
+        if self.classification_mode:
+            classified = sum(
+                self.result_key(self.entries[self.current_index], i) in self.results
+                for i in range(len(rois))
+            )
+            self.status.setText(
+                f"{self.current_index + 1} / {len(self.entries)} — {self.entries[self.current_index].path.name} — "
+                f"{len(rois)} ROI(s), {classified} classified"
+            )
+            return
         suffix = "No ROI — drag to create one." if not rois else f"{len(rois)} ROI(s): " + ", ".join(
             f"{self.roi_label(i)}={roi[2]}x{roi[3]} at ({roi[0]}, {roi[1]})" for i, roi in enumerate(rois)
         )
         self.status.setText(f"{self.current_index + 1} / {len(self.entries)} — {self.entries[self.current_index].path.name} — {suffix}")
 
 
+def parse_args():
+    parser = ArgumentParser(description=__doc__)
+    parser.add_argument("--model", type=Path, help="Trained Ultralytics classification checkpoint (best.pt)")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     app = QApplication(sys.argv)
-    window = MainWindow()
+    window = MainWindow(args.model.resolve() if args.model else None)
     window.show()
     sys.exit(app.exec())
 
