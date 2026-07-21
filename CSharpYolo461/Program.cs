@@ -15,8 +15,6 @@ namespace CSharpYolo461
     {
         private const int ImageSize = 224;
         private static readonly string[] ClassNames = { "flipped", "normal" };
-        private static readonly float[] Mean = { 0.485f, 0.456f, 0.406f };
-        private static readonly float[] StdDev = { 0.229f, 0.224f, 0.225f };
         private static readonly HashSet<string> Extensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             ".bmp", ".jpg", ".jpeg", ".png", ".tif", ".tiff"
@@ -136,9 +134,9 @@ namespace CSharpYolo461
                         for (var x = 0; x < ImageSize; x++)
                         {
                             var offset = row + x * 3;
-                            tensor[0, 0, y, x] = (bytes[offset + 2] / 255f - Mean[0]) / StdDev[0];
-                            tensor[0, 1, y, x] = (bytes[offset + 1] / 255f - Mean[1]) / StdDev[1];
-                            tensor[0, 2, y, x] = (bytes[offset] / 255f - Mean[2]) / StdDev[2];
+                            tensor[0, 0, y, x] = bytes[offset + 2] / 255f;
+                            tensor[0, 1, y, x] = bytes[offset + 1] / 255f;
+                            tensor[0, 2, y, x] = bytes[offset] / 255f;
                         }
                     }
                 }

@@ -541,7 +541,7 @@ class ClassificationWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
 
     def predict_full_frame(self, images: list[Image.Image]) -> torch.Tensor:
-        """Use the same resize and normalization as the custom training dataset."""
+        """Use the same full-frame resize and scaling as the training dataset."""
         assert self.model is not None
         core = self.model.model
         imgsz_value = getattr(core, "args", {}).get("imgsz", 224)
@@ -550,7 +550,6 @@ class ClassificationWindow(QMainWindow):
             [
                 transforms.Resize((imgsz, imgsz), antialias=True),
                 transforms.ToTensor(),
-                transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
             ]
         )
         batch = torch.stack([preprocessing(image) for image in images])

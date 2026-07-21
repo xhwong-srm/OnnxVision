@@ -3,7 +3,6 @@
 from argparse import ArgumentParser
 from pathlib import Path
 
-import torch
 import torchvision.transforms as transforms
 from ultralytics import YOLO
 from ultralytics.data.dataset import ClassificationDataset
@@ -16,32 +15,12 @@ class FullFrameClassificationDataset(ClassificationDataset):
     def __init__(self, root: str, args, augment: bool = False, prefix: str = ""):
         super().__init__(root, args, augment, prefix)
 
-        preprocessing = [
-            transforms.Resize((args.imgsz, args.imgsz), antialias=True),
-        ]
-        if augment:
-            preprocessing.extend(
-                [
-                    transforms.RandomHorizontalFlip(p=args.fliplr),
-                    transforms.RandomVerticalFlip(p=args.flipud),
-                    transforms.ColorJitter(
-                        brightness=args.hsv_v,
-                        contrast=args.hsv_v,
-                        saturation=args.hsv_s,
-                        hue=args.hsv_h,
-                    ),
-                ]
-            )
-        preprocessing.extend(
+        self.torch_transforms = transforms.Compose(
             [
+                transforms.Resize((args.imgsz, args.imgsz), antialias=True),
                 transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=torch.tensor((0.485, 0.456, 0.406)),
-                    std=torch.tensor((0.229, 0.224, 0.225)),
-                ),
             ]
         )
-        self.torch_transforms = transforms.Compose(preprocessing)
 
 
 class FullFrameClassificationTrainer(ClassificationTrainer):
@@ -59,7 +38,7 @@ def parse_args():
     parser.add_argument(
         "--data",
         type=Path,
-        default=Path("images/seal_dataset"),
+        default=Path("images/seal_dataset_v2"),
         help="Dataset root containing train/val/test class folders",
     )
     parser.add_argument("--model", default="yolo26n-cls.pt")
@@ -95,7 +74,7 @@ def main() -> None:
         batch=args.batch,
         device=args.device,
         project=str(args.project.resolve()),
-        name="yolo26-seal",
+        name="yolo26-seal-260721",
     )
 
 

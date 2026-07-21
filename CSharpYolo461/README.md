@@ -1,6 +1,6 @@
 # C# YOLO26 classification experiment (.NET Framework 4.6.1)
 
-This console application runs the exported YOLO26 classification ONNX model in-process with ONNX Runtime. It reproduces the training pipeline's full-frame 224 x 224 resize, RGB conversion, and ImageNet normalization.
+This console application runs the exported YOLO26 classification ONNX model in-process with ONNX Runtime. It reproduces the training pipeline's full-frame 224 x 224 resize, RGB conversion, and pixel scaling to `[0, 1]`.
 
 Build and run from the repository root:
 
