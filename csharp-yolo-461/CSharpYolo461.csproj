@@ -11,6 +11,9 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.17.3" />
-    <Reference Include="System.Drawing" />
+    <Reference Include="Open_eVision_NetApi_22_12">
+      <HintPath>C:\VisionRef64\Open_eVision_NetApi_22_12.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
   </ItemGroup>
 </Project>

@@ -1,6 +1,8 @@
 # C# YOLO26 classification experiment (.NET Framework 4.6.1)
 
-This console application runs the exported YOLO26 classification ONNX model in-process with ONNX Runtime. It reproduces the training pipeline's full-frame 224 x 224 resize, RGB conversion, and pixel scaling to `[0, 1]`.
+This console application runs the exported YOLO26 classification ONNX model in-process with ONNX Runtime. Image ownership and ROI access use Euresys Open eVision 22.12. The runner supports grayscale `EImageBW8`/`EROIBW8`, color `EImageC24`/`EROIC24`, and the original float-input model.
+
+The project references the installed production assembly at `C:\VisionRef64\Open_eVision_NetApi_22_12.dll` and must run on a machine with the matching Open eVision 22.12 x64 runtime.
 
 Build and run from the repository root:
 
@@ -10,6 +12,41 @@ dotnet build CSharpYolo461\CSharpYolo461.csproj -c Release
   runs\classify\yolo26-seal-260721\weights\best.onnx `
   images\seal_dataset_v2\test
 ```
+
+With a fixed production ROI, append `x y width height`:
+
+```powershell
+& CSharpYolo461\bin\Release\net461\win7-x64\CSharpYolo461.exe `
+  runs\classify\yolo26-seal-260721\weights\best.onnx `
+  images\seal_dataset_v2\test `
+  100 80 640 640
+```
+
+When the production pipeline already owns an image, call `Classifier.Predict(EImageBW8)` or `Classifier.Predict(EImageC24)` directly. The file-based test overload selects the matching Euresys image type from the ONNX input metadata. Both paths attach a reusable ROI, apply the configured placement, copy rows through `GetImagePtr(0, y)`, and detach the ROI before the source image can be disposed.
+
+Generate and validate both embedded-preprocessing wrappers:
+
+```powershell
+uv run python python-scripts\experiment_embedded_preprocessing.py `
+  runs\classify\yolo26-seal-260721\weights\best.onnx `
+  images\seal_dataset_v2\test `
+  --bw8-output artifacts\best-embedded-preprocess-bw8.onnx `
+  --c24-output artifacts\best-embedded-preprocess-c24.onnx
+```
+
+Run either model with the same executable:
+
+```powershell
+& CSharpYolo461\bin\Release\net461\win7-x64\CSharpYolo461.exe `
+  artifacts\best-embedded-preprocess-bw8.onnx `
+  images\seal_dataset_v2\test
+
+& CSharpYolo461\bin\Release\net461\win7-x64\CSharpYolo461.exe `
+  artifacts\best-embedded-preprocess-c24.onnx `
+  images\seal_dataset_v2\test
+```
+
+The BW8 model accepts `uint8 [1,1,H,W]` NCHW grayscale. The C24 model accepts raw Euresys/Windows-compatible `uint8 [1,H,W,3]` NHWC BGR and performs BGR-to-RGB conversion inside ONNX. Both graphs perform resize, float conversion, normalization, and then execute the same classifier core.
 
 The executable must run as x64 because the ONNX Runtime native package is architecture-specific.
 
@@ -26,7 +63,30 @@ The executable must run as x64 because the ONNX Runtime native package is archit
 - ONNX inference: 3.286-4.352 ms/image
 - Mismatches: `flipped/22_E.bmp`, `normal/36_D.bmp`, `normal/38_C.bmp`
 
-The optimized path reuses its resize surface, tensor buffer, and ONNX input wrapper. It fills the CHW tensor directly from locked bitmap memory, avoiding per-image tensor and intermediate byte-array allocations.
+## Euresys full-image test result
+
+- Accuracy: 398/400 (99.50%)
+- Flipped recall: 43/43 (100.00%)
+- Normal recall: 355/357 (99.44%)
+- Warmed end-to-end latency: 18.236 ms/image (54.8 images/s)
+- Preprocessing (Euresys load, ROI access, and resize): 14.858 ms/image
+- ONNX inference: 3.360 ms/image
+- Mismatches: `normal/36_D.bmp`, `normal/38_C.bmp`
+
+## Embedded ONNX preprocessing results
+
+- Models: `artifacts/best-embedded-preprocess-bw8.onnx` and `artifacts/best-embedded-preprocess-c24.onnx`
+- BW8 input: dynamic-size `uint8 [1,1,height,width]` NCHW grayscale
+- C24 input: dynamic-size `uint8 [1,height,width,3]` NHWC BGR
+- Python validation: both wrappers agreed with the reference on 400/400 predictions and with each other on 400/400 predictions
+- Accuracy: 398/400 (99.50%) for both wrappers
+- Flipped recall: 43/43 (100.00%)
+- Normal recall: 355/357 (99.44%)
+- BW8 C# end-to-end: 4.162 ms/image (240.3 images/s), with 0.467 ms/image outside ONNX
+- C24 C# end-to-end: 4.311 ms/image (232.0 images/s), with 0.496 ms/image outside ONNX
+- Mismatches: `normal/36_D.bmp`, `normal/38_C.bmp`
+
+The Euresys path reuses its ROI, tensor buffer, and ONNX input wrapper. Embedded models copy raw Euresys rows without resizing or channel conversion in C#. In production, passing an existing Euresys image also removes file loading from the preprocessing measurement.
 
 ## Deployment options considered
 
