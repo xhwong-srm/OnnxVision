@@ -33,7 +33,8 @@ namespace CSharpYolo461
         private long inferenceTicks;
         private bool disposed;
 
-        public YoloClassifier(string modelPath, IEnumerable<string> classNames, RoiPlacement defaultRoi = null)
+        public YoloClassifier(string modelPath, IEnumerable<string> classNames, RoiPlacement defaultRoi = null,
+            ExecutionProvider executionProvider = ExecutionProvider.Cpu)
         {
             if (string.IsNullOrWhiteSpace(modelPath))
                 throw new ArgumentException("A model path is required.", "modelPath");
@@ -44,7 +45,8 @@ namespace CSharpYolo461
             if (this.classNames.Length == 0 || this.classNames.Any(string.IsNullOrWhiteSpace))
                 throw new ArgumentException("At least one non-empty class name is required.", "classNames");
 
-            using (var options = new SessionOptions())
+            ExecutionProvider = executionProvider;
+            using (var options = CreateSessionOptions(executionProvider))
                 session = new InferenceSession(modelPath, options);
 
             var inputMetadata = session.InputMetadata.Single();
@@ -75,6 +77,7 @@ namespace CSharpYolo461
         }
 
         public string InputName { get; private set; }
+        public ExecutionProvider ExecutionProvider { get; private set; }
 
         public string InputDescription
         {
@@ -100,6 +103,19 @@ namespace CSharpYolo461
         public bool HasEmbeddedPreprocessing { get { return inputContract != InputContract.FloatNchw; } }
         public double PreprocessMilliseconds { get { return preprocessTicks * 1000.0 / Stopwatch.Frequency; } }
         public double InferenceMilliseconds { get { return inferenceTicks * 1000.0 / Stopwatch.Frequency; } }
+
+        private static SessionOptions CreateSessionOptions(ExecutionProvider executionProvider)
+        {
+            var options = new SessionOptions();
+            if (executionProvider == ExecutionProvider.DirectML)
+            {
+                options.ExecutionMode = ExecutionMode.ORT_SEQUENTIAL;
+                options.EnableMemoryPattern = false;
+                options.AppendExecutionProvider_DML(0);
+            }
+
+            return options;
+        }
 
         public Prediction Predict(string imagePath)
         {
@@ -376,6 +392,12 @@ namespace CSharpYolo461
             Bw8Nchw,
             C24Nhwc
         }
+    }
+
+    public enum ExecutionProvider
+    {
+        Cpu,
+        DirectML
     }
 
     public sealed class RoiPlacement

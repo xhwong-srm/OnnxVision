@@ -16,9 +16,9 @@ namespace CSharpYolo461
 
         private static int Main(string[] args)
         {
-            if (args.Length != 2 && args.Length != 6)
+            if (args.Length != 2 && args.Length != 3 && args.Length != 6 && args.Length != 7)
             {
-                Console.Error.WriteLine("Usage: CSharpYolo461.exe <model.onnx> <test-directory> [roi-x roi-y roi-width roi-height]");
+                Console.Error.WriteLine("Usage: CSharpYolo461.exe <model.onnx> <test-directory> [cpu|directml] [roi-x roi-y roi-width roi-height]");
                 return 2;
             }
 
@@ -37,12 +37,19 @@ namespace CSharpYolo461
                 return 2;
             }
 
+            ExecutionProvider executionProvider;
+            if (!TryParseExecutionProvider(args, out executionProvider))
+            {
+                Console.Error.WriteLine("Execution provider must be 'cpu' or 'directml'.");
+                return 2;
+            }
+
             var images = Directory.EnumerateFiles(testDirectory, "*", SearchOption.AllDirectories)
                 .Where(path => Extensions.Contains(Path.GetExtension(path)))
                 .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
 
-            using (var classifier = new YoloClassifier(modelPath, new[] { "flipped", "normal" }, roiPlacement))
+            using (var classifier = new YoloClassifier(modelPath, new[] { "flipped", "normal" }, roiPlacement, executionProvider))
             {
                 PrintModelInformation(classifier, images.Length, roiPlacement);
 
@@ -60,6 +67,7 @@ namespace CSharpYolo461
         {
             Console.WriteLine("Runtime: ONNX Runtime {0}, .NET Framework {1}",
                 OrtEnv.Instance().GetVersionString(), Environment.Version);
+            Console.WriteLine("Execution provider: {0}", classifier.ExecutionProvider);
             Console.WriteLine("Model input: {0}; test images: {1}", classifier.InputName, imageCount);
             Console.WriteLine("Input contract: " + classifier.InputDescription);
             Console.WriteLine("Euresys input: " + classifier.EuresysInputDescription +
@@ -124,20 +132,38 @@ namespace CSharpYolo461
         private static bool TryParseRoi(string[] args, out RoiPlacement placement)
         {
             placement = null;
-            if (args.Length == 2)
+            if (args.Length == 2 || args.Length == 3)
                 return true;
 
+            var offset = args.Length == 7 ? 3 : 2;
             int x;
             int y;
             int width;
             int height;
-            if (!int.TryParse(args[2], out x) || !int.TryParse(args[3], out y) ||
-                !int.TryParse(args[4], out width) || !int.TryParse(args[5], out height) ||
+            if (!int.TryParse(args[offset], out x) || !int.TryParse(args[offset + 1], out y) ||
+                !int.TryParse(args[offset + 2], out width) || !int.TryParse(args[offset + 3], out height) ||
                 width <= 0 || height <= 0)
                 return false;
 
             placement = new RoiPlacement(x, y, width, height);
             return true;
+        }
+
+        private static bool TryParseExecutionProvider(string[] args, out ExecutionProvider executionProvider)
+        {
+            executionProvider = ExecutionProvider.Cpu;
+            if (args.Length == 2 || args.Length == 6)
+                return true;
+
+            if (string.Equals(args[2], "cpu", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (string.Equals(args[2], "directml", StringComparison.OrdinalIgnoreCase))
+            {
+                executionProvider = ExecutionProvider.DirectML;
+                return true;
+            }
+
+            return false;
         }
 
         private static string MakeRelative(string root, string path)

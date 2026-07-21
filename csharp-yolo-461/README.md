@@ -70,6 +70,27 @@ The BW8 model accepts `uint8 [1,1,H,W]` NCHW grayscale. The C24 model accepts ra
 
 The executable must run as x64 because the ONNX Runtime native package is architecture-specific.
 
+Select the ONNX Runtime execution provider after the test directory. CPU remains the default:
+
+```powershell
+& csharp-yolo-461\bin\Release\net461\win7-x64\CSharpYolo461.exe `
+  artifacts\best-embedded-preprocess-bw8.onnx `
+  images\seal_dataset_v2\test directml
+```
+
+The DirectML package supports both DirectML and CPU. DirectML uses GPU device 0 and keeps ONNX Runtime's CPU fallback for unsupported graph nodes.
+
+## DirectML GPU test on this machine
+
+- GPU: Intel(R) Graphics, driver 32.0.101.7085
+- Model: `artifacts/best-embedded-preprocess-bw8.onnx`
+- Dataset: 400 test images; both providers produced 398/400 accuracy and the same two mismatches
+- CPU end-to-end: 5.563-5.872 ms/image across three runs; median 5.696 ms/image
+- DirectML end-to-end: 5.364-6.078 ms/image across three runs; median 5.544 ms/image
+- Result: DirectML works, but the approximately 2.7% median improvement is within the observed run-to-run variation and is not a meaningful win for this small model/batch-one workload
+
+ONNX Runtime reports that some shape-related nodes remain on CPU. This is expected with DirectML's CPU fallback and can reduce the benefit of GPU execution for small graphs.
+
 ## Measured result on this machine
 
 - Runtime: ONNX Runtime 1.17.3, CPU execution provider
