@@ -41,16 +41,16 @@ namespace CSharpYolo461
                 .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
 
-            using (var options = new SessionOptions())
-            using (var session = new InferenceSession(modelPath, options))
+            using (var classifier = new Classifier(modelPath))
             {
                 Console.WriteLine("Runtime: ONNX Runtime {0}, .NET Framework {1}",
                     OrtEnv.Instance().GetVersionString(), Environment.Version);
                 Console.WriteLine("Model input: {0}; test images: {1}",
-                    session.InputMetadata.Single().Key, images.Length);
+                    classifier.InputName, images.Length);
 
                 for (var i = 0; i < Math.Min(20, images.Length); i++)
-                    Predict(session, images[i]);
+                    classifier.Predict(images[i]);
+                classifier.ResetTimings();
 
                 var stopwatch = Stopwatch.StartNew();
                 var correct = 0;
@@ -63,7 +63,7 @@ namespace CSharpYolo461
                 foreach (var image in images)
                 {
                     var expected = new DirectoryInfo(Path.GetDirectoryName(image)).Name;
-                    var prediction = Predict(session, image);
+                    var prediction = classifier.Predict(image);
                     var isCorrect = string.Equals(expected, prediction.Name, StringComparison.OrdinalIgnoreCase);
                     if (isCorrect)
                         correct++;
@@ -89,6 +89,8 @@ namespace CSharpYolo461
                 Console.WriteLine("End-to-end: {0:F3} ms/image ({1:F1} images/s)",
                     stopwatch.Elapsed.TotalMilliseconds / images.Length,
                     images.Length / stopwatch.Elapsed.TotalSeconds);
+                Console.WriteLine("Preprocess: {0:F3} ms/image", classifier.PreprocessMilliseconds / images.Length);
+                Console.WriteLine("Inference: {0:F3} ms/image", classifier.InferenceMilliseconds / images.Length);
                 foreach (var error in errors)
                     Console.WriteLine("Mismatch: " + error);
             }
@@ -96,47 +98,91 @@ namespace CSharpYolo461
             return 0;
         }
 
-        private static Prediction Predict(InferenceSession session, string imagePath)
+        private sealed class Classifier : IDisposable
         {
-            var tensor = LoadTensor(imagePath);
-            var inputs = new[] { NamedOnnxValue.CreateFromTensor("images", tensor) };
-            using (var results = session.Run(inputs))
+            private const int PlaneSize = ImageSize * ImageSize;
+            private readonly InferenceSession session;
+            private readonly Bitmap resized;
+            private readonly Graphics graphics;
+            private readonly float[] tensorBuffer;
+            private readonly IReadOnlyCollection<NamedOnnxValue> inputs;
+            private long preprocessTicks;
+            private long inferenceTicks;
+
+            public Classifier(string modelPath)
             {
-                var scores = results.First().AsEnumerable<float>().ToArray();
-                var bestIndex = scores[1] > scores[0] ? 1 : 0;
-                return new Prediction(ClassNames[bestIndex], SoftmaxConfidence(scores, bestIndex));
+                using (var options = new SessionOptions())
+                    session = new InferenceSession(modelPath, options);
+
+                InputName = session.InputMetadata.Single().Key;
+                resized = new Bitmap(ImageSize, ImageSize, PixelFormat.Format24bppRgb);
+                graphics = Graphics.FromImage(resized);
+                graphics.CompositingMode = CompositingMode.SourceCopy;
+                graphics.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                graphics.PixelOffsetMode = PixelOffsetMode.Half;
+
+                tensorBuffer = new float[3 * PlaneSize];
+                var tensor = new DenseTensor<float>(tensorBuffer, new[] { 1, 3, ImageSize, ImageSize });
+                inputs = new[] { NamedOnnxValue.CreateFromTensor(InputName, tensor) };
             }
-        }
 
-        private static DenseTensor<float> LoadTensor(string imagePath)
-        {
-            using (var source = new Bitmap(imagePath))
-            using (var resized = new Bitmap(ImageSize, ImageSize, PixelFormat.Format24bppRgb))
+            public string InputName { get; private set; }
+            public double PreprocessMilliseconds { get { return preprocessTicks * 1000.0 / Stopwatch.Frequency; } }
+            public double InferenceMilliseconds { get { return inferenceTicks * 1000.0 / Stopwatch.Frequency; } }
+
+            public Prediction Predict(string imagePath)
             {
-                using (var graphics = Graphics.FromImage(resized))
+                var started = Stopwatch.GetTimestamp();
+                LoadTensor(imagePath);
+                var preprocessed = Stopwatch.GetTimestamp();
+                Prediction prediction;
+                using (var results = session.Run(inputs))
                 {
-                    graphics.CompositingMode = CompositingMode.SourceCopy;
-                    graphics.InterpolationMode = InterpolationMode.HighQualityBilinear;
-                    graphics.PixelOffsetMode = PixelOffsetMode.Half;
-                    graphics.DrawImage(source, new Rectangle(0, 0, ImageSize, ImageSize), 0, 0, source.Width, source.Height, GraphicsUnit.Pixel);
+                    var scores = results.First().AsTensor<float>();
+                    var first = scores.GetValue(0);
+                    var second = scores.GetValue(1);
+                    var bestIndex = second > first ? 1 : 0;
+                    prediction = new Prediction(ClassNames[bestIndex], SoftmaxConfidence(first, second, bestIndex));
                 }
+                var inferred = Stopwatch.GetTimestamp();
+                preprocessTicks += preprocessed - started;
+                inferenceTicks += inferred - preprocessed;
+                return prediction;
+            }
 
-                var tensor = new DenseTensor<float>(new[] { 1, 3, ImageSize, ImageSize });
+            public void ResetTimings()
+            {
+                preprocessTicks = 0;
+                inferenceTicks = 0;
+            }
+
+            public void Dispose()
+            {
+                graphics.Dispose();
+                resized.Dispose();
+                session.Dispose();
+            }
+
+            private unsafe void LoadTensor(string imagePath)
+            {
+                using (var source = new Bitmap(imagePath))
+                    graphics.DrawImage(source, new Rectangle(0, 0, ImageSize, ImageSize), 0, 0, source.Width, source.Height, GraphicsUnit.Pixel);
+
                 var rectangle = new Rectangle(0, 0, ImageSize, ImageSize);
                 var data = resized.LockBits(rectangle, ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
                 try
                 {
-                    var bytes = new byte[Math.Abs(data.Stride) * ImageSize];
-                    System.Runtime.InteropServices.Marshal.Copy(data.Scan0, bytes, 0, bytes.Length);
                     for (var y = 0; y < ImageSize; y++)
                     {
-                        var row = data.Stride > 0 ? y * data.Stride : (ImageSize - 1 - y) * -data.Stride;
+                        var row = (byte*)data.Scan0 + y * data.Stride;
+                        var tensorRow = y * ImageSize;
                         for (var x = 0; x < ImageSize; x++)
                         {
-                            var offset = row + x * 3;
-                            tensor[0, 0, y, x] = bytes[offset + 2] / 255f;
-                            tensor[0, 1, y, x] = bytes[offset + 1] / 255f;
-                            tensor[0, 2, y, x] = bytes[offset] / 255f;
+                            var sourceOffset = x * 3;
+                            var tensorOffset = tensorRow + x;
+                            tensorBuffer[tensorOffset] = row[sourceOffset + 2] / 255f;
+                            tensorBuffer[PlaneSize + tensorOffset] = row[sourceOffset + 1] / 255f;
+                            tensorBuffer[2 * PlaneSize + tensorOffset] = row[sourceOffset] / 255f;
                         }
                     }
                 }
@@ -144,15 +190,15 @@ namespace CSharpYolo461
                 {
                     resized.UnlockBits(data);
                 }
-                return tensor;
             }
         }
 
-        private static float SoftmaxConfidence(float[] scores, int index)
+        private static float SoftmaxConfidence(float first, float second, int index)
         {
-            var maximum = scores.Max();
-            var denominator = scores.Sum(score => Math.Exp(score - maximum));
-            return (float)(Math.Exp(scores[index] - maximum) / denominator);
+            var maximum = Math.Max(first, second);
+            var firstExp = Math.Exp(first - maximum);
+            var secondExp = Math.Exp(second - maximum);
+            return (float)((index == 0 ? firstExp : secondExp) / (firstExp + secondExp));
         }
 
         private static string MakeRelative(string root, string path)

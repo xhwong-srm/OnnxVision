@@ -7,7 +7,7 @@ Build and run from the repository root:
 ```powershell
 dotnet build CSharpYolo461\CSharpYolo461.csproj -c Release
 & CSharpYolo461\bin\Release\net461\win7-x64\CSharpYolo461.exe `
-  runs\classify\yolo26-seal\weights\best.onnx `
+  runs\classify\yolo26-seal-260721\weights\best.onnx `
   images\seal_dataset_v2\test
 ```
 
@@ -17,18 +17,21 @@ The executable must run as x64 because the ONNX Runtime native package is archit
 
 - Runtime: ONNX Runtime 1.17.3, CPU execution provider
 - Dataset: `images/seal_dataset_v2/test` (400 images)
-- Accuracy: 398/400 (99.50%)
-- Flipped recall: 43/43 (100.00%)
+- Model: `runs/classify/yolo26-seal-260721/weights/best.onnx`
+- Accuracy: 397/400 (99.25%)
+- Flipped recall: 42/43 (97.67%)
 - Normal recall: 355/357 (99.44%)
-- Warmed end-to-end latency: 18.949-22.740 ms/image across two runs (44.0-52.8 images/s)
-- Mismatches: `normal/36_D.bmp`, `normal/38_C.bmp`
+- Warmed end-to-end latency: 5.529-6.977 ms/image across three runs (143-181 images/s)
+- Preprocessing: 2.224-2.598 ms/image
+- ONNX inference: 3.286-4.352 ms/image
+- Mismatches: `flipped/22_E.bmp`, `normal/36_D.bmp`, `normal/38_C.bmp`
 
-The same ONNX model with the original TorchVision full-frame preprocessing produces the same two mismatches. Confidence varies slightly because `System.Drawing` and TorchVision use different resize implementations.
+The optimized path reuses its resize surface, tensor buffer, and ONNX input wrapper. It fills the CHW tensor directly from locked bitmap memory, avoiding per-image tensor and intermediate byte-array allocations.
 
 ## Deployment options considered
 
 1. **Direct ONNX Runtime in C# (implemented):** simplest in-process route for .NET Framework 4.6.1 and preserves test accuracy.
-2. **OpenVINO through native interop:** potentially faster on this Intel machine, but it requires owning a C API/P/Invoke wrapper and native deployment. There is no benefit to taking on that integration until 22.7 ms/image is insufficient.
+2. **OpenVINO through native interop:** potentially faster at model execution on Intel hardware, but it requires owning a C API/P/Invoke wrapper and native deployment. The optimized C# ONNX pipeline already matches the measured Python OpenVINO end-to-end latency.
 3. **External Python/OpenVINO worker:** already proven faster by the Python benchmark, but adds process lifecycle, IPC, Python environment, and failure-recovery concerns.
 
 For an existing .NET Framework application, start with option 1. Keep one `InferenceSession` alive for the process lifetime; constructing it per image is expensive.
