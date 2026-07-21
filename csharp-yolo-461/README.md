@@ -91,6 +91,43 @@ The DirectML package supports both DirectML and CPU. DirectML uses GPU device 0 
 
 ONNX Runtime reports that some shape-related nodes remain on CPU. This is expected with DirectML's CPU fallback and can reduce the benefit of GPU execution for small graphs.
 
+## OpenVINO execution-provider test
+
+OpenVINO is built separately because its native ONNX Runtime binaries cannot share an output directory with the DirectML package:
+
+```powershell
+dotnet build csharp-yolo-461\CSharpYolo461.OpenVino.csproj -c Release
+& csharp-yolo-461\bin\openvino\Release\net461\win7-x64\CSharpYolo461.OpenVino.exe `
+  runs\classify\yolo26-seal-260721\weights\best.onnx `
+  images\seal_dataset_v2\test openvino-gpu
+```
+
+Measured with `Intel.ML.OnnxRuntime.OpenVino` 1.20.0 and the original float-input model:
+
+- Dataset: 400 test images; both providers produced 398/400 accuracy and the same two mismatches
+- OpenVINO CPU median: 13.493 ms/image end-to-end and 4.483 ms/image inference
+- OpenVINO Intel GPU median: 11.266 ms/image end-to-end and 2.619 ms/image inference
+- Intel GPU improvement: approximately 16.5% end-to-end and 41.6% for inference
+
+Do not use the embedded `uint8` preprocessing wrapper with this OpenVINO GPU provider: it measured 124.680 ms/image because that graph shape causes expensive execution or device-transfer behavior. Use the original float-input model for OpenVINO; resizing and normalization remain in C#.
+
+### Static-shape embedded preprocessing for OpenVINO GPU
+
+For a production ROI whose dimensions never change, the export script can create an OpenVINO-oriented BW8 model. It casts and normalizes before float resize and fixes the raw input shape so the GPU does not compile kernels for changing dimensions:
+
+```powershell
+uv run python python-scripts\experiment_embedded_preprocessing.py `
+  runs\classify\yolo26-seal-260721\weights\best.onnx `
+  images\seal_dataset_v2\test `
+  --openvino-bw8-output artifacts\best-embedded-preprocess-openvino-bw8.onnx `
+  --openvino-input-width 125 --openvino-input-height 167 `
+  --skip-validation
+```
+
+The width and height must match the production ROI exactly. On the 48 test images sharing the measured `125x167` shape, the static model produced 48/48 correct predictions and a median 2.869 ms/image end-to-end across three runs (median 2.408 ms/image inside ONNX). The same graph with dynamic dimensions had a 3.069 ms/image median when every input remained `125x167`, but processing the full test set with many changing shapes took 179.030 ms/image. Stable input dimensions are therefore the important requirement; static model metadata provides a smaller additional improvement.
+
+These subset accuracy numbers do not replace the 400-image validation. Export the static model using the real production ROI dimensions and validate it on a representative dataset normalized to that exact shape before deployment.
+
 ## Measured result on this machine
 
 - Runtime: ONNX Runtime 1.17.3, CPU execution provider

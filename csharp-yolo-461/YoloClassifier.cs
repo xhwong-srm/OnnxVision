@@ -113,6 +113,14 @@ namespace CSharpYolo461
                 options.EnableMemoryPattern = false;
                 options.AppendExecutionProvider_DML(0);
             }
+            else if (executionProvider == ExecutionProvider.OpenVinoCpu)
+            {
+                options.AppendExecutionProvider_OpenVINO("CPU");
+            }
+            else if (executionProvider == ExecutionProvider.OpenVinoGpu)
+            {
+                options.AppendExecutionProvider_OpenVINO("GPU");
+            }
 
             return options;
         }
@@ -397,7 +405,9 @@ namespace CSharpYolo461
     public enum ExecutionProvider
     {
         Cpu,
-        DirectML
+        DirectML,
+        OpenVinoCpu,
+        OpenVinoGpu
     }
 
     public sealed class RoiPlacement

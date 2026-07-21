@@ -18,7 +18,7 @@ namespace CSharpYolo461
         {
             if (args.Length != 2 && args.Length != 3 && args.Length != 6 && args.Length != 7)
             {
-                Console.Error.WriteLine("Usage: CSharpYolo461.exe <model.onnx> <test-directory> [cpu|directml] [roi-x roi-y roi-width roi-height]");
+                Console.Error.WriteLine("Usage: CSharpYolo461.exe <model.onnx> <test-directory> [cpu|directml|openvino-cpu|openvino-gpu] [roi-x roi-y roi-width roi-height]");
                 return 2;
             }
 
@@ -40,7 +40,7 @@ namespace CSharpYolo461
             ExecutionProvider executionProvider;
             if (!TryParseExecutionProvider(args, out executionProvider))
             {
-                Console.Error.WriteLine("Execution provider must be 'cpu' or 'directml'.");
+                Console.Error.WriteLine("Execution provider must be 'cpu', 'directml', 'openvino-cpu', or 'openvino-gpu'.");
                 return 2;
             }
 
@@ -160,6 +160,16 @@ namespace CSharpYolo461
             if (string.Equals(args[2], "directml", StringComparison.OrdinalIgnoreCase))
             {
                 executionProvider = ExecutionProvider.DirectML;
+                return true;
+            }
+            if (string.Equals(args[2], "openvino-cpu", StringComparison.OrdinalIgnoreCase))
+            {
+                executionProvider = ExecutionProvider.OpenVinoCpu;
+                return true;
+            }
+            if (string.Equals(args[2], "openvino-gpu", StringComparison.OrdinalIgnoreCase))
+            {
+                executionProvider = ExecutionProvider.OpenVinoGpu;
                 return true;
             }
 

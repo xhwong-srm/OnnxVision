@@ -29,6 +29,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("dataset", type=Path, help="Class-folder dataset to compare")
     parser.add_argument("--bw8-output", type=Path, help="BW8 wrapped model output path")
     parser.add_argument("--c24-output", type=Path, help="C24 wrapped model output path")
+    parser.add_argument(
+        "--openvino-bw8-output",
+        type=Path,
+        help="Experimental BW8 model that casts before Resize for OpenVINO GPU",
+    )
+    parser.add_argument("--openvino-input-width", type=int)
+    parser.add_argument("--openvino-input-height", type=int)
+    parser.add_argument(
+        "--skip-validation", action="store_true", help="Only export the models"
+    )
     parser.add_argument("--imgsz", type=int, default=224)
     return parser.parse_args()
 
@@ -130,6 +140,72 @@ def wrap_bw8(model_path: Path, output_path: Path, imgsz: int) -> None:
     )
 
 
+def wrap_bw8_openvino(
+    model_path: Path,
+    output_path: Path,
+    imgsz: int,
+    input_width: int | None,
+    input_height: int | None,
+) -> None:
+    """Build a GPU-friendlier graph by resizing float data instead of uint8."""
+    core, core_input = prepare_core(model_path)
+    input_shape = [
+        1,
+        1,
+        input_height if input_height else "height",
+        input_width if input_width else "width",
+    ]
+    core.graph.input.append(
+        helper.make_tensor_value_info(
+            "images_bw8_uint8_nchw", TensorProto.UINT8, input_shape
+        )
+    )
+    sizes_name, scale_name = add_common_initializers(core, 1, imgsz)
+    rgb_shape_name = "preprocess/rgb_shape"
+    core.graph.initializer.append(
+        numpy_helper.from_array(
+            np.asarray([1, 3, imgsz, imgsz], dtype=np.int64), rgb_shape_name
+        )
+    )
+
+    preprocessing = [
+        helper.make_node(
+            "Cast",
+            ["images_bw8_uint8_nchw"],
+            ["preprocess/images_float"],
+            to=TensorProto.FLOAT,
+            name="preprocess/cast",
+        ),
+        helper.make_node(
+            "Div",
+            ["preprocess/images_float", scale_name],
+            ["preprocess/normalized_gray"],
+            name="preprocess/normalize",
+        ),
+        helper.make_node(
+            "Resize",
+            ["preprocess/normalized_gray", "", "", sizes_name],
+            ["preprocess/resized_float"],
+            mode="linear",
+            coordinate_transformation_mode="half_pixel",
+            antialias=1,
+            name="preprocess/resize_float",
+        ),
+        helper.make_node(
+            "Expand",
+            ["preprocess/resized_float", rgb_shape_name],
+            [core_input],
+            name="preprocess/gray_to_rgb",
+        ),
+    ]
+    finish_wrapper(
+        core,
+        preprocessing,
+        output_path,
+        "YOLO classifier with OpenVINO-oriented BW8 float-resize preprocessing.",
+    )
+
+
 def wrap_c24(model_path: Path, output_path: Path, imgsz: int) -> None:
     core, core_input = prepare_core(model_path)
     core.graph.input.append(
@@ -211,18 +287,44 @@ def main() -> None:
         if args.c24_output
         else model_path.with_name(f"{model_path.stem}-embedded-preprocess-c24.onnx")
     )
+    openvino_bw8_output = (
+        args.openvino_bw8_output.resolve() if args.openvino_bw8_output else None
+    )
+    if (args.openvino_input_width is None) != (args.openvino_input_height is None):
+        raise SystemExit(
+            "--openvino-input-width and --openvino-input-height must be supplied together"
+        )
     images = image_paths(dataset)
     if not images:
         raise SystemExit(f"No images found below {dataset}")
 
     wrap_bw8(model_path, bw8_output, args.imgsz)
     wrap_c24(model_path, c24_output, args.imgsz)
+    if openvino_bw8_output:
+        wrap_bw8_openvino(
+            model_path,
+            openvino_bw8_output,
+            args.imgsz,
+            args.openvino_input_width,
+            args.openvino_input_height,
+        )
+
+    if args.skip_validation:
+        print(f"created_bw8={bw8_output}")
+        print(f"created_c24={c24_output}")
+        if openvino_bw8_output:
+            print(f"created_openvino_bw8={openvino_bw8_output}")
+        return
 
     sessions = {
         "reference": ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"]),
         "bw8": ort.InferenceSession(str(bw8_output), providers=["CPUExecutionProvider"]),
         "c24": ort.InferenceSession(str(c24_output), providers=["CPUExecutionProvider"]),
     }
+    if openvino_bw8_output:
+        sessions["openvino_bw8"] = ort.InferenceSession(
+            str(openvino_bw8_output), providers=["CPUExecutionProvider"]
+        )
     input_names = {name: session.get_inputs()[0].name for name, session in sessions.items()}
     preprocessing = transforms.Compose(
         [transforms.Resize((args.imgsz, args.imgsz), antialias=True), transforms.ToTensor()]
@@ -233,6 +335,9 @@ def main() -> None:
     correct = {name: 0 for name in sessions}
     agreements = {"bw8": 0, "c24": 0, "bw8_c24": 0}
     maximum_score_delta = {"bw8": 0.0, "c24": 0.0, "bw8_c24": 0.0}
+    if openvino_bw8_output:
+        agreements["openvino_bw8"] = 0
+        maximum_score_delta["openvino_bw8"] = 0.0
     changed: list[str] = []
 
     for path in images:
@@ -245,6 +350,8 @@ def main() -> None:
                 # EImageC24 uses Windows-compatible BGR byte order in memory.
                 "c24": np.asarray(rgb, dtype=np.uint8)[..., ::-1].copy()[None, ...],
             }
+            if openvino_bw8_output:
+                tensors["openvino_bw8"] = tensors["bw8"]
 
         scores = {
             name: sessions[name].run(None, {input_names[name]: tensor})[0][0]
@@ -258,6 +365,10 @@ def main() -> None:
         agreements["bw8"] += predictions["bw8"] == predictions["reference"]
         agreements["c24"] += predictions["c24"] == predictions["reference"]
         agreements["bw8_c24"] += predictions["bw8"] == predictions["c24"]
+        if openvino_bw8_output:
+            agreements["openvino_bw8"] += (
+                predictions["openvino_bw8"] == predictions["reference"]
+            )
         maximum_score_delta["bw8"] = max(
             maximum_score_delta["bw8"],
             float(np.max(np.abs(scores["bw8"] - scores["reference"]))),
@@ -270,6 +381,15 @@ def main() -> None:
             maximum_score_delta["bw8_c24"],
             float(np.max(np.abs(scores["bw8"] - scores["c24"]))),
         )
+        if openvino_bw8_output:
+            maximum_score_delta["openvino_bw8"] = max(
+                maximum_score_delta["openvino_bw8"],
+                float(
+                    np.max(
+                        np.abs(scores["openvino_bw8"] - scores["reference"])
+                    )
+                ),
+            )
         if len(set(predictions.values())) != 1:
             changed.append(
                 f"{path.relative_to(dataset)}: "
@@ -279,6 +399,8 @@ def main() -> None:
     total = len(images)
     print(f"created_bw8={bw8_output}")
     print(f"created_c24={c24_output}")
+    if openvino_bw8_output:
+        print(f"created_openvino_bw8={openvino_bw8_output}")
     print("bw8_input=images_bw8_uint8_nchw uint8 NCHW dynamic-height-width grayscale")
     print("c24_input=images_c24_uint8_nhwc_bgr uint8 NHWC dynamic-height-width BGR")
     print(f"images={total}")
