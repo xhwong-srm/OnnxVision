@@ -72,6 +72,8 @@ Run either model with the same executable:
 
 The BW8 model accepts `uint8 [1,1,H,W]` NCHW grayscale. The C24 model accepts raw Euresys/Windows-compatible `uint8 [1,H,W,3]` NHWC BGR and performs BGR-to-RGB conversion inside ONNX. Both graphs perform resize, float conversion, normalization, and then execute the same classifier core.
 
+The Ultralytics export embeds the ordered class mapping in ONNX metadata under `names`, for example `{0: 'flipped', 1: 'normal'}`. `YoloClassifier` reads this mapping when `classNames` is omitted; explicitly supplied names remain supported and must match the embedded order when metadata is present.
+
 The executable must run as x64 because the ONNX Runtime native package is architecture-specific.
 
 Select the ONNX Runtime execution provider after the test directory. CPU remains the default:

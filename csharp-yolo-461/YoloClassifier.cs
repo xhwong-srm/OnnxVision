@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using Euresys.Open_eVision_22_12;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
@@ -15,6 +16,8 @@ namespace CSharpYolo461
     /// </summary>
     public sealed class YoloClassifier : IDisposable
     {
+        private const string ClassNamesMetadataKey = "names";
+
         private readonly InferenceSession session;
         private readonly string[] classNames;
         private readonly EROIBW8 attachedBw8Roi;
@@ -29,21 +32,26 @@ namespace CSharpYolo461
         private long inferenceTicks;
         private bool disposed;
 
-        public YoloClassifier(string modelPath, IEnumerable<string> classNames, RoiPlacement defaultRoi = null,
+        public YoloClassifier(string modelPath, IEnumerable<string> classNames = null, RoiPlacement defaultRoi = null,
             ExecutionProvider executionProvider = ExecutionProvider.Cpu)
         {
             if (string.IsNullOrWhiteSpace(modelPath))
                 throw new ArgumentException("A model path is required.", "modelPath");
-            if (classNames == null)
-                throw new ArgumentNullException("classNames");
-
-            this.classNames = classNames.ToArray();
-            if (this.classNames.Length == 0 || this.classNames.Any(string.IsNullOrWhiteSpace))
-                throw new ArgumentException("At least one non-empty class name is required.", "classNames");
-
             ExecutionProvider = executionProvider;
             using (var options = CreateSessionOptions(executionProvider))
                 session = new InferenceSession(modelPath, options);
+
+            var embeddedClassNames = ReadEmbeddedClassNames();
+            var explicitClassNames = classNames == null ? null : classNames.ToArray();
+            ValidateClassNames(explicitClassNames, "classNames");
+            ValidateClassNames(embeddedClassNames, "model metadata");
+            if (explicitClassNames != null && embeddedClassNames != null &&
+                !explicitClassNames.SequenceEqual(embeddedClassNames, StringComparer.Ordinal))
+                throw new InvalidOperationException("Explicit class names do not match the model's embedded names metadata.");
+
+            this.classNames = explicitClassNames ?? embeddedClassNames;
+            if (this.classNames == null)
+                throw new ArgumentException("Class names must be supplied or embedded in the ONNX model metadata.", "classNames");
 
             var inputMetadata = session.InputMetadata.Single();
             InputName = inputMetadata.Key;
@@ -350,6 +358,36 @@ namespace CSharpYolo461
         {
             if (disposed)
                 throw new ObjectDisposedException("YoloClassifier");
+        }
+
+        private string[] ReadEmbeddedClassNames()
+        {
+            string serializedNames;
+            if (!session.ModelMetadata.CustomMetadataMap.TryGetValue(ClassNamesMetadataKey, out serializedNames) ||
+                string.IsNullOrWhiteSpace(serializedNames))
+                return null;
+
+            var matches = Regex.Matches(serializedNames, @"(?<index>\d+)\s*:\s*'(?<name>[^']*)'");
+            if (matches.Count == 0)
+                matches = Regex.Matches(serializedNames, "(?<index>\\d+)\\s*:\\s*\"(?<name>[^\"]*)\"");
+            if (matches.Count == 0)
+                throw new InvalidOperationException("The ONNX model names metadata is not a valid class mapping.");
+
+            var names = new string[matches.Count];
+            for (var position = 0; position < matches.Count; position++)
+            {
+                var index = int.Parse(matches[position].Groups["index"].Value);
+                if (index != position)
+                    throw new InvalidOperationException("The ONNX model names metadata must use contiguous class indices starting at zero.");
+                names[position] = matches[position].Groups["name"].Value;
+            }
+            return names;
+        }
+
+        private static void ValidateClassNames(string[] names, string source)
+        {
+            if (names != null && (names.Length == 0 || names.Any(string.IsNullOrWhiteSpace)))
+                throw new ArgumentException("Class names from " + source + " must contain at least one non-empty name.");
         }
 
         private enum InputContract

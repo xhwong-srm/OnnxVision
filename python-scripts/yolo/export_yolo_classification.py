@@ -1,6 +1,6 @@
 """Export a YOLO classification checkpoint to ONNX.
 
-The regular export accepts the float RGB NCHW tensor used by the existing
+The regular export accepts the float RGB NCHW tensor used by the original
 preprocessing path.  With ``--embedded-preprocessing`` this script also emits
 two uint8 models for the two camera input families:
 
