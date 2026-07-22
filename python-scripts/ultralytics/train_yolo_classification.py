@@ -56,6 +56,12 @@ def parse_args():
     )
     parser.add_argument("--model", default="yolo26n-cls.pt")
     parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=8,
+        help="Stop after this many epochs without validation improvement; 0 disables early stopping",
+    )
     parser.add_argument("--imgsz", type=int, default=224)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument(
@@ -83,6 +89,7 @@ def main() -> None:
         trainer=FullFrameClassificationTrainer,
         data=str(data),
         epochs=args.epochs,
+        patience=args.patience,
         imgsz=args.imgsz,
         batch=args.batch,
         device=args.device,

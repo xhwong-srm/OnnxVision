@@ -28,6 +28,12 @@ def parse_args():
     )
     parser.add_argument("--model", default=MODEL_NAME)
     parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=8,
+        help="Stop after this many epochs without validation improvement; 0 disables early stopping",
+    )
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -160,6 +166,7 @@ def main() -> None:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     best_accuracy = -1.0
+    epochs_without_improvement = 0
     history = []
 
     for epoch in range(1, args.epochs + 1):
@@ -172,7 +179,14 @@ def main() -> None:
         save_checkpoint(output / "last.pt", model, optimizer, epoch, val_accuracy, train_set.classes, config, args.model)
         if val_accuracy > best_accuracy:
             best_accuracy = val_accuracy
+            epochs_without_improvement = 0
             save_checkpoint(output / "best.pt", model, optimizer, epoch, val_accuracy, train_set.classes, config, args.model)
+        else:
+            epochs_without_improvement += 1
+
+        if args.patience > 0 and epochs_without_improvement >= args.patience:
+            print(f"early stopping after epoch {epoch}: validation accuracy did not improve for {args.patience} epochs")
+            break
 
     with (output / "history.csv").open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=history[0].keys())
