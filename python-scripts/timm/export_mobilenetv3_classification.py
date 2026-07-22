@@ -31,6 +31,17 @@ from torchvision import transforms
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 
 
+class ProbabilityModel(torch.nn.Module):
+    """Expose classifier probabilities instead of raw logits for deployment."""
+
+    def __init__(self, model: torch.nn.Module):
+        super().__init__()
+        self.model = model
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        return torch.softmax(self.model(images), dim=1)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", type=Path, help="Checkpoint (.pt) produced by the training script")
@@ -94,11 +105,12 @@ def export_onnx(args: argparse.Namespace):
     if args.half:
         model = model.half()
         input_tensor = input_tensor.half()
-    dynamic_axes = {"images": {0: "batch"}, "logits": {0: "batch"}} if args.dynamic else None
+    export_model = ProbabilityModel(model)
+    dynamic_axes = {"images": {0: "batch"}, "probabilities": {0: "batch"}} if args.dynamic else None
     if args.dynamic:
         dynamic_axes["images"].update({2: "height", 3: "width"})
     print(f"Exporting {checkpoint_path.name} ({model.__class__.__name__}) to ONNX...")
-    torch.onnx.export(model, input_tensor, output, input_names=["images"], output_names=["logits"],
+    torch.onnx.export(export_model, input_tensor, output, input_names=["images"], output_names=["probabilities"],
                       opset_version=args.opset, dynamic_axes=dynamic_axes,
                       do_constant_folding=True, dynamo=False)
     if args.simplify:
