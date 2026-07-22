@@ -273,8 +273,10 @@ namespace CSharpYolo461
                     }
                 }
 
+                var probabilities = new float[scores.Length];
+                SoftmaxProbabilities(scores, probabilities);
                 prediction = new Prediction(classNames[bestIndex], bestIndex,
-                    SoftmaxConfidence(scores, bestIndex));
+                    probabilities[bestIndex], probabilities);
             }
 
             var inferred = Stopwatch.GetTimestamp();
@@ -345,7 +347,7 @@ namespace CSharpYolo461
                         placement.X, placement.Y, placement.Width, placement.Height, imageWidth, imageHeight));
         }
 
-        private static float SoftmaxConfidence(Tensor<float> scores, int selectedIndex)
+        private static void SoftmaxProbabilities(Tensor<float> scores, float[] probabilities)
         {
             var maximum = float.MinValue;
             for (var index = 0; index < scores.Length; index++)
@@ -355,7 +357,8 @@ namespace CSharpYolo461
             for (var index = 0; index < scores.Length; index++)
                 denominator += Math.Exp(scores.GetValue(index) - maximum);
 
-            return (float)(Math.Exp(scores.GetValue(selectedIndex) - maximum) / denominator);
+            for (var index = 0; index < scores.Length; index++)
+                probabilities[index] = (float)(Math.Exp(scores.GetValue(index) - maximum) / denominator);
         }
 
         private void ThrowIfDisposed()
@@ -486,15 +489,17 @@ namespace CSharpYolo461
 
     public sealed class Prediction
     {
-        public Prediction(string name, int classIndex, float confidence)
+        public Prediction(string name, int classIndex, float confidence, float[] probabilities)
         {
             Name = name;
             ClassIndex = classIndex;
             Confidence = confidence;
+            Probabilities = probabilities;
         }
 
         public string Name { get; private set; }
         public int ClassIndex { get; private set; }
         public float Confidence { get; private set; }
+        public IReadOnlyList<float> Probabilities { get; private set; }
     }
 }

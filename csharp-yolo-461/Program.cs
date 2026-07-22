@@ -85,6 +85,11 @@ namespace CSharpYolo461
             var flippedTotal = 0;
             var normalCorrect = 0;
             var normalTotal = 0;
+            var truePositives = 0;
+            var falsePositives = 0;
+            var falseNegatives = 0;
+            var trueNegatives = 0;
+            var rocScores = new List<RocPoint>();
             var errors = new List<string>();
 
             foreach (var image in images)
@@ -107,12 +112,26 @@ namespace CSharpYolo461
                     normalTotal++;
                     if (isCorrect) normalCorrect++;
                 }
+
+                var actualPositive = string.Equals(expected, "flipped", StringComparison.OrdinalIgnoreCase);
+                var predictedPositive = string.Equals(prediction.Name, "flipped", StringComparison.OrdinalIgnoreCase);
+                if (actualPositive && predictedPositive) truePositives++;
+                else if (!actualPositive && predictedPositive) falsePositives++;
+                else if (actualPositive) falseNegatives++;
+                else trueNegatives++;
+
+                var positiveIndex = predictedPositive ? prediction.ClassIndex : 1 - prediction.ClassIndex;
+                if (prediction.Probabilities != null && prediction.Probabilities.Count > positiveIndex)
+                    rocScores.Add(new RocPoint(actualPositive, prediction.Probabilities[positiveIndex]));
             }
 
             stopwatch.Stop();
             Console.WriteLine("Accuracy: {0}/{1} ({2:P2})", correct, images.Length, Divide(correct, images.Length));
             Console.WriteLine("Flipped recall: {0}/{1} ({2:P2})", flippedCorrect, flippedTotal, Divide(flippedCorrect, flippedTotal));
             Console.WriteLine("Normal recall: {0}/{1} ({2:P2})", normalCorrect, normalTotal, Divide(normalCorrect, normalTotal));
+            PrintClassificationMetrics(truePositives, falsePositives, falseNegatives, trueNegatives, rocScores);
+            PrintConfidenceInterval("Accuracy 95% Wilson CI", correct, images.Length, 1.96);
+            PrintConfidenceInterval("Accuracy 99% Wilson CI", correct, images.Length, 2.576);
             Console.WriteLine("End-to-end: {0:F3} ms/image ({1:F1} images/s)",
                 stopwatch.Elapsed.TotalMilliseconds / images.Length,
                 images.Length / stopwatch.Elapsed.TotalSeconds);
@@ -124,9 +143,88 @@ namespace CSharpYolo461
                 Console.WriteLine("Mismatch: " + error);
         }
 
+        private static void PrintClassificationMetrics(int tp, int fp, int fn, int tn, List<RocPoint> rocScores)
+        {
+            var precision = Divide(tp, tp + fp);
+            var recall = Divide(tp, tp + fn);
+            var f1 = Divide(2.0 * precision * recall, precision + recall);
+            var normalPrecision = Divide(tn, tn + fn);
+            var normalRecall = Divide(tn, tn + fp);
+            var normalF1 = Divide(2.0 * normalPrecision * normalRecall, normalPrecision + normalRecall);
+            Console.WriteLine("Confusion matrix (actual rows / predicted columns):");
+            Console.WriteLine("                 flipped  normal");
+            Console.WriteLine("actual flipped    {0,7} {1,7}", tp, fn);
+            Console.WriteLine("actual normal     {0,7} {1,7}", fp, tn);
+            Console.WriteLine("Flipped precision: {0:P2}; recall: {1:P2}; F1: {2:P2}", precision, recall, f1);
+            Console.WriteLine("Normal precision: {0:P2}; recall: {1:P2}; F1: {2:P2}", normalPrecision, normalRecall, normalF1);
+            Console.WriteLine("Macro precision: {0:P2}; macro recall: {1:P2}; macro F1: {2:P2}",
+                (precision + normalPrecision) / 2.0,
+                (recall + normalRecall) / 2.0,
+                (f1 + normalF1) / 2.0);
+            Console.WriteLine("ROC AUC (flipped positive): {0:F4}", CalculateAuc(rocScores));
+        }
+
+        private static void PrintConfidenceInterval(string label, int successes, int total, double z)
+        {
+            if (total == 0)
+            {
+                Console.WriteLine(label + ": n/a");
+                return;
+            }
+
+            var p = (double)successes / total;
+            var zSquared = z * z;
+            var denominator = 1.0 + zSquared / total;
+            var centre = p + zSquared / (2.0 * total);
+            var margin = z * Math.Sqrt((p * (1.0 - p) + zSquared / (4.0 * total)) / total);
+            Console.WriteLine("{0}: [{1:P2}, {2:P2}]", label,
+                Math.Max(0.0, (centre - margin) / denominator),
+                Math.Min(1.0, (centre + margin) / denominator));
+        }
+
+        private static double CalculateAuc(List<RocPoint> scores)
+        {
+            var positives = scores.Count(point => point.ActualPositive);
+            var negatives = scores.Count - positives;
+            if (positives == 0 || negatives == 0)
+                return double.NaN;
+
+            var ordered = scores.OrderBy(point => point.Score).ToArray();
+            var rank = 1.0;
+            var positiveRankSum = 0.0;
+            for (var i = 0; i < ordered.Length;)
+            {
+                var end = i + 1;
+                while (end < ordered.Length && ordered[end].Score == ordered[i].Score) end++;
+                var averageRank = (rank + rank + end - i - 1.0) / 2.0;
+                for (var j = i; j < end; j++)
+                    if (ordered[j].ActualPositive) positiveRankSum += averageRank;
+                rank += end - i;
+                i = end;
+            }
+            return (positiveRankSum - positives * (positives + 1) / 2.0) / (positives * (double)negatives);
+        }
+
+        private sealed class RocPoint
+        {
+            public RocPoint(bool actualPositive, float score)
+            {
+                ActualPositive = actualPositive;
+                Score = score;
+            }
+
+            public bool ActualPositive { get; private set; }
+            public float Score { get; private set; }
+        }
+
         private static double Divide(int numerator, int denominator)
         {
             return denominator == 0 ? 0.0 : (double)numerator / denominator;
+        }
+
+        private static double Divide(double numerator, double denominator)
+        {
+            return denominator == 0.0 ? 0.0 : numerator / denominator;
         }
 
         private static bool TryParseRoi(string[] args, out RoiPlacement placement)
