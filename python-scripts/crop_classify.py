@@ -7,6 +7,7 @@ Classify: python crop.py --model path/to/best.pt
 
 from __future__ import annotations
 
+import ast
 import os
 import random
 import sys
@@ -368,6 +369,10 @@ class MainWindow(QMainWindow):
         self.results: dict[tuple[Path, int], tuple[str, float]] = {}
         self.model_path = initial_model
         self.model: YOLO | None = None
+        self.onnx_session = None
+        self.onnx_input_name: str | None = None
+        self.onnx_kind: str | None = None
+        self.class_names: dict[int, str] = {}
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -849,11 +854,18 @@ class MainWindow(QMainWindow):
 
     def choose_model(self):
         filename, _ = QFileDialog.getOpenFileName(
-            self, "Choose trained classification model", "", "PyTorch model (*.pt)"
+            self,
+            "Choose trained classification model",
+            "",
+            "Classification model (*.pt *.onnx);;PyTorch model (*.pt);;ONNX model (*.onnx)",
         )
         if filename:
             self.model_path = Path(filename).resolve()
             self.model = None
+            self.onnx_session = None
+            self.onnx_input_name = None
+            self.onnx_kind = None
+            self.class_names = {}
             self.results.clear()
             self.update_model_label()
             if self.current_index >= 0:
@@ -867,7 +879,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No images", "Open at least one image first.")
             return
         if not self.model_path or not self.model_path.is_file():
-            QMessageBox.information(self, "Model required", "Choose your trained best.pt model first.")
+            QMessageBox.information(
+                self,
+                "Model required",
+                "Choose a trained .pt model or an embedded BW8/C24 .onnx model first.",
+            )
             self.choose_model()
             if not self.model_path or not self.model_path.is_file():
                 return
@@ -880,8 +896,7 @@ class MainWindow(QMainWindow):
         self.status.setText("Loading model and classifying ROI(s)...")
         QApplication.processEvents()
         try:
-            if self.model is None:
-                self.model = YOLO(str(self.model_path), task="classify")
+            self.load_model()
             crops: list[Image.Image] = []
             keys: list[tuple[Path, int]] = []
             for entry in targets:
@@ -890,10 +905,14 @@ class MainWindow(QMainWindow):
                     crops.append(image.crop((x, y, x + width, y + height)))
                     keys.append(self.result_key(entry, index))
             probabilities = self.predict_full_frame(crops)
-            names = self.model.names
+            names = self.model.names if self.model is not None else self.class_names
             for key, probs in zip(keys, probabilities):
-                confidence, class_index = probs.max(dim=0)
-                self.results[key] = (str(names[int(class_index)]), float(confidence))
+                class_index = int(np.argmax(probs))
+                if isinstance(names, dict):
+                    class_name = names.get(class_index, class_index)
+                else:
+                    class_name = names[class_index] if class_index < len(names) else class_index
+                self.results[key] = (str(class_name), float(probs[class_index]))
             if self.current_index >= 0:
                 self.select_image(self.current_index)
             self.update_status(f"Classified {len(crops)} ROI(s).")
@@ -903,8 +922,65 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
 
-    def predict_full_frame(self, images: list[Image.Image]) -> torch.Tensor:
-        """Use the same full-frame resize and scaling as the training dataset."""
+    def load_model(self):
+        assert self.model_path is not None
+        if self.model_path.suffix.lower() == ".onnx":
+            if self.onnx_session is not None:
+                return
+            try:
+                import onnxruntime as ort
+            except ImportError as error:
+                raise RuntimeError("ONNX models require the onnxruntime package.") from error
+            session = ort.InferenceSession(str(self.model_path), providers=["CPUExecutionProvider"])
+            inputs = session.get_inputs()
+            if len(inputs) != 1:
+                raise ValueError("Expected an embedded model with exactly one input.")
+            input_info = inputs[0]
+            if input_info.name == "images_bw8_uint8_nchw":
+                self.onnx_kind = "bw8"
+            elif input_info.name == "images_c24_uint8_nhwc_bgr":
+                self.onnx_kind = "c24"
+            else:
+                raise ValueError(
+                    "The ONNX model is not an embedded BW8 or C24 classifier "
+                    f"(input: {input_info.name})."
+                )
+            self.onnx_session = session
+            self.onnx_input_name = input_info.name
+            self.class_names = self.read_onnx_names(session)
+            return
+        if self.model is None:
+            self.model = YOLO(str(self.model_path), task="classify")
+
+    @staticmethod
+    def read_onnx_names(session) -> dict[int, str]:
+        metadata = session.get_modelmeta().custom_metadata_map
+        raw_names = metadata.get("names")
+        if not raw_names:
+            return {}
+        try:
+            names = ast.literal_eval(raw_names)
+        except (SyntaxError, ValueError):
+            return {}
+        if isinstance(names, dict):
+            return {int(index): str(name) for index, name in names.items()}
+        if isinstance(names, (list, tuple)):
+            return dict(enumerate(map(str, names)))
+        return {}
+
+    def predict_full_frame(self, images: list[Image.Image]) -> np.ndarray:
+        """Use embedded preprocessing for ONNX or the training preprocessing for PT."""
+        if self.onnx_session is not None:
+            assert self.onnx_input_name is not None
+            predictions = []
+            for image in images:
+                if self.onnx_kind == "bw8":
+                    tensor = np.asarray(image.convert("L"), dtype=np.uint8)[None, None, ...]
+                else:
+                    tensor = np.asarray(image.convert("RGB"), dtype=np.uint8)[..., ::-1].copy()[None, ...]
+                predictions.append(self.onnx_session.run(None, {self.onnx_input_name: tensor})[0][0])
+            return np.asarray(predictions)
+
         assert self.model is not None
         core = self.model.model
         imgsz_value = getattr(core, "args", {}).get("imgsz", 224)
@@ -920,7 +996,7 @@ class MainWindow(QMainWindow):
             output = core(batch.to(device))
             if isinstance(output, (tuple, list)):
                 output = output[0]
-            return output.cpu()
+            return output.cpu().numpy()
 
     def result_text(self, roi_index: int) -> str:
         if not self.classification_mode or self.current_index < 0:
@@ -1075,7 +1151,11 @@ class MainWindow(QMainWindow):
 
 def parse_args():
     parser = ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, help="Trained Ultralytics classification checkpoint (best.pt)")
+    parser.add_argument(
+        "--model",
+        type=Path,
+        help="Trained .pt checkpoint or embedded BW8/C24 .onnx model",
+    )
     return parser.parse_args()
 
 
