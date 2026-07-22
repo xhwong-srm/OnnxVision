@@ -7,13 +7,13 @@
     <Nullable>disable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
-    <AssemblyName>CSharpYolo461.OpenVino.Backend</AssemblyName>
-    <BaseOutputPath>bin\openvino\</BaseOutputPath>
+    <AssemblyName>CSharpYolo461.DirectML.Backend</AssemblyName>
+    <BaseOutputPath>bin\directml\</BaseOutputPath>
   </PropertyGroup>
 
   <ItemGroup>
     <Compile Include="YoloClassifier.cs" />
-    <PackageReference Include="Intel.ML.OnnxRuntime.OpenVino" Version="1.24.1" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.DirectML" Version="1.24.4" />
     <Reference Include="Open_eVision_NetApi_22_12">
       <HintPath>C:\VisionRef64\Open_eVision_NetApi_22_12.dll</HintPath>
       <Private>true</Private>
