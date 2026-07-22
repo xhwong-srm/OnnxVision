@@ -15,16 +15,12 @@ namespace CSharpYolo461
     /// </summary>
     public sealed class YoloClassifier : IDisposable
     {
-        private const int FloatModelImageSize = 224;
-        private const int FloatModelPlaneSize = FloatModelImageSize * FloatModelImageSize;
-
         private readonly InferenceSession session;
         private readonly string[] classNames;
         private readonly EROIBW8 attachedBw8Roi;
         private readonly EROIC24 attachedC24Roi;
         private readonly RoiPlacement defaultRoi;
         private readonly InputContract inputContract;
-        private readonly float[] floatTensorBuffer;
         private byte[] byteTensorBuffer;
         private int byteTensorWidth;
         private int byteTensorHeight;
@@ -52,14 +48,12 @@ namespace CSharpYolo461
             var inputMetadata = session.InputMetadata.Single();
             InputName = inputMetadata.Key;
             var dimensions = inputMetadata.Value.Dimensions;
-            if (inputMetadata.Value.ElementType == typeof(float))
-                inputContract = InputContract.FloatNchw;
-            else if (inputMetadata.Value.ElementType == typeof(byte) && dimensions.Length == 4 && dimensions[1] == 1)
+            if (inputMetadata.Value.ElementType == typeof(byte) && dimensions.Length == 4 && dimensions[1] == 1)
                 inputContract = InputContract.Bw8Nchw;
             else if (inputMetadata.Value.ElementType == typeof(byte) && dimensions.Length == 4 && dimensions[3] == 3)
                 inputContract = InputContract.C24Nhwc;
             else
-                throw new NotSupportedException("Expected float NCHW, uint8 BW8 NCHW, or uint8 C24 NHWC input metadata.");
+                throw new NotSupportedException("Expected uint8 BW8 NCHW or uint8 C24 NHWC input metadata with embedded preprocessing.");
 
             this.defaultRoi = defaultRoi;
             if (inputContract == InputContract.C24Nhwc)
@@ -67,13 +61,6 @@ namespace CSharpYolo461
             else
                 attachedBw8Roi = new EROIBW8();
 
-            if (inputContract == InputContract.FloatNchw)
-            {
-                floatTensorBuffer = new float[3 * FloatModelPlaneSize];
-                var tensor = new DenseTensor<float>(floatTensorBuffer,
-                    new[] { 1, 3, FloatModelImageSize, FloatModelImageSize });
-                inputs = new[] { NamedOnnxValue.CreateFromTensor(InputName, tensor) };
-            }
         }
 
         public string InputName { get; private set; }
@@ -85,12 +72,12 @@ namespace CSharpYolo461
             {
                 switch (inputContract)
                 {
-                    case InputContract.FloatNchw:
-                        return "float NCHW; resize and normalization run in C#";
                     case InputContract.Bw8Nchw:
                         return "uint8 [1,1,H,W] BW8 NCHW; preprocessing runs inside ONNX";
-                    default:
+                    case InputContract.C24Nhwc:
                         return "uint8 [1,H,W,3] C24 NHWC BGR; channel reorder and preprocessing run inside ONNX";
+                    default:
+                        throw new InvalidOperationException("Unknown input contract.");
                 }
             }
         }
@@ -100,7 +87,7 @@ namespace CSharpYolo461
             get { return inputContract == InputContract.C24Nhwc ? "EImageC24 / EROIC24" : "EImageBW8 / EROIBW8"; }
         }
 
-        public bool HasEmbeddedPreprocessing { get { return inputContract != InputContract.FloatNchw; } }
+        public bool HasEmbeddedPreprocessing { get { return true; } }
         public double PreprocessMilliseconds { get { return preprocessTicks * 1000.0 / Stopwatch.Frequency; } }
         public double InferenceMilliseconds { get { return inferenceTicks * 1000.0 / Stopwatch.Frequency; } }
 
@@ -284,38 +271,9 @@ namespace CSharpYolo461
             return prediction;
         }
 
-        private unsafe void LoadTensor(EROIBW8 roi)
+        private void LoadTensor(EROIBW8 roi)
         {
-            if (inputContract == InputContract.Bw8Nchw)
-            {
-                LoadByteTensor(roi);
-                return;
-            }
-
-            for (var y = 0; y < FloatModelImageSize; y++)
-            {
-                var sourceY = ((y + 0.5) * roi.Height / FloatModelImageSize) - 0.5;
-                var y0 = Math.Max(0, Math.Min(roi.Height - 1, (int)Math.Floor(sourceY)));
-                var y1 = Math.Min(y0 + 1, roi.Height - 1);
-                var yWeight = sourceY <= 0 ? 0.0 : sourceY - Math.Floor(sourceY);
-                var row0 = (byte*)roi.GetImagePtr(0, y0).ToPointer();
-                var row1 = (byte*)roi.GetImagePtr(0, y1).ToPointer();
-                var tensorRow = y * FloatModelImageSize;
-                for (var x = 0; x < FloatModelImageSize; x++)
-                {
-                    var sourceX = ((x + 0.5) * roi.Width / FloatModelImageSize) - 0.5;
-                    var x0 = Math.Max(0, Math.Min(roi.Width - 1, (int)Math.Floor(sourceX)));
-                    var x1 = Math.Min(x0 + 1, roi.Width - 1);
-                    var xWeight = sourceX <= 0 ? 0.0 : sourceX - Math.Floor(sourceX);
-                    var top = row0[x0] + (row0[x1] - row0[x0]) * xWeight;
-                    var bottom = row1[x0] + (row1[x1] - row1[x0]) * xWeight;
-                    var pixel = (float)((top + (bottom - top) * yWeight) / 255.0);
-                    var tensorOffset = tensorRow + x;
-                    floatTensorBuffer[tensorOffset] = pixel;
-                    floatTensorBuffer[FloatModelPlaneSize + tensorOffset] = pixel;
-                    floatTensorBuffer[2 * FloatModelPlaneSize + tensorOffset] = pixel;
-                }
-            }
+            LoadByteTensor(roi);
         }
 
         private void LoadByteTensor(EROIBW8 roi)
@@ -396,7 +354,6 @@ namespace CSharpYolo461
 
         private enum InputContract
         {
-            FloatNchw,
             Bw8Nchw,
             C24Nhwc
         }
