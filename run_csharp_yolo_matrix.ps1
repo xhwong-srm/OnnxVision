@@ -105,12 +105,20 @@ foreach ($Job in $Jobs) {
 
     Write-Host ("[{0}/{1}] {2} ({3}), repeat {4}" -f $JobNumber, $Jobs.Count, (Split-Path $Job.Executable -Leaf), $Job.Provider, $Job.Iteration)
 
+    $PreviousErrorActionPreference = $ErrorActionPreference
     try {
+        # Windows PowerShell 5.1 can turn stderr from a native executable into
+        # a terminating error when ErrorActionPreference is Stop. The runners
+        # may legitimately write warnings to stderr, so keep the process alive
+        # and capture that stream together with stdout.
+        $ErrorActionPreference = "Continue"
         $Output = & $Job.Executable $ModelPath $DatasetPath $Job.Provider 2>&1 | Out-String
         $ExitCode = $LASTEXITCODE
     } catch {
-        $ErrorOutput = $_.Exception.Message
+        $ErrorOutput = ($_ | Out-String)
         $Output = $ErrorOutput
+    } finally {
+        $ErrorActionPreference = $PreviousErrorActionPreference
     }
     $Stopwatch.Stop()
 
