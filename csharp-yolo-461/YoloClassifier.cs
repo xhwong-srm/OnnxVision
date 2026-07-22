@@ -1,8 +1,12 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Runtime.Serialization;
+using System.Runtime.Serialization.Json;
+using System.Text;
 using System.Text.RegularExpressions;
 using Euresys.Open_eVision_22_12;
 using Microsoft.ML.OnnxRuntime;
@@ -367,6 +371,38 @@ namespace CSharpYolo461
                 string.IsNullOrWhiteSpace(serializedNames))
                 return null;
 
+            serializedNames = serializedNames.Trim();
+            // Some exporters persist the complete JSON value with one extra pair
+            // of single quotes. Remove that wrapper before trying valid JSON.
+            if (serializedNames.Length >= 2 && serializedNames[0] == '\'' &&
+                serializedNames[serializedNames.Length - 1] == '\'')
+                serializedNames = serializedNames.Substring(1, serializedNames.Length - 2).Trim();
+
+            if (serializedNames.StartsWith("{", StringComparison.Ordinal))
+            {
+                try
+                {
+                    var serializer = new DataContractJsonSerializer(
+                        typeof(Dictionary<string, string>),
+                        new DataContractJsonSerializerSettings { UseSimpleDictionaryFormat = true });
+                    using (var stream = new MemoryStream(Encoding.UTF8.GetBytes(serializedNames)))
+                    {
+                        var jsonNames = (Dictionary<string, string>)serializer.ReadObject(stream);
+                        return BuildClassNames(jsonNames);
+                    }
+                }
+                catch (SerializationException)
+                {
+                    // Ultralytics exports the same mapping as a Python-style
+                    // dictionary, so let the legacy parser below handle it.
+                }
+                catch (ArgumentException)
+                {
+                    // Ultralytics exports the same mapping as a Python-style
+                    // dictionary, so let the legacy parser below handle it.
+                }
+            }
+
             var matches = Regex.Matches(serializedNames, @"(?<index>\d+)\s*:\s*'(?<name>[^']*)'");
             if (matches.Count == 0)
                 matches = Regex.Matches(serializedNames, "(?<index>\\d+)\\s*:\\s*\"(?<name>[^\"]*)\"");
@@ -381,6 +417,28 @@ namespace CSharpYolo461
                     throw new InvalidOperationException("The ONNX model names metadata must use contiguous class indices starting at zero.");
                 names[position] = matches[position].Groups["name"].Value;
             }
+            return names;
+        }
+
+        private static string[] BuildClassNames(IDictionary<string, string> serializedNames)
+        {
+            if (serializedNames == null || serializedNames.Count == 0)
+                throw new InvalidOperationException("The ONNX model names metadata must contain at least one class.");
+
+            var names = new string[serializedNames.Count];
+            foreach (var entry in serializedNames)
+            {
+                int index;
+                if (!int.TryParse(entry.Key, out index) || index < 0 || index >= names.Length ||
+                    names[index] != null)
+                    throw new InvalidOperationException("The ONNX model names metadata must use unique contiguous class indices starting at zero.");
+
+                names[index] = entry.Value;
+            }
+
+            if (names.Any(string.IsNullOrWhiteSpace))
+                throw new InvalidOperationException("The ONNX model names metadata must use contiguous class indices starting at zero.");
+
             return names;
         }
 
