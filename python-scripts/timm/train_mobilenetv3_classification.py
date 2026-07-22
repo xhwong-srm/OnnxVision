@@ -54,7 +54,21 @@ def image_transform(model, *, train: bool):
     interpolation = getattr(transforms.InterpolationMode, config.get("interpolation", "bicubic").upper())
     operations = [transforms.Resize((height, width), interpolation=interpolation, antialias=True)]
     if train:
-        operations.append(transforms.RandomHorizontalFlip())
+        operations.extend(
+            [
+                transforms.RandomApply(
+                    [
+                        transforms.RandomAffine(
+                            degrees=3,
+                            translate=(0.03, 0.03),
+                            scale=(0.97, 1.03),
+                        ),
+                        transforms.ColorJitter(brightness=0.10, contrast=0.10),
+                    ],
+                    p=0.5,
+                ),
+            ]
+        )
     operations.extend(
         [
             transforms.ToTensor(),

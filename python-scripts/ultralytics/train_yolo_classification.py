@@ -18,6 +18,19 @@ class FullFrameClassificationDataset(ClassificationDataset):
         self.torch_transforms = transforms.Compose(
             [
                 transforms.Resize((args.imgsz, args.imgsz), antialias=True),
+                transforms.RandomApply(
+                    [
+                        transforms.RandomAffine(
+                            degrees=3,
+                            translate=(0.03, 0.03),
+                            scale=(0.97, 1.03),
+                        ),
+                        transforms.ColorJitter(brightness=0.10, contrast=0.10),
+                    ],
+                    p=0.5,
+                )
+                if augment
+                else transforms.Lambda(lambda image: image),
                 transforms.ToTensor(),
             ]
         )
