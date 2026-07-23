@@ -7,11 +7,13 @@
     <LangVersion>7.3</LangVersion>
     <Nullable>disable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>OnnxVision.OpenVino</AssemblyName>
+    <BaseOutputPath>bin\openvino\</BaseOutputPath>
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Remove="YoloClassifier.cs" />
-    <ProjectReference Include="CSharpYolo461.Backend.csproj" />
+    <Compile Remove="ImageClassifier.cs" />
+    <ProjectReference Include="OnnxVision.OpenVino.Backend.csproj" />
     <Reference Include="Open_eVision_NetApi_22_12">
       <HintPath>C:\VisionRef64\Open_eVision_NetApi_22_12.dll</HintPath>
       <Private>true</Private>

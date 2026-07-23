@@ -5,7 +5,7 @@ using System.IO;
 using System.Linq;
 using Microsoft.ML.OnnxRuntime;
 
-namespace CSharpYolo461
+namespace OnnxVision
 {
     internal static class Program
     {
@@ -18,7 +18,7 @@ namespace CSharpYolo461
         {
             if (args.Length != 2 && args.Length != 3 && args.Length != 6 && args.Length != 7)
             {
-                Console.Error.WriteLine("Usage: CSharpYolo461.exe <model.onnx> <test-directory> [cpu|directml|openvino-cpu|openvino-gpu] [roi-x roi-y roi-width roi-height]");
+                Console.Error.WriteLine("Usage: OnnxVision.exe <model.onnx> <test-directory> [cpu|directml|openvino-cpu|openvino-gpu] [roi-x roi-y roi-width roi-height]");
                 return 2;
             }
 
@@ -49,7 +49,7 @@ namespace CSharpYolo461
                 .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
 
-            using (var classifier = new YoloClassifier(modelPath, new[] { "flipped", "normal" }, roiPlacement, executionProvider))
+            using (var classifier = new ImageClassifier(modelPath, null, roiPlacement, executionProvider))
             {
                 PrintModelInformation(classifier, images.Length, roiPlacement);
 
@@ -63,7 +63,7 @@ namespace CSharpYolo461
             return 0;
         }
 
-        private static void PrintModelInformation(YoloClassifier classifier, int imageCount, RoiPlacement roiPlacement)
+        private static void PrintModelInformation(ImageClassifier classifier, int imageCount, RoiPlacement roiPlacement)
         {
             Console.WriteLine("Runtime: ONNX Runtime {0}, .NET Framework {1}",
                 OrtEnv.Instance().GetVersionString(), Environment.Version);
@@ -77,7 +77,7 @@ namespace CSharpYolo461
                         roiPlacement.X, roiPlacement.Y, roiPlacement.Width, roiPlacement.Height)));
         }
 
-        private static void RunEvaluation(YoloClassifier classifier, string testDirectory, string[] images)
+        private static void RunEvaluation(ImageClassifier classifier, string testDirectory, string[] images)
         {
             var stopwatch = Stopwatch.StartNew();
             var correct = 0;

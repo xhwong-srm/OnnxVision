@@ -1,5 +1,5 @@
 <Project>
-  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'CSharpYolo461.OpenVino' Or '$(MSBuildProjectName)' == 'CSharpYolo461.OpenVino.Backend'">
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'OnnxVision.OpenVino' Or '$(MSBuildProjectName)' == 'OnnxVision.OpenVino.Backend'">
     <BaseIntermediateOutputPath>obj\openvino\$(MSBuildProjectName)\</BaseIntermediateOutputPath>
     <MSBuildProjectExtensionsPath>obj\openvino\$(MSBuildProjectName)\</MSBuildProjectExtensionsPath>
     <DefaultItemExcludes>$(DefaultItemExcludes);obj\**</DefaultItemExcludes>

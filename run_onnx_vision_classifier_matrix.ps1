@@ -12,7 +12,7 @@ param(
     [ValidateRange(0, 86400)]
     [double] $GapSeconds = 0,
 
-    [string] $OutputCsv = "runs\csharp-yolo-matrix.csv",
+    [string] $OutputCsv = "runs\onnx-vision-classifier-matrix.csv",
 
     [int] $Seed = 0,
 
@@ -40,12 +40,12 @@ function Resolve-DirectoryPath([string] $Path) {
 
 function New-DefaultCommandSpec {
     @(
-        "csharp-yolo-461\bin\openvino\Release\net461\win7-x64\CSharpYolo461.OpenVino.exe|openvino-gpu",
-        "csharp-yolo-461\bin\openvino\Release\net461\win7-x64\CSharpYolo461.OpenVino.exe|openvino-cpu",
-        "csharp-yolo-461\bin\openvino\Release\net461\win7-x64\CSharpYolo461.OpenVino.exe|cpu",
-        "csharp-yolo-461\bin\directml\Release\net461\win7-x64\CSharpYolo461.DirectML.exe|directml",
-        "csharp-yolo-461\bin\directml\Release\net461\win7-x64\CSharpYolo461.DirectML.exe|cpu",
-        "csharp-yolo-461\bin\Release\net461\win7-x64\CSharpYolo461.exe|cpu"
+        "onnx-vision\bin\openvino\Release\net461\win7-x64\OnnxVision.OpenVino.exe|openvino-gpu",
+        "onnx-vision\bin\openvino\Release\net461\win7-x64\OnnxVision.OpenVino.exe|openvino-cpu",
+        "onnx-vision\bin\openvino\Release\net461\win7-x64\OnnxVision.OpenVino.exe|cpu",
+        "onnx-vision\bin\directml\Release\net461\win7-x64\OnnxVision.DirectML.exe|directml",
+        "onnx-vision\bin\directml\Release\net461\win7-x64\OnnxVision.DirectML.exe|cpu",
+        "onnx-vision\bin\Release\net461\win7-x64\OnnxVision.exe|cpu"
     )
 }
 

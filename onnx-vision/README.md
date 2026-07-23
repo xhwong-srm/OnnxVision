@@ -1,14 +1,16 @@
-# C# YOLO26 classification experiment (.NET Framework 4.6.1)
+# ONNX Vision for C# (.NET Framework 4.6.1)
 
-This console application runs the exported YOLO26 classification ONNX model in-process with ONNX Runtime. Image ownership and ROI access use Euresys Open eVision 22.12. The runner supports grayscale `EImageBW8`/`EROIBW8` and color `EImageC24`/`EROIC24`; preprocessing must be embedded in the ONNX graph.
+`OnnxVision` is a model-agnostic ONNX computer-vision runtime for .NET Framework. Its current `ImageClassifier` component runs classification models in-process with ONNX Runtime; the project name intentionally leaves room for future object-detection and segmentation components. Image ownership and ROI access use Euresys Open eVision 22.12.
+
+Classification models must follow the documented wrapper contract: raw BW8 `uint8 [1,1,H,W]` NCHW or raw C24 BGR `uint8 [1,H,W,3]` NHWC input, preprocessing embedded in the ONNX graph, one float score per class as output, and ordered class names supplied explicitly or stored in ONNX metadata under `names`. The model architecture does not need to be YOLO.
 
 The project references the installed production assembly at `C:\VisionRef64\Open_eVision_NetApi_22_12.dll` and must run on a machine with the matching Open eVision 22.12 x64 runtime.
 
 Build and run from the repository root:
 
 ```powershell
-dotnet build CSharpYolo461\CSharpYolo461.csproj -c Release
-& CSharpYolo461\bin\Release\net461\win7-x64\CSharpYolo461.exe `
+dotnet build onnx-vision\OnnxVision.csproj -c Release
+& onnx-vision\bin\Release\net461\win7-x64\OnnxVision.exe `
   runs\classify\yolo26-seal-260721\weights\best.onnx `
   images\seal_dataset_v2\test
 ```
@@ -16,7 +18,7 @@ dotnet build CSharpYolo461\CSharpYolo461.csproj -c Release
 With a fixed production ROI, append `x y width height`:
 
 ```powershell
-& CSharpYolo461\bin\Release\net461\win7-x64\CSharpYolo461.exe `
+& onnx-vision\bin\Release\net461\win7-x64\OnnxVision.exe `
   runs\classify\yolo26-seal-260721\weights\best.onnx `
   images\seal_dataset_v2\test `
   100 80 640 640
@@ -24,13 +26,13 @@ With a fixed production ROI, append `x y width height`:
 
 The code is split into two assemblies:
 
-- `CSharpYolo461.Backend.csproj` contains the reusable `YoloClassifier`, model lifetime, raw-image tensor packing, and inference API.
-- `CSharpYolo461.csproj` is only the console/dataset frontend.
+- `OnnxVision.Backend.csproj` contains the reusable `ImageClassifier`, model lifetime, raw-image tensor packing, and inference API.
+- `OnnxVision.csproj` is only the console/dataset frontend.
 
 Reference the backend project from another .NET Framework application and keep one classifier alive:
 
 ```csharp
-using (var classifier = new YoloClassifier(
+using (var classifier = new ImageClassifier(
     modelPath,
     new[] { "flipped", "normal" }))
 {
@@ -61,25 +63,25 @@ uv run python python-scripts\export_yolo_classification.py `
 Run either model with the same executable:
 
 ```powershell
-& CSharpYolo461\bin\Release\net461\win7-x64\CSharpYolo461.exe `
+& onnx-vision\bin\Release\net461\win7-x64\OnnxVision.exe `
   artifacts\best-embedded-preprocess-bw8.onnx `
   images\seal_dataset_v2\test
 
-& CSharpYolo461\bin\Release\net461\win7-x64\CSharpYolo461.exe `
+& onnx-vision\bin\Release\net461\win7-x64\OnnxVision.exe `
   artifacts\best-embedded-preprocess-c24.onnx `
   images\seal_dataset_v2\test
 ```
 
 The BW8 model accepts `uint8 [1,1,H,W]` NCHW grayscale. The C24 model accepts raw Euresys/Windows-compatible `uint8 [1,H,W,3]` NHWC BGR and performs BGR-to-RGB conversion inside ONNX. Both graphs perform resize, float conversion, normalization, and then execute the same classifier core.
 
-The Ultralytics export embeds the ordered class mapping in ONNX metadata under `names`, for example `{0: 'flipped', 1: 'normal'}`. `YoloClassifier` reads this mapping when `classNames` is omitted; explicitly supplied names remain supported and must match the embedded order when metadata is present.
+The example Ultralytics export embeds the ordered class mapping in ONNX metadata under `names`, for example `{0: 'flipped', 1: 'normal'}`. `ImageClassifier` reads this mapping when `classNames` is omitted; explicitly supplied names remain supported and must match the embedded order when metadata is present.
 
 The executable must run as x64 because the ONNX Runtime native package is architecture-specific.
 
 Select the ONNX Runtime execution provider after the test directory. CPU remains the default:
 
 ```powershell
-& csharp-yolo-461\bin\Release\net461\win7-x64\CSharpYolo461.exe `
+& onnx-vision\bin\Release\net461\win7-x64\OnnxVision.exe `
   artifacts\best-embedded-preprocess-bw8.onnx `
   images\seal_dataset_v2\test directml
 ```
@@ -102,8 +104,8 @@ ONNX Runtime reports that some shape-related nodes remain on CPU. This is expect
 OpenVINO is built separately because its native ONNX Runtime binaries cannot share an output directory with the DirectML package:
 
 ```powershell
-dotnet build csharp-yolo-461\CSharpYolo461.OpenVino.csproj -c Release
-& csharp-yolo-461\bin\openvino\Release\net461\win7-x64\CSharpYolo461.OpenVino.exe `
+dotnet build onnx-vision\OnnxVision.OpenVino.csproj -c Release
+& onnx-vision\bin\openvino\Release\net461\win7-x64\OnnxVision.OpenVino.exe `
   runs\classify\yolo26-seal-260721\weights\best.onnx `
   images\seal_dataset_v2\test openvino-gpu
 ```

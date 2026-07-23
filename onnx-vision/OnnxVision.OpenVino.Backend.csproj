@@ -7,12 +7,12 @@
     <Nullable>disable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
-    <AssemblyName>CSharpYolo461.OpenVino.Backend</AssemblyName>
+    <AssemblyName>OnnxVision.OpenVino.Backend</AssemblyName>
     <BaseOutputPath>bin\openvino\</BaseOutputPath>
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="YoloClassifier.cs" />
+    <Compile Include="ImageClassifier.cs" />
     <PackageReference Include="Intel.ML.OnnxRuntime.OpenVino" Version="1.24.1" />
     <Reference Include="Open_eVision_NetApi_22_12">
       <HintPath>C:\VisionRef64\Open_eVision_NetApi_22_12.dll</HintPath>

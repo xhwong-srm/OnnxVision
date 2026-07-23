@@ -1,19 +1,17 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
     <TargetFramework>net461</TargetFramework>
     <PlatformTarget>x64</PlatformTarget>
     <RuntimeIdentifier>win7-x64</RuntimeIdentifier>
     <LangVersion>7.3</LangVersion>
     <Nullable>disable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <AssemblyName>CSharpYolo461.DirectML</AssemblyName>
-    <BaseOutputPath>bin\directml\</BaseOutputPath>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Remove="YoloClassifier.cs" />
-    <ProjectReference Include="CSharpYolo461.DirectML.Backend.csproj" />
+    <Compile Include="ImageClassifier.cs" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.27.1" />
     <Reference Include="Open_eVision_NetApi_22_12">
       <HintPath>C:\VisionRef64\Open_eVision_NetApi_22_12.dll</HintPath>
       <Private>true</Private>

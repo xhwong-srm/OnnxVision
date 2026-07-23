@@ -12,13 +12,13 @@ using Euresys.Open_eVision_22_12;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 
-namespace CSharpYolo461
+namespace OnnxVision
 {
     /// <summary>
     /// Reusable ONNX image-classification backend. Keep one instance alive and reuse it.
     /// An instance is not safe for concurrent calls to Predict.
     /// </summary>
-    public sealed class YoloClassifier : IDisposable
+    public sealed class ImageClassifier : IDisposable
     {
         private const string ClassNamesMetadataKey = "names";
 
@@ -36,7 +36,7 @@ namespace CSharpYolo461
         private long inferenceTicks;
         private bool disposed;
 
-        public YoloClassifier(string modelPath, IEnumerable<string> classNames = null, RoiPlacement defaultRoi = null,
+        public ImageClassifier(string modelPath, IEnumerable<string> classNames = null, RoiPlacement defaultRoi = null,
             ExecutionProvider executionProvider = ExecutionProvider.Cpu)
         {
             if (string.IsNullOrWhiteSpace(modelPath))
@@ -364,7 +364,7 @@ namespace CSharpYolo461
         private void ThrowIfDisposed()
         {
             if (disposed)
-                throw new ObjectDisposedException("YoloClassifier");
+                throw new ObjectDisposedException("ImageClassifier");
         }
 
         private string[] ReadEmbeddedClassNames()
