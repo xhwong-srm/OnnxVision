@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import sys
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -165,6 +166,37 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+
+    # Keep the effective configuration alongside every run so it can be reproduced
+    # even when the command used to start training is no longer available.
+    parameters = {
+        "command": [sys.executable, *sys.argv],
+        "data": str(data),
+        "model": args.model,
+        "epochs": args.epochs,
+        "patience": args.patience,
+        "batch": args.batch,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "workers": args.workers,
+        "seed": args.seed,
+        "output": str(output),
+        "requested_device": args.device,
+        "device": str(device),
+        "pretrained": True,
+        "optimizer": "AdamW",
+        "scheduler": {"name": "CosineAnnealingLR", "T_max": args.epochs},
+        "loss": "CrossEntropyLoss",
+        "mixed_precision": device.type == "cuda",
+        "num_classes": len(train_set.classes),
+        "classes": train_set.classes,
+        "train_samples": len(train_set),
+        "val_samples": len(val_set),
+        "test_samples": len(test_set) if test_set is not None else 0,
+        "torch_version": torch.__version__,
+        "timm_version": getattr(timm, "__version__", "unknown"),
+        "data_config": config,
+    }
     best_accuracy = -1.0
     epochs_without_improvement = 0
     history = []
@@ -192,7 +224,13 @@ def main() -> None:
         writer = csv.DictWriter(file, fieldnames=history[0].keys())
         writer.writeheader()
         writer.writerows(history)
-    (output / "metadata.json").write_text(json.dumps({"model_name": args.model, "classes": train_set.classes, "data_config": config}, indent=2), encoding="utf-8")
+    metadata = {
+        "model_name": args.model,
+        "classes": train_set.classes,
+        "data_config": config,
+        "parameters": parameters,
+    }
+    (output / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     if test_loader is not None:
         best = torch.load(output / "best.pt", map_location=device, weights_only=False)
         model.load_state_dict(best["model_state_dict"])
