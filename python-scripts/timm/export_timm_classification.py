@@ -1,4 +1,4 @@
-"""Export a checkpoint from train_mobilenetv3_classification.py to ONNX.
+"""Export a timm classification checkpoint from train_mobilenetv3_classification.py to ONNX.
 
 The normal model input is a float RGB NCHW tensor after the training
 script's resize, ToTensor, and Normalize operations.  With
@@ -9,7 +9,7 @@ embedded callers:
 * C24: uint8 BGR NHWC
 
 The embedded models perform resize, RGB conversion where required, scaling,
-and the MobileNetV3 mean/std normalization inside ONNX.
+and the model's mean/std normalization inside ONNX.
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ def load_training_checkpoint(path: Path, model_name_override: str | None):
         raise FileNotFoundError(f"Checkpoint not found: {path}")
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
-        raise ValueError("Expected a checkpoint produced by train_mobilenetv3_classification.py")
+        raise ValueError("Expected a checkpoint produced by the timm classification training script")
     model_name = model_name_override or checkpoint.get("model_name")
     classes = checkpoint.get("classes")
     if not model_name or not classes:
@@ -180,7 +180,7 @@ def wrap_bw8(model_path, output_path, imgsz, config):
              helper.make_node("Expand", ["preprocess/scaled", "preprocess/rgb_shape"], ["preprocess/rgb"], name="preprocess/gray_to_rgb"),
              helper.make_node("Sub", ["preprocess/rgb", "preprocess/mean"], ["preprocess/centered"], name="preprocess/mean"),
              helper.make_node("Div", ["preprocess/centered", "preprocess/std"], [core_input], name="preprocess/std")]
-    finish_wrapper(core, nodes, output_path, "timm MobileNetV3 with BW8 preprocessing.")
+    finish_wrapper(core, nodes, output_path, "timm image classifier with BW8 preprocessing.")
 
 
 def wrap_c24(model_path, output_path, imgsz, config):
@@ -195,7 +195,7 @@ def wrap_c24(model_path, output_path, imgsz, config):
              helper.make_node("Div", ["preprocess/resized_float", "preprocess/pixel_scale"], ["preprocess/scaled"], name="preprocess/scale"),
              helper.make_node("Sub", ["preprocess/scaled", "preprocess/mean"], ["preprocess/centered"], name="preprocess/mean"),
              helper.make_node("Div", ["preprocess/centered", "preprocess/std"], [core_input], name="preprocess/std")]
-    finish_wrapper(core, nodes, output_path, "timm MobileNetV3 with C24 preprocessing.")
+    finish_wrapper(core, nodes, output_path, "timm image classifier with C24 preprocessing.")
 
 
 def image_paths(dataset: Path):
