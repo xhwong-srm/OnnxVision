@@ -6,7 +6,9 @@ Run:
 Draw boxes with the mouse, select a class with Tab, and move between images with
 Left/Right. A learned pattern stores the current annotations relative to a
 distinctive template. Any number of patterns can be learned and used to place
-those annotations on the current image or the whole batch.
+those annotations on the current image or the whole batch. Export either full
+images with YOLO detection labels or cropped ROIs in YOLO classification class
+folders.
 """
 
 from __future__ import annotations
@@ -50,6 +52,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -469,6 +472,30 @@ class MainWindow(QMainWindow):
         self.pattern_threshold.setValue(0.75)
         threshold_row.addWidget(self.pattern_threshold)
         right.addLayout(threshold_row)
+        occurrence_row = QHBoxLayout()
+        occurrence_nms_column = QVBoxLayout()
+        occurrence_nms_column.addWidget(QLabel("Occurrence NMS"))
+        self.occurrence_nms = QDoubleSpinBox()
+        self.occurrence_nms.setRange(0.0, 1.0)
+        self.occurrence_nms.setDecimals(2)
+        self.occurrence_nms.setSingleStep(0.05)
+        self.occurrence_nms.setValue(0.30)
+        self.occurrence_nms.setToolTip(
+            "Lower values suppress nearby pattern hits more aggressively."
+        )
+        occurrence_nms_column.addWidget(self.occurrence_nms)
+        occurrence_row.addLayout(occurrence_nms_column)
+        maximum_column = QVBoxLayout()
+        maximum_column.addWidget(QLabel("Max / pattern"))
+        self.maximum_occurrences = QSpinBox()
+        self.maximum_occurrences.setRange(1, 10000)
+        self.maximum_occurrences.setValue(500)
+        self.maximum_occurrences.setToolTip(
+            "Maximum accepted occurrences for each pattern in each image."
+        )
+        maximum_column.addWidget(self.maximum_occurrences)
+        occurrence_row.addLayout(maximum_column)
+        right.addLayout(occurrence_row)
         self.auto_fit_boxes = QCheckBox("Auto-fit rough boxes using patterns")
         self.auto_fit_boxes.setChecked(True)
         self.auto_fit_boxes.setToolTip(
@@ -495,6 +522,12 @@ class MainWindow(QMainWindow):
         auto_all = QPushButton("Auto-place boxes on all")
         auto_all.clicked.connect(lambda: self.auto_place(True))
         right.addWidget(auto_all)
+        clear_current_rois = QPushButton("Delete all ROIs on current image")
+        clear_current_rois.clicked.connect(self.clear_current_rois)
+        right.addWidget(clear_current_rois)
+        clear_all_rois = QPushButton("Delete all ROIs on all images")
+        clear_all_rois.clicked.connect(self.clear_all_rois)
+        right.addWidget(clear_all_rois)
 
         right.addWidget(QLabel("Export split"))
         split_row = QHBoxLayout()
@@ -507,9 +540,12 @@ class MainWindow(QMainWindow):
             column.addWidget(box)
             split_row.addLayout(column)
         right.addLayout(split_row)
-        export = QPushButton("Generate YOLO dataset...")
-        export.clicked.connect(self.export_dataset)
-        right.addWidget(export)
+        export_detection = QPushButton("Generate detection dataset...")
+        export_detection.clicked.connect(self.export_detection_dataset)
+        right.addWidget(export_detection)
+        export_classification = QPushButton("Generate classification crops...")
+        export_classification.clicked.connect(self.export_classification_dataset)
+        right.addWidget(export_classification)
         layout.addLayout(right, 1)
 
         self.add_shortcut(Qt.Key.Key_Left, lambda: self.navigate(-1))
@@ -652,6 +688,8 @@ class MainWindow(QMainWindow):
                     image,
                     pattern.template,
                     self.pattern_threshold.value(),
+                    self.occurrence_nms.value(),
+                    self.maximum_occurrences.value(),
                 )
             except ValueError:
                 continue
@@ -888,7 +926,13 @@ class MainWindow(QMainWindow):
                 for pattern in self.patterns:
                     template_height, template_width = pattern.template.shape
                     try:
-                        found = find_pattern_matches(image, pattern.template, threshold)
+                        found = find_pattern_matches(
+                            image,
+                            pattern.template,
+                            threshold,
+                            self.occurrence_nms.value(),
+                            self.maximum_occurrences.value(),
+                        )
                         if not found:
                             raise ValueError(f"no matches at or above {threshold:.2f}")
                         reference_x, reference_y, _, _ = pattern.reference_rect
@@ -952,6 +996,37 @@ class MainWindow(QMainWindow):
             current = max(self.current_index, 0)
             self.image_list.setCurrentRow(min(max(current + amount, 0), len(self.entries) - 1))
 
+    def clear_current_rois(self) -> None:
+        if not 0 <= self.current_index < len(self.entries):
+            return
+        entry = self.entries[self.current_index]
+        if not entry.annotations:
+            return
+        if QMessageBox.question(
+            self,
+            "Delete current ROIs?",
+            f"Delete all {len(entry.annotations)} ROI(s) from the current image?",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        entry.annotations.clear()
+        self.select_image(self.current_index)
+        self.update_status("Deleted all ROIs from the current image.")
+
+    def clear_all_rois(self) -> None:
+        count = sum(len(entry.annotations) for entry in self.entries)
+        if not count:
+            return
+        if QMessageBox.question(
+            self,
+            "Delete all ROIs?",
+            f"Delete all {count} ROI(s) from all {len(self.entries)} image(s)?",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        for entry in self.entries:
+            entry.annotations.clear()
+        self.select_image(self.current_index)
+        self.update_status("Deleted all ROIs from all images.")
+
     def clear_images(self) -> None:
         if self.entries and QMessageBox.question(
             self, "Clear images?", "Remove all images, boxes, and learned patterns?"
@@ -979,7 +1054,7 @@ class MainWindow(QMainWindow):
                 Qt.GlobalColor.darkGreen if entry.annotations else Qt.GlobalColor.transparent
             )
 
-    def export_dataset(self) -> None:
+    def export_detection_dataset(self) -> None:
         if not self.entries:
             QMessageBox.information(self, "No images", "Add images before exporting.")
             return
@@ -1071,6 +1146,98 @@ class MainWindow(QMainWindow):
             f"Created a YOLO detection dataset with {copied} image(s):\n{output}",
         )
         self.update_status(f"Dataset created: {output}")
+
+    def export_classification_dataset(self) -> None:
+        if not self.entries:
+            QMessageBox.information(self, "No images", "Add images before exporting.")
+            return
+        annotation_count = sum(len(entry.annotations) for entry in self.entries)
+        if not annotation_count:
+            QMessageBox.information(
+                self,
+                "No ROIs",
+                "Draw or auto-place at least one ROI before exporting classification crops.",
+            )
+            return
+        if not self.classes:
+            QMessageBox.information(self, "No classes", "Add at least one class before exporting.")
+            return
+        values = (self.train_ratio.value(), self.val_ratio.value(), self.test_ratio.value())
+        if abs(sum(values) - 100.0) > 0.01:
+            QMessageBox.warning(self, "Invalid split", "Train, val, and test must add up to 100%.")
+            return
+        parent = QFileDialog.getExistingDirectory(self, "Choose the parent folder for the dataset")
+        if not parent:
+            return
+        value, accepted = QInputDialog.getText(
+            self,
+            "Dataset folder",
+            "New dataset folder name:",
+            QLineEdit.EchoMode.Normal,
+            "classification_dataset",
+        )
+        if not accepted:
+            return
+        try:
+            dataset_name = validate_name(value, "Dataset folder name")
+        except ValueError as error:
+            QMessageBox.warning(self, "Invalid folder name", str(error))
+            return
+        output = Path(parent) / dataset_name
+        if output.exists():
+            QMessageBox.warning(self, "Destination exists", f"Nothing was changed:\n{output}")
+            return
+
+        entries = list(self.entries)
+        random.Random(42).shuffle(entries)
+        ratios = tuple(value / 100.0 for value in values)
+        counts = split_counts(len(entries), ratios)  # type: ignore[arg-type]
+        splits: dict[str, list[ImageEntry]] = {}
+        offset = 0
+        for split, count in zip(("train", "val", "test"), counts):
+            splits[split] = entries[offset : offset + count]
+            offset += count
+
+        cropped = 0
+        try:
+            for split, split_entries in splits.items():
+                for class_name in self.classes:
+                    (output / split / class_name).mkdir(parents=True, exist_ok=True)
+                for entry in split_entries:
+                    image = load_image(entry.path)
+                    digest = hashlib.sha1(str(entry.path.resolve()).encode()).hexdigest()[:10]
+                    for annotation_index, annotation in enumerate(entry.annotations):
+                        if not 0 <= annotation.class_id < len(self.classes):
+                            raise ValueError(
+                                f"{entry.path.name} has invalid class ID {annotation.class_id}."
+                            )
+                        x, y, width, height = annotation.rect
+                        if width <= 0 or height <= 0:
+                            raise ValueError(
+                                f"{entry.path.name} ROI {annotation_index + 1} is empty."
+                            )
+                        crop = image.crop((x, y, x + width, y + height))
+                        filename = (
+                            f"{entry.path.stem}_{digest}_roi{annotation_index + 1:04d}.png"
+                        )
+                        destination = (
+                            output / split / self.classes[annotation.class_id] / filename
+                        )
+                        crop.save(destination)
+                        cropped += 1
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Classification export failed",
+                f"Exported {cropped} crop(s) before the error.\n\n{error}\n\nPartial output: {output}",
+            )
+            return
+        QMessageBox.information(
+            self,
+            "Classification dataset created",
+            f"Created {cropped} classification crop(s) from {len(self.entries)} source image(s):\n{output}",
+        )
+        self.update_status(f"Classification dataset created: {output}")
 
     @staticmethod
     def yaml_string(value: str) -> str:
