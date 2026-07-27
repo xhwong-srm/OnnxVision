@@ -1,583 +1,491 @@
-"""Keyboard-first builder for Ultralytics YOLO classification datasets.
+"""Interactive ROI classification dataset builder.
 
-Run:
-    uv run python classification_dataset_builder.py
-    uv run python classification_dataset_builder.py --model runs/classify/.../best.pt
-
-Workflow:
-    1. Add images or a folder.
-    2. Add/select classes. Tab cycles classes; Enter assigns and advances.
-    3. Optionally load a trained classification model and auto-label images.
-    4. Export copies to ``train/class``, ``val/class`` and ``test/class``.
+The editor works on full source images.  ROIs can be drawn, moved with the
+right mouse button, multi-selected with Ctrl, learned as a template pattern,
+auto-populated to image edges, classified with an embedded ONNX classifier,
+and exported as class-folder train/val/test crops.
 """
-
 from __future__ import annotations
 
+import ast
 import hashlib
 import random
 import shutil
 import sys
 from argparse import ArgumentParser
-from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QKeySequence, QPixmap, QShortcut
+import cv2
+import numpy as np
+from PIL import Image, ImageOps
+from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtGui import QBrush, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QApplication,
-    QCheckBox,
-    QComboBox,
-    QDoubleSpinBox,
-    QFileDialog,
-    QHBoxLayout,
-    QInputDialog,
-    QLabel,
-    QLineEdit,
-    QListWidget,
-    QListWidgetItem,
-    QMainWindow,
-    QMessageBox,
-    QPushButton,
-    QVBoxLayout,
-    QWidget,
+    QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QGraphicsItem,
+    QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsScene, QGraphicsView,
+    QHBoxLayout, QInputDialog, QLabel, QListWidget, QMainWindow, QMessageBox,
+    QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
 )
-from ultralytics import YOLO
-
 
 SUPPORTED_SUFFIXES = {".bmp", ".dng", ".gif", ".heic", ".jpeg", ".jpg", ".mpo", ".png", ".tif", ".tiff", ".webp"}
-INVALID_CLASS_CHARACTERS = set('<>:"/\\|?*')
-RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+BAD = set('<>:"/\\|?*')
+RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 
 
-def validate_class_name(value: str) -> str:
-    name = value.strip()
-    if not name or name in {".", ".."}:
-        raise ValueError("Class name cannot be empty.")
-    if any(character in INVALID_CLASS_CHARACTERS for character in name) or name.endswith((".", " ")):
-        raise ValueError('Class names cannot contain <>:"/\\|?* or end with a dot or space.')
-    if name.split(".", 1)[0].upper() in RESERVED_NAMES:
-        raise ValueError(f"'{name}' is a reserved Windows filename.")
-    return name
+def valid_name(value: str, kind: str = "Name") -> str:
+    value = value.strip()
+    if not value or value in {".", ".."} or any(c in BAD for c in value) or value.endswith((".", " ")):
+        raise ValueError(f"{kind} is empty or contains invalid Windows filename characters.")
+    if value.split(".", 1)[0].upper() in RESERVED:
+        raise ValueError(f"'{value}' is a reserved Windows filename.")
+    return value
 
 
-def split_counts(count: int, ratios: tuple[float, float, float]) -> list[int]:
-    exact = [count * ratio for ratio in ratios]
-    result = [int(value) for value in exact]
-    order = sorted(range(3), key=lambda index: exact[index] - result[index], reverse=True)
-    for index in order[: count - sum(result)]:
-        result[index] += 1
+def load_image(path: Path) -> Image.Image:
+    with Image.open(path) as image:
+        return ImageOps.exif_transpose(image).copy()
+
+
+def iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax, ay, aw, ah = a; bx, by, bw, bh = b
+    area = max(0, min(ax + aw, bx + bw) - max(ax, bx)) * max(0, min(ay + ah, by + bh) - max(ay, by))
+    union = aw * ah + bw * bh - area
+    return area / union if union else 0.0
+
+
+def find_pattern_matches(image, template, threshold, suppression_iou=0.30, maximum_matches=500):
+    """Find distinct anchor matches using the same NMS policy as the detection builder."""
+    template_height, template_width = template.shape
+    if image.shape[0] < template_height or image.shape[1] < template_width:
+        raise ValueError("image is smaller than the learned anchor pattern")
+    scores = cv2.matchTemplate(image, template, cv2.TM_CCOEFF_NORMED)
+    ys, xs = np.where(np.isfinite(scores) & (scores >= threshold))
+    candidates = sorted(((int(x), int(y), float(scores[y, x])) for x, y in zip(xs, ys)), key=lambda item: item[2], reverse=True)
+    selected = []
+    for x, y, score in candidates:
+        rect = (x, y, template_width, template_height)
+        if any(iou(rect, (old_x, old_y, template_width, template_height)) > suppression_iou for old_x, old_y, _ in selected):
+            continue
+        selected.append((x, y, score))
+        if len(selected) >= maximum_matches:
+            break
+    return selected
+
+
+def randomize_sides(rect, size, ranges, rng):
+    x, y, w, h = rect; iw, ih = size
+    values = [round(base * rng.uniform(*sorted((float(lo), float(hi)))) / 100) for base, (lo, hi) in zip((w, w, h, h), ranges)]
+    x1, y1 = max(0, x - values[0]), max(0, y - values[2])
+    x2, y2 = min(iw, x + w + values[1]), min(ih, y + h + values[3])
+    return x1, y1, max(1, x2 - x1), max(1, y2 - y1)
+
+
+def force_ratio(rect, ratio: float, size: tuple[int, int]) -> tuple[int, int, int, int]:
+    """Resize around the ROI center while keeping it inside the image."""
+    if ratio <= 0:
+        return rect
+    x, y, w, h = rect; iw, ih = size
+    if w / h > ratio:
+        h = max(1, round(w / ratio))
+    else:
+        w = max(1, round(h * ratio))
+    w, h = min(w, iw), min(h, ih)
+    return max(0, min(iw - w, round(x + (rect[2] - w) / 2))), max(0, min(ih - h, round(y + (rect[3] - h) / 2))), w, h
+
+
+def median_gap(rois: list[tuple[int, int, int, int]]) -> tuple[float, float]:
+    ordered = sorted(rois, key=lambda r: r[0] + r[2] / 2)
+    if len(ordered) < 2:
+        raise ValueError("At least two ROIs are required to determine the gap median.")
+    centers = [(x + w / 2, y + h / 2) for x, y, w, h in ordered]
+    return (float(np.median(np.diff([p[0] for p in centers]))), float(np.median(np.diff([p[1] for p in centers]))))
+
+
+def populate_edges(rois, size, ranges=((0, 0),) * 4, rng=None):
+    """Extend a horizontal ROI sequence to both boundaries using median gaps."""
+    rng = rng or random.Random()
+    ordered = sorted(rois, key=lambda r: r[0] + r[2] / 2)
+    gap_x, gap_y = median_gap(ordered)
+    if gap_x <= 0: raise ValueError("ROIs need increasing horizontal centers.")
+    iw, ih = size; result = list(ordered)
+    for source, direction in ((ordered[0], -1), (ordered[-1], 1)):
+        cx, cy = source[0] + source[2] / 2, source[1] + source[3] / 2
+        step = 1
+        while True:
+            ncx, ncy = cx + direction * gap_x * step, cy + direction * gap_y * step
+            if not (0 <= ncx < iw and 0 <= ncy < ih): break
+            base = (round(ncx - source[2] / 2), round(ncy - source[3] / 2), source[2], source[3])
+            # Do not clamp a candidate into the image.  If the complete ROI
+            # does not fit, the edge has been reached and this direction ends.
+            if base[0] < 0 or base[1] < 0 or base[0] + base[2] > iw or base[1] + base[3] > ih: break
+            candidate = randomize_sides(base, size, ranges, rng)
+            if any(iou(candidate, old) > .5 for old in result): break
+            result.append(candidate); step += 1
+    return sorted(result, key=lambda r: r[0] + r[2] / 2)
+
+
+def split_counts(count, ratios):
+    exact = [count * r for r in ratios]; result = [int(x) for x in exact]
+    for i in sorted(range(3), key=lambda i: exact[i] - result[i], reverse=True)[:count - sum(result)]: result[i] += 1
     return result
 
 
-def balance_training_groups(
-    groups: dict[str, list[Path]], strategy: str, rng: random.Random
-) -> dict[str, list[Path]]:
-    """Return equal-sized training classes without changing the input lists."""
-    if not groups or any(not images for images in groups.values()):
-        return {name: list(images) for name, images in groups.items()}
-    target = max(map(len, groups.values())) if strategy == "Oversample" else min(map(len, groups.values()))
-    balanced: dict[str, list[Path]] = {}
-    for name, images in groups.items():
-        selected = list(images)
-        if strategy == "Oversample":
-            selected.extend(rng.choice(images) for _ in range(target - len(images)))
-        else:
-            rng.shuffle(selected)
-            selected = selected[:target]
-        balanced[name] = selected
-    return balanced
+@dataclass
+class ROI:
+    rect: tuple[int, int, int, int]
+    class_id: int | None = None
+    confidence: float | None = None
+
+
+@dataclass
+class Entry:
+    path: Path
+    size: tuple[int, int]
+    rois: list[ROI] = field(default_factory=list)
+    pattern_matches: dict[str, list[tuple[int, int, int, int, float]]] = field(default_factory=dict)
+
+
+@dataclass
+class Pattern:
+    name: str
+    reference: Path
+    rect: tuple[int, int, int, int]
+    template: np.ndarray
+    rois: list[ROI]
+
+
+class RoiItem(QGraphicsRectItem):
+    def __init__(self, rect, bounds, label, changed):
+        super().__init__(QRectF(0, 0, rect[2], rect[3])); self.setPos(rect[0], rect[1]); self.bounds = bounds; self.label = label; self.changed = changed
+        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable | QGraphicsItem.GraphicsItemFlag.ItemIsSelectable); self.setAcceptHoverEvents(True); self.setZValue(2)
+        self.setPen(QPen(Qt.GlobalColor.yellow, 2)); self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+    def scene_rect(self): return QRectF(self.pos(), self.rect().size())
+    def boundingRect(self): return self.rect().adjusted(-5, -5, 5, 5)
+    def paint(self, painter, option, widget=None):
+        painter.setPen(QPen(Qt.GlobalColor.cyan if self.isSelected() else Qt.GlobalColor.yellow, 3)); painter.drawRect(self.rect()); painter.drawText(self.rect().adjusted(4, 2, -2, -2), self.label)
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event); r = self.scene_rect(); self.setPos(max(0, min(r.x(), self.bounds.width() - r.width())), max(0, min(r.y(), self.bounds.height() - r.height()))); self.changed(self.scene_rect())
+    def mouseReleaseEvent(self, event): self.changed(self.scene_rect()); super().mouseReleaseEvent(event)
+
+
+class ImageView(QGraphicsView):
+    def __init__(self, created):
+        super().__init__(); self.created = created; self.bounds = QRectF(); self.drawing = False; self.start = QPointF(); self.draft = None; self.right_drag = False; self.last = QPointF(); self.setDragMode(QGraphicsView.DragMode.NoDrag)
+    def mousePressEvent(self, event):
+        p = self.mapToScene(event.position().toPoint()); item = self.itemAt(event.position().toPoint())
+        if event.button() == Qt.MouseButton.LeftButton and self.bounds.contains(p) and not isinstance(item, RoiItem):
+            self.drawing = True; self.start = p; self.draft = QGraphicsRectItem(); self.draft.setPen(QPen(Qt.GlobalColor.red, 2, Qt.PenStyle.DashLine)); self.scene().addItem(self.draft); event.accept(); return
+        if event.button() == Qt.MouseButton.RightButton:
+            self.right_drag = True; self.last = p; event.accept(); return
+        super().mousePressEvent(event)
+    def mouseMoveEvent(self, event):
+        p = self.mapToScene(event.position().toPoint())
+        if self.drawing and self.draft: self.draft.setRect(QRectF(self.start, p).normalized().intersected(self.bounds)); event.accept(); return
+        if self.right_drag:
+            delta = p - self.last
+            for item in self.scene().selectedItems():
+                if isinstance(item, RoiItem): item.moveBy(delta.x(), delta.y()); item.changed(item.scene_rect())
+            self.last = p; event.accept(); return
+        super().mouseMoveEvent(event)
+    def mouseReleaseEvent(self, event):
+        if self.drawing and self.draft:
+            rect = self.draft.rect(); self.scene().removeItem(self.draft); self.draft = None; self.drawing = False
+            if rect.width() >= 2 and rect.height() >= 2: self.created(rect)
+            event.accept(); return
+        if self.right_drag: self.right_drag = False; event.accept(); return
+        super().mouseReleaseEvent(event)
+    def wheelEvent(self, event): self.scale(1.2 if event.angleDelta().y() > 0 else 1 / 1.2, 1.2 if event.angleDelta().y() > 0 else 1 / 1.2)
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, initial_model: Path | None = None) -> None:
-        super().__init__()
-        self.setWindowTitle("YOLO Classification Dataset Builder")
-        self.resize(1300, 820)
-        self.paths: list[Path] = []
-        self.assignments: dict[Path, str] = {}
-        self.confidences: dict[Path, float] = {}
-        self.classes: list[str] = []
-        self.current_pixmap = QPixmap()
-        self.model_path = initial_model
-        self.model: YOLO | None = None
-
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QHBoxLayout(central)
-
-        images_panel = QVBoxLayout()
-        images_panel.addWidget(QLabel("Images"))
-        self.image_list = QListWidget()
-        self.image_list.currentRowChanged.connect(self.show_image)
-        images_panel.addWidget(self.image_list, 1)
-        add_images = QPushButton("Add images...")
-        add_images.clicked.connect(self.add_images)
-        images_panel.addWidget(add_images)
-        add_folder = QPushButton("Add folder...")
-        add_folder.clicked.connect(self.add_folder)
-        images_panel.addWidget(add_folder)
-        load_dataset = QPushButton("Load YOLO dataset...")
-        load_dataset.clicked.connect(self.load_dataset)
-        images_panel.addWidget(load_dataset)
-        clear = QPushButton("Clear images")
-        clear.clicked.connect(self.clear_images)
-        images_panel.addWidget(clear)
-        layout.addLayout(images_panel, 1)
-
-        center = QVBoxLayout()
-        self.image_label = QLabel("Add images to begin")
-        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setMinimumSize(480, 320)
-        self.image_label.setStyleSheet("QLabel { background: #202020; color: #dddddd; }")
-        center.addWidget(self.image_label, 1)
-        self.assignment_label = QLabel()
-        self.assignment_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        center.addWidget(self.assignment_label)
-
-        navigation = QHBoxLayout()
-        previous = QPushButton("Previous  (Left)")
-        previous.clicked.connect(lambda: self.navigate(-1))
-        navigation.addWidget(previous)
-        assign = QPushButton("Assign selected class + next  (Enter)")
-        assign.clicked.connect(self.assign_and_advance)
-        navigation.addWidget(assign)
-        following = QPushButton("Next  (Right)")
-        following.clicked.connect(lambda: self.navigate(1))
-        navigation.addWidget(following)
-        center.addLayout(navigation)
-
-        model_row = QHBoxLayout()
-        choose_model = QPushButton("Choose model...")
-        choose_model.clicked.connect(self.choose_model)
-        model_row.addWidget(choose_model)
-        self.model_label = QLabel()
-        self.model_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        model_row.addWidget(self.model_label, 1)
-        center.addLayout(model_row)
-        auto_row = QHBoxLayout()
-        auto_current = QPushButton("Auto-label current")
-        auto_current.clicked.connect(lambda: self.auto_label(False))
-        auto_row.addWidget(auto_current)
-        auto_all = QPushButton("Auto-label all")
-        auto_all.clicked.connect(lambda: self.auto_label(True))
-        auto_row.addWidget(auto_all)
-        center.addLayout(auto_row)
-        self.status = QLabel()
-        self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        center.addWidget(self.status)
-        layout.addLayout(center, 4)
-
-        classes_panel = QVBoxLayout()
-        classes_panel.addWidget(QLabel("Classes (Tab cycles)"))
-        self.class_list = QListWidget()
-        self.class_list.currentRowChanged.connect(lambda _row: self.update_status())
-        self.class_list.itemDoubleClicked.connect(lambda _item: self.assign_and_advance())
-        classes_panel.addWidget(self.class_list, 1)
-        add_class = QPushButton("Add class...")
-        add_class.clicked.connect(lambda _checked=False: self.add_class())
-        classes_panel.addWidget(add_class)
-        remove_class = QPushButton("Remove class")
-        remove_class.clicked.connect(self.remove_class)
-        classes_panel.addWidget(remove_class)
-
-        classes_panel.addWidget(QLabel("Export split"))
-        split_row = QHBoxLayout()
-        self.train_ratio = self.create_ratio_spinbox(70.0)
-        self.val_ratio = self.create_ratio_spinbox(20.0)
-        self.test_ratio = self.create_ratio_spinbox(10.0)
-        for label, widget in (("Train", self.train_ratio), ("Val", self.val_ratio), ("Test", self.test_ratio)):
-            column = QVBoxLayout()
-            column.addWidget(QLabel(label))
-            column.addWidget(widget)
-            split_row.addLayout(column)
-        classes_panel.addLayout(split_row)
-        self.balance_training = QCheckBox("Balance training split")
-        self.balance_training.setToolTip(
-            "Validation and test are not balanced, keeping evaluation data free from duplicated samples."
-        )
-        classes_panel.addWidget(self.balance_training)
-        self.balance_strategy = QComboBox()
-        self.balance_strategy.addItems(["Oversample", "Undersample"])
-        self.balance_strategy.setToolTip(
-            "Oversample duplicates minority training images; undersample discards majority training images."
-        )
-        classes_panel.addWidget(self.balance_strategy)
-        export = QPushButton("Generate dataset...")
-        export.clicked.connect(self.export_dataset)
-        classes_panel.addWidget(export)
-        layout.addLayout(classes_panel, 1)
-
-        self.add_shortcut(Qt.Key.Key_Left, lambda: self.navigate(-1))
-        self.add_shortcut(Qt.Key.Key_Right, lambda: self.navigate(1))
-        self.add_shortcut(Qt.Key.Key_Tab, lambda: self.cycle_class(1))
-        self.add_shortcut(Qt.Key.Key_Backtab, lambda: self.cycle_class(-1))
-        self.add_shortcut(Qt.Key.Key_Return, self.assign_and_advance)
-        self.add_shortcut(Qt.Key.Key_Enter, self.assign_and_advance)
-        self.update_model_label()
-        self.update_status()
-
+    def __init__(self, initial_model=None):
+        super().__init__(); self.setWindowTitle("Classification ROI Dataset Builder"); self.resize(1450, 850); self.entries=[]; self.classes=[]; self.patterns=[]; self.current=-1; self.items=[]; self.pattern_items=[]; self.learning_pattern=False; self.pattern_roi_indices=[]; self.model_path=Path(initial_model).resolve() if initial_model else None; self.session=None; self.input_name=None; self.kind=None; self.names={}
+        root=QWidget(); self.setCentralWidget(root); layout=QHBoxLayout(root)
+        left=QVBoxLayout(); left.addWidget(QLabel("Images")); self.images=QListWidget(); self.images.currentRowChanged.connect(self.select); left.addWidget(self.images,1)
+        for text, fn in (("Add images...",self.add_images),("Add folder...",self.add_folder),("Delete ROIs on current",self.clear_current),("Delete ROIs on all",self.clear_all),("Clear images",self.clear_images)):
+            b=QPushButton(text); b.clicked.connect(fn); left.addWidget(b)
+        layout.addLayout(left,1)
+        center=QVBoxLayout(); self.scene=QGraphicsScene(); self.pixmap=QGraphicsPixmapItem(); self.scene.addItem(self.pixmap); self.view=ImageView(self.created); self.view.setScene(self.scene); center.addWidget(self.view,1)
+        nav=QHBoxLayout();
+        for text, fn in (("Previous",lambda:self.navigate(-1)),("Next",lambda:self.navigate(1)),("Delete selected ROI(s)",self.delete_selected)):
+            b=QPushButton(text); b.clicked.connect(fn); nav.addWidget(b)
+        center.addLayout(nav); self.status=QLabel(); self.status.setAlignment(Qt.AlignmentFlag.AlignCenter); center.addWidget(self.status); layout.addLayout(center,4)
+        self.delete_shortcut=QShortcut(QKeySequence(Qt.Key.Key_Delete),self); self.delete_shortcut.activated.connect(self.delete_selected)
+        right=QVBoxLayout(); right.addWidget(QLabel("Classes (Ctrl-select ROIs; right-drag moves them)")); self.class_list=QListWidget(); right.addWidget(self.class_list,1)
+        b=QPushButton("Add class..."); b.clicked.connect(self.add_class); right.addWidget(b); b=QPushButton("Assign class to selected ROI(s)"); b.clicked.connect(self.assign_class); right.addWidget(b)
+        right.addWidget(QLabel("Learned anchor patterns")); self.pattern_list=QListWidget(); right.addWidget(self.pattern_list,1)
+        for text, fn in (("Draw / learn anchor pattern",self.begin_pattern),("Extend current by median gap",lambda:self.extend_gap(False)),("Extend all by median gap",lambda:self.extend_gap(True)),("Auto-populate current",lambda:self.auto_place(False)),("Auto-populate all",lambda:self.auto_place(True)),("Expand current ROI(s)",lambda:self.random_resize(False)),("Expand all ROI(s)",lambda:self.random_resize(True))):
+            b=QPushButton(text); b.clicked.connect(fn); right.addWidget(b)
+        duplicate_row=QHBoxLayout(); duplicate_row.addWidget(QLabel("Duplicates / ROI")); self.duplicate_count=QSpinBox(); self.duplicate_count.setRange(1,1000); self.duplicate_count.setValue(10); duplicate_row.addWidget(self.duplicate_count); right.addLayout(duplicate_row)
+        for text, fn in (("Duplicate current ROI(s)",lambda:self.duplicate_rois(False)),("Duplicate all ROI(s)",lambda:self.duplicate_rois(True))):
+            b=QPushButton(text); b.clicked.connect(fn); right.addWidget(b)
+        self.threshold=self.spin(.75,0,1,.05); right.addWidget(QLabel("Pattern threshold")); right.addWidget(self.threshold)
+        self.occurrence_nms=self.spin(.30,0,1,.05); right.addWidget(QLabel("Occurrence NMS")); right.addWidget(self.occurrence_nms)
+        right.addWidget(QLabel("Maximum occurrences / pattern")); self.maximum_occurrences=QSpinBox(); self.maximum_occurrences.setRange(1,10000); self.maximum_occurrences.setValue(500); right.addWidget(self.maximum_occurrences)
+        right.addWidget(QLabel("Expansion %: left / right / top / bottom (min-max)")); self.ranges=[]
+        for side in ("Left","Right","Top","Bottom"):
+            row=QHBoxLayout(); row.addWidget(QLabel(side)); lo=self.spin(0,0,100,1); hi=self.spin(0,0,100,1); row.addWidget(lo); row.addWidget(hi); right.addLayout(row); self.ranges.append((lo,hi))
+        right.addWidget(QLabel("ROI width / height ratio (0 disables)")); self.ratio=self.spin(0,0,1000,.01); right.addWidget(self.ratio)
+        b=QPushButton("Choose ONNX model..."); b.clicked.connect(self.choose_model); right.addWidget(b); self.model_label=QLabel(); self.model_label.setWordWrap(True); right.addWidget(self.model_label)
+        for text, fn in (("Auto-label current",lambda:self.auto_label(False)),("Auto-label all",lambda:self.auto_label(True))): b=QPushButton(text); b.clicked.connect(fn); right.addWidget(b)
+        right.addWidget(QLabel("Split % (train / val / test)")); self.split=[self.spin(x,0,100,1) for x in (70,20,10)]; row=QHBoxLayout(); [row.addWidget(x) for x in self.split]; right.addLayout(row); self.balance=QCheckBox("Balance training split"); right.addWidget(self.balance); self.strategy=QListWidget(); self.strategy.addItems(["Oversample","Undersample"]); self.strategy.setCurrentRow(0); self.strategy.setMaximumHeight(45); right.addWidget(self.strategy)
+        b=QPushButton("Export classification dataset..."); b.clicked.connect(self.export); right.addWidget(b)
+        right_panel=QWidget(); right_panel.setLayout(right)
+        right_scroll=QScrollArea(); right_scroll.setWidgetResizable(True); right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); right_scroll.setWidget(right_panel); right_scroll.setMinimumWidth(300)
+        layout.addWidget(right_scroll,1); self.update()
     @staticmethod
-    def create_ratio_spinbox(value: float) -> QDoubleSpinBox:
-        box = QDoubleSpinBox()
-        box.setRange(0.0, 100.0)
-        box.setDecimals(0)
-        box.setSuffix("%")
-        box.setValue(value)
-        return box
-
-    def add_shortcut(self, key: Qt.Key, action) -> None:
-        shortcut = QShortcut(QKeySequence(key), self)
-        shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
-        shortcut.activated.connect(action)
-
-    def add_images(self) -> None:
-        files, _ = QFileDialog.getOpenFileNames(self, "Add images", "", "Images (*.bmp *.dng *.gif *.heic *.jpeg *.jpg *.mpo *.png *.tif *.tiff *.webp)")
-        self.add_paths([Path(filename) for filename in files])
-
-    def add_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Add image folder")
-        if folder:
-            self.add_paths(sorted(path for path in Path(folder).iterdir() if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES))
-
-    def load_dataset(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Select YOLO classification dataset")
-        if not folder:
-            return
-        root = Path(folder)
-        split_dirs = [root / name for name in ("train", "val", "test") if (root / name).is_dir()]
-        if not split_dirs:
-            QMessageBox.warning(
-                self,
-                "Not a YOLO classification dataset",
-                "The selected folder must contain train, val, or test directories.",
-            )
-            return
-
-        labeled_paths: list[tuple[Path, str]] = []
-        invalid_classes: list[str] = []
-        for split_dir in split_dirs:
-            for class_dir in sorted(path for path in split_dir.iterdir() if path.is_dir()):
-                try:
-                    class_name = validate_class_name(class_dir.name)
-                except ValueError:
-                    invalid_classes.append(str(class_dir))
-                    continue
-                for path in sorted(class_dir.rglob("*")):
-                    if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES:
-                        labeled_paths.append((path, class_name))
-        if not labeled_paths:
-            QMessageBox.warning(self, "Dataset is empty", "No supported images were found in class folders.")
-            return
-
-        canonical = {name.casefold(): name for name in self.classes}
-        for _path, class_name in labeled_paths:
-            if class_name.casefold() not in canonical:
-                canonical[class_name.casefold()] = class_name
-                self.classes.append(class_name)
-                self.class_list.addItem(class_name)
-        self.add_paths([path for path, _class_name in labeled_paths])
-        stored_paths = {path.resolve(): path for path in self.paths}
-        for path, class_name in labeled_paths:
-            stored = stored_paths.get(path.resolve())
-            if stored is not None:
-                self.assignments[stored] = canonical[class_name.casefold()]
-                self.confidences.pop(stored, None)
-        self.refresh_all_items()
-        message = f"Loaded {len(labeled_paths)} labeled image(s) from {len(split_dirs)} split folder(s)."
-        if invalid_classes:
-            message += f" Skipped {len(invalid_classes)} invalid class folder(s)."
-        self.update_status(message)
-
-    def add_paths(self, paths: list[Path]) -> None:
-        known = {path.resolve() for path in self.paths}
-        for path in paths:
-            resolved = path.resolve()
-            if resolved not in known and path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES:
-                self.paths.append(path)
-                self.image_list.addItem(QListWidgetItem(path.name))
-                known.add(resolved)
-        if self.image_list.currentRow() < 0 and self.paths:
-            self.image_list.setCurrentRow(0)
-        self.refresh_all_items()
-
-    def add_class(self, suggested: str = "") -> str | None:
-        value, accepted = QInputDialog.getText(
-            self,
-            "Add class",
-            "Class name:",
-            QLineEdit.EchoMode.Normal,
-            suggested,
-        )
-        if not accepted:
-            return None
-        try:
-            name = validate_class_name(value)
-        except ValueError as error:
-            QMessageBox.warning(self, "Invalid class name", str(error))
-            return None
-        existing = next((item for item in self.classes if item.casefold() == name.casefold()), None)
-        if existing is not None:
-            self.class_list.setCurrentRow(self.classes.index(existing))
-            return existing
-        self.classes.append(name)
-        self.class_list.addItem(name)
-        self.class_list.setCurrentRow(len(self.classes) - 1)
-        self.update_status()
-        return name
-
-    def remove_class(self) -> None:
-        row = self.class_list.currentRow()
-        if not 0 <= row < len(self.classes):
-            return
-        name = self.classes[row]
-        count = sum(label == name for label in self.assignments.values())
-        prompt = f"Remove class '{name}'?"
-        if count:
-            prompt += f"\n\n{count} assigned image(s) will become unassigned."
-        if QMessageBox.question(self, "Remove class?", prompt) != QMessageBox.StandardButton.Yes:
-            return
-        self.classes.pop(row)
-        self.class_list.takeItem(row)
-        for path in [path for path, label in self.assignments.items() if label == name]:
-            self.assignments.pop(path, None)
-            self.confidences.pop(path, None)
-        if self.classes:
-            self.class_list.setCurrentRow(min(row, len(self.classes) - 1))
-        self.refresh_all_items()
-
-    def cycle_class(self, amount: int) -> None:
-        if not self.classes:
-            return
-        current = self.class_list.currentRow()
-        self.class_list.setCurrentRow((current + amount) % len(self.classes))
-
-    def assign_and_advance(self) -> None:
-        image_row = self.image_list.currentRow()
-        class_row = self.class_list.currentRow()
-        if not 0 <= image_row < len(self.paths):
-            return
-        if not 0 <= class_row < len(self.classes):
-            QMessageBox.information(self, "Class required", "Add and select a class first.")
-            return
-        path = self.paths[image_row]
-        self.assignments[path] = self.classes[class_row]
-        self.confidences.pop(path, None)
-        self.refresh_item(image_row)
-        if image_row < len(self.paths) - 1:
-            self.image_list.setCurrentRow(image_row + 1)
-        else:
-            self.update_status("All images reviewed. You can export the dataset.")
-
-    def navigate(self, amount: int) -> None:
-        if self.paths:
-            current = max(self.image_list.currentRow(), 0)
-            self.image_list.setCurrentRow(min(max(current + amount, 0), len(self.paths) - 1))
-
-    def show_image(self, index: int) -> None:
-        if not 0 <= index < len(self.paths):
-            self.current_pixmap = QPixmap()
-            self.image_label.setText("Add images to begin")
-            self.update_status()
-            return
-        self.current_pixmap = QPixmap(str(self.paths[index]))
-        if self.current_pixmap.isNull():
-            self.image_label.setText(f"Could not display\n{self.paths[index].name}")
-        else:
-            self.scale_current_image()
-        assigned = self.assignments.get(self.paths[index])
-        if assigned in self.classes:
-            self.class_list.setCurrentRow(self.classes.index(assigned))
-        self.update_status()
-
-    def scale_current_image(self) -> None:
-        if not self.current_pixmap.isNull():
-            self.image_label.setPixmap(self.current_pixmap.scaled(self.image_label.contentsRect().size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self.scale_current_image()
-
-    def refresh_item(self, index: int) -> None:
-        path = self.paths[index]
-        label = self.assignments.get(path)
-        confidence = self.confidences.get(path)
-        suffix = f" ({confidence:.1%})" if confidence is not None else ""
-        self.image_list.item(index).setText(f"{label or '—'}{suffix}  |  {path.name}")
-        self.image_list.item(index).setBackground(Qt.GlobalColor.darkGreen if label else Qt.GlobalColor.transparent)
-
-    def refresh_all_items(self) -> None:
-        for index in range(len(self.paths)):
-            self.refresh_item(index)
-        self.update_status()
-
-    def clear_images(self) -> None:
-        if self.paths and QMessageBox.question(self, "Clear images?", "Remove all images and their assignments from this session?") != QMessageBox.StandardButton.Yes:
-            return
-        self.paths.clear()
-        self.assignments.clear()
-        self.confidences.clear()
-        self.image_list.clear()
-        self.current_pixmap = QPixmap()
-        self.image_label.setText("Add images to begin")
-        self.update_status()
-
-    def choose_model(self) -> None:
-        filename, _ = QFileDialog.getOpenFileName(self, "Choose trained classification model", "", "PyTorch model (*.pt)")
-        if filename:
-            self.model_path = Path(filename)
-            self.model = None
-            self.update_model_label()
-
-    def auto_label(self, all_images: bool) -> None:
-        row = self.image_list.currentRow()
-        targets = self.paths if all_images else ([self.paths[row]] if 0 <= row < len(self.paths) else [])
-        if not targets:
-            QMessageBox.information(self, "No images", "Add at least one image first.")
-            return
-        if not self.model_path or not self.model_path.is_file():
-            self.choose_model()
-            if not self.model_path or not self.model_path.is_file():
-                return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        self.status.setText(f"Auto-labeling {len(targets)} full image(s)...")
-        QApplication.processEvents()
-        try:
-            if self.model is None:
-                self.model = YOLO(str(self.model_path), task="classify")
-            results = self.model([str(path) for path in targets], verbose=False)
-            predicted = []
-            for path, result in zip(targets, results):
-                if result.probs is None:
-                    raise ValueError("The selected checkpoint did not return classification probabilities.")
-                class_id = int(result.probs.top1)
-                name = validate_class_name(str(result.names[class_id]))
-                predicted.append((path, name, float(result.probs.top1conf)))
-            for _path, name, _confidence in predicted:
-                if not any(existing.casefold() == name.casefold() for existing in self.classes):
-                    self.classes.append(name)
-                    self.class_list.addItem(name)
-            canonical = {name.casefold(): name for name in self.classes}
-            for path, name, confidence in predicted:
-                self.assignments[path] = canonical[name.casefold()]
-                self.confidences[path] = confidence
-            self.refresh_all_items()
-            if row >= 0:
-                self.show_image(row)
-            self.update_status(f"Auto-labeled {len(predicted)} image(s). Review predictions before export.")
-        except Exception as error:
-            QMessageBox.critical(self, "Auto-labeling failed", str(error))
-            self.update_status()
-        finally:
-            QApplication.restoreOverrideCursor()
-
-    def export_dataset(self) -> None:
-        if not self.paths:
-            QMessageBox.information(self, "No images", "Add and label images first.")
-            return
-        missing = [path for path in self.paths if path not in self.assignments]
-        if missing:
-            QMessageBox.warning(self, "Unassigned images", f"Assign every image before export.\n\nUnassigned: {len(missing)}")
-            return
-        values = (self.train_ratio.value(), self.val_ratio.value(), self.test_ratio.value())
-        if abs(sum(values) - 100.0) > 0.01:
-            QMessageBox.warning(self, "Invalid split", "Train, val, and test percentages must add up to 100%.")
-            return
-        folder = QFileDialog.getExistingDirectory(self, "Choose the parent folder for the dataset")
-        if not folder:
-            return
-        name, accepted = QInputDialog.getText(
-            self,
-            "Dataset folder",
-            "New dataset folder name:",
-            QLineEdit.EchoMode.Normal,
-            "classification_dataset",
-        )
-        if not accepted:
-            return
-        try:
-            dataset_name = validate_class_name(name)
-        except ValueError as error:
-            QMessageBox.warning(self, "Invalid folder name", str(error))
-            return
-        output = Path(folder) / dataset_name
-        if output.exists():
-            QMessageBox.warning(self, "Destination exists", f"Choose a new folder name. Nothing was changed:\n{output}")
-            return
-        grouped: dict[str, list[Path]] = defaultdict(list)
-        for path in self.paths:
-            grouped[self.assignments[path]].append(path)
-        rng = random.Random(42)
-        ratios = tuple(value / 100.0 for value in values)
-        copied = 0
-        try:
-            split_groups: dict[str, dict[str, list[Path]]] = {
-                split: {class_name: [] for class_name in grouped}
-                for split in ("train", "val", "test")
-            }
-            for class_name, images in grouped.items():
-                rng.shuffle(images)
-                counts = split_counts(len(images), ratios)  # type: ignore[arg-type]
-                offset = 0
-                for split, count in zip(("train", "val", "test"), counts):
-                    split_groups[split][class_name] = images[offset : offset + count]
-                    offset += count
-            if self.balance_training.isChecked():
-                split_groups["train"] = balance_training_groups(
-                    split_groups["train"], self.balance_strategy.currentText(), rng
-                )
-
-            for split, classes in split_groups.items():
-                for class_name, images in classes.items():
-                    destination_dir = output / split / class_name
-                    destination_dir.mkdir(parents=True, exist_ok=True)
-                    for copy_index, source in enumerate(images):
-                        destination = destination_dir / source.name
-                        if destination.exists():
-                            digest = hashlib.sha1(str(source.resolve()).encode("utf-8")).hexdigest()[:10]
-                            destination = destination_dir / f"{source.stem}_{digest}_{copy_index:04d}{source.suffix.lower()}"
-                            collision = 1
-                            while destination.exists():
-                                destination = destination_dir / f"{source.stem}_{digest}_{copy_index:04d}_{collision}{source.suffix.lower()}"
-                                collision += 1
-                        shutil.copy2(source, destination)
-                        copied += 1
-        except Exception as error:
-            QMessageBox.critical(self, "Export failed", f"Copied {copied} image(s) before the error.\n\n{error}\n\nPartial output: {output}")
-            return
-        QMessageBox.information(self, "Dataset created", f"Created a YOLO classification dataset with {copied} image(s):\n{output}")
-        self.update_status(f"Dataset created: {output}")
-
-    def update_model_label(self) -> None:
+    def spin(value, low, high, step):
+        b=QDoubleSpinBox(); b.setRange(low,high); b.setSingleStep(step); b.setDecimals(2 if step < 1 else 0); b.setValue(value); return b
+    def update(self, message=None):
+        if message: self.status.setText(message); return
+        n=len(self.entries[self.current].rois) if 0<=self.current<len(self.entries) else 0; self.status.setText(f"{self.current+1}/{len(self.entries)}  {n} ROI(s)  | Ctrl-select, right-drag move")
         self.model_label.setText(f"Model: {self.model_path}" if self.model_path else "Model: not selected")
-
-    def update_status(self, message: str | None = None) -> None:
-        if message:
-            self.status.setText(message)
+    def add_images(self):
+        files,_=QFileDialog.getOpenFileNames(self,"Add images","","Images (*.bmp *.jpg *.jpeg *.png *.tif *.tiff *.webp)"); self.add_paths([Path(x) for x in files])
+    def add_folder(self):
+        folder=QFileDialog.getExistingDirectory(self,"Add image folder"); self.add_paths(sorted(Path(folder).iterdir())) if folder else None
+    def add_paths(self, paths):
+        for path in paths:
+            if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES and not any(e.path.resolve()==path.resolve() for e in self.entries):
+                try: image=load_image(path); self.entries.append(Entry(path.resolve(),image.size))
+                except Exception: pass
+        self.images.clear(); self.images.addItems([f"0 ROI | {e.path.name}" for e in self.entries]);
+        if self.entries and self.current<0: self.images.setCurrentRow(0)
+    def select(self,index):
+        self.current=index
+        for item in self.items + self.pattern_items: self.scene.removeItem(item)
+        self.items=[]; self.pattern_items=[]
+        if not 0<=index<len(self.entries): self.pixmap.setPixmap(QPixmap()); self.update(); return
+        image=load_image(self.entries[index].path); self.pixmap.setPixmap(self.pixmap_from(image)); self.view.bounds=QRectF(0,0,*image.size); self.view.fitInView(self.view.bounds,Qt.AspectRatioMode.KeepAspectRatio)
+        for matches in self.entries[index].pattern_matches.values():
+            for x,y,w,h,score in matches:
+                overlay=QGraphicsRectItem(QRectF(x,y,w,h)); overlay.setPen(QPen(Qt.GlobalColor.magenta,2,Qt.PenStyle.DashLine)); overlay.setBrush(QBrush(Qt.BrushStyle.NoBrush)); overlay.setZValue(1); overlay.setToolTip(f"Anchor match: {score:.3f}"); self.scene.addItem(overlay); self.pattern_items.append(overlay)
+        for i,roi in enumerate(self.entries[index].rois): self.add_item(i,roi)
+        self.update()
+    @staticmethod
+    def pixmap_from(image):
+        image=image.convert("RGBA"); data=image.tobytes("raw","RGBA"); return QPixmap.fromImage(QImage(data,image.width,image.height,QImage.Format.Format_RGBA8888).copy())
+    def add_item(self,index,roi):
+        item=RoiItem(roi.rect,self.view.bounds,f"{index+1}:{self.classes[roi.class_id] if roi.class_id is not None and roi.class_id<len(self.classes) else '?'}",lambda r,i=index:self.changed(i,r)); self.scene.addItem(item); self.items.append(item)
+    def changed(self,index,r):
+        if 0<=self.current<len(self.entries) and index<len(self.entries[self.current].rois): self.entries[self.current].rois[index].rect=(round(r.x()),round(r.y()),round(r.width()),round(r.height())); self.images.item(self.current).setText(f"{len(self.entries[self.current].rois)} ROI | {self.entries[self.current].path.name}")
+    def created(self,r):
+        if not 0<=self.current<len(self.entries): return
+        rect=(round(r.x()),round(r.y()),round(r.width()),round(r.height())); ratio=self.ratio.value();
+        if self.learning_pattern:
+            self.learn_pattern(rect)
             return
-        row = self.image_list.currentRow()
-        assigned_count = len(self.assignments)
-        position = f"{row + 1} / {len(self.paths)}" if row >= 0 else f"0 / {len(self.paths)}"
-        selected = self.classes[self.class_list.currentRow()] if 0 <= self.class_list.currentRow() < len(self.classes) else "none"
-        current = self.assignments.get(self.paths[row], "unassigned") if 0 <= row < len(self.paths) else "unassigned"
-        confidence = self.confidences.get(self.paths[row]) if 0 <= row < len(self.paths) else None
-        confidence_text = f" ({confidence:.1%})" if confidence is not None else ""
-        self.assignment_label.setText(f"Current: {current}{confidence_text}    •    Selected class: {selected}")
-        self.status.setText(f"{position}    •    {assigned_count} / {len(self.paths)} assigned    •    Tab class, Enter assign + next")
+        rect=force_ratio(rect,ratio,self.entries[self.current].size)
+        if not any(iou(rect,x.rect)>.5 for x in self.entries[self.current].rois): self.entries[self.current].rois.append(ROI(rect)); self.select(self.current)
+    def delete_selected(self):
+        if not 0<=self.current<len(self.entries): return
+        chosen={i for i,item in enumerate(self.items) if item.isSelected()}
+        if not chosen:
+            self.update("Select one or more ROI(s) before deleting")
+            return
+        self.entries[self.current].rois=[roi for i,roi in enumerate(self.entries[self.current].rois) if i not in chosen]
+        self.select(self.current)
+    def clear_current(self):
+        if 0<=self.current<len(self.entries): self.entries[self.current].rois.clear(); self.select(self.current)
+    def clear_all(self):
+        for e in self.entries: e.rois.clear()
+        self.select(self.current)
+    def clear_images(self): self.entries.clear(); self.patterns.clear(); self.images.clear(); self.select(-1)
+    def navigate(self, amount):
+        if self.entries: self.images.setCurrentRow(max(0,min(len(self.entries)-1,self.current+amount)))
+    def add_class(self):
+        value,ok=QInputDialog.getText(self,"Add class","Class name:");
+        if ok:
+            try: name=valid_name(value,"Class name")
+            except ValueError as e: QMessageBox.warning(self,"Invalid class",str(e)); return
+            if name.casefold() not in {x.casefold() for x in self.classes}: self.classes.append(name); self.class_list.addItem(name)
+    def assign_class(self):
+        cid=self.class_list.currentRow()
+        if cid<0 or not 0<=self.current<len(self.entries): return
+        for item,roi in zip(self.items,self.entries[self.current].rois):
+            if item.isSelected(): roi.class_id=cid
+        self.select(self.current)
+    def begin_pattern(self):
+        if not 0<=self.current<len(self.entries):
+            QMessageBox.information(self,"No image","Select a reference image first."); return
+        if not self.entries[self.current].rois:
+            QMessageBox.information(self,"ROIs required","Create the linked ROI(s) before drawing the anchor pattern."); return
+        self.pattern_roi_indices=[i for i,item in enumerate(self.items) if item.isSelected()] or list(range(len(self.items)))
+        self.learning_pattern=True
+        self.update(f"Draw the anchor pattern; {len(self.pattern_roi_indices)} ROI(s) will follow it")
+
+    def learn_pattern(self, pattern_rect):
+        self.learning_pattern=False
+        if not 0<=self.current<len(self.entries): return
+        image=np.asarray(load_image(self.entries[self.current].path).convert("L")); x,y,w,h=pattern_rect; template=image[y:y+h,x:x+w].copy();
+        if template.size==0 or template.std()<1e-6: QMessageBox.warning(self,"Invalid pattern","Anchor has no visible detail."); return
+        value,ok=QInputDialog.getText(self,"Pattern name","Name:",text=f"pattern_{len(self.patterns)+1}");
+        if not ok: return
+        try: name=valid_name(value,"Pattern name")
+        except ValueError as e: QMessageBox.warning(self,"Invalid pattern",str(e)); return
+        linked=[ROI(self.entries[self.current].rois[i].rect,self.entries[self.current].rois[i].class_id,self.entries[self.current].rois[i].confidence) for i in self.pattern_roi_indices if i<len(self.entries[self.current].rois)]
+        self.patterns.append(Pattern(name,self.entries[self.current].path,pattern_rect,template,linked)); self.pattern_list.addItem(f"{name} ({len(linked)} linked ROI)"); self.update(f"Learned {name}; auto-populate can now place linked ROI(s)")
+    def extend_gap(self, all_images):
+        if not 0<=self.current<len(self.entries): return
+        source=self.entries[self.current]
+        if len(source.rois)<2:
+            QMessageBox.information(self,"Need two ROIs","Draw at least two ROIs on the current image first."); return
+        # Median-gap placement is deliberately size-neutral.  Use the
+        # explicit Expand buttons when randomized side expansion is wanted.
+        ranges=[(0.0,0.0)] * 4; rng=random.Random()
+        try: generated=populate_edges([r.rect for r in source.rois],source.size,ranges,rng)
+        except ValueError as e: QMessageBox.warning(self,"Cannot extend ROIs",str(e)); return
+        targets=self.entries if all_images else [source]; added=0; skipped=[]
+        for entry in targets:
+            if entry is source:
+                candidates=generated
+            elif len(entry.rois)>=2:
+                # Recalculate from the target image's own ROI positions.  This
+                # avoids copying a reference image's small translation error.
+                try: candidates=populate_edges([roi.rect for roi in entry.rois],entry.size,ranges,rng)
+                except ValueError: candidates=[]
+            else:
+                # If the target has no local spacing information, align the
+                # reference sequence through the learned anchor pattern.
+                candidates=[]
+                for pattern in self.patterns[:1]:
+                    try: matches=find_pattern_matches(np.asarray(load_image(entry.path).convert("L")),pattern.template,self.threshold.value(),self.occurrence_nms.value(),self.maximum_occurrences.value())
+                    except ValueError: continue
+                    template_height,template_width=pattern.template.shape
+                    entry.pattern_matches[pattern.name]=[(x,y,template_width,template_height,score) for x,y,score in matches]
+                    for match_x,match_y,_ in matches:
+                        dx,dy=match_x-pattern.rect[0],match_y-pattern.rect[1]
+                        candidates.extend((x+dx,y+dy,w,h) for x,y,w,h in generated)
+                    if candidates: break
+                if not candidates: skipped.append(entry.path.name)
+            for rect in candidates:
+                rect=force_ratio(rect,self.ratio.value(),entry.size)
+                if 0<=rect[0] and 0<=rect[1] and rect[0]+rect[2]<=entry.size[0] and rect[1]+rect[3]<=entry.size[1] and not any(iou(rect,old.rect)>.5 for old in entry.rois):
+                    entry.rois.append(ROI(rect)); added+=1
+        self.select(self.current); self.update(f"Added {added} median-gap ROI(s)")
+        if skipped and all_images:
+            self.update(f"Added {added} ROI(s); skipped {len(skipped)} image(s) without local ROIs or an anchor match")
+    def random_resize(self, all_images):
+        if not 0<=self.current<len(self.entries): return
+        ranges=[(a.value(),b.value()) for a,b in self.ranges]; rng=random.Random()
+        if all_images:
+            targets=self.entries
+        else:
+            selected=any(item.isSelected() for item in self.items)
+            targets=[self.entries[self.current]]
+        changed=0
+        for entry in targets:
+            for index,roi in enumerate(entry.rois):
+                if not all_images and selected and (index>=len(self.items) or not self.items[index].isSelected()): continue
+                roi.rect=force_ratio(randomize_sides(roi.rect,entry.size,ranges,rng),self.ratio.value(),entry.size); changed+=1
+        self.select(self.current); self.update(f"Expanded {changed} ROI(s) on {'all images' if all_images else 'the current image'}")
+    def duplicate_rois(self, all_images):
+        if not self.entries: return
+        count=self.duplicate_count.value()
+        if all_images:
+            targets=[(entry,None) for entry in self.entries]
+        elif 0<=self.current<len(self.entries):
+            selected=any(item.isSelected() for item in self.items)
+            targets=[(self.entries[self.current],selected)]
+        else:
+            return
+        duplicated=0
+        for entry,selected_only in targets:
+            source=list(entry.rois)
+            if selected_only:
+                indices={i for i,item in enumerate(self.items) if item.isSelected()}
+                source=[roi for i,roi in enumerate(source) if i in indices]
+            for roi in source:
+                entry.rois.extend(ROI(roi.rect,roi.class_id,roi.confidence) for _ in range(count))
+                duplicated+=count
+        self.select(self.current); self.update(f"Duplicated {duplicated} ROI(s) at their original locations")
+    def auto_place(self, all_images):
+        if not self.patterns or not self.entries: return
+        source=self.entries[self.current] if 0<=self.current<len(self.entries) else None; targets=self.entries if all_images else ([source] if source else []); rng=random.Random()
+        for entry in targets:
+            image=np.asarray(load_image(entry.path).convert("L")); proposals=[]
+            for pattern in self.patterns:
+                try: matches=find_pattern_matches(image,pattern.template,self.threshold.value(),self.occurrence_nms.value(),self.maximum_occurrences.value())
+                except ValueError: continue
+                template_height,template_width=pattern.template.shape
+                entry.pattern_matches[pattern.name]=[(x,y,template_width,template_height,score) for x,y,score in matches]
+                for match_x,match_y,score in matches:
+                    dx,dy=match_x-pattern.rect[0],match_y-pattern.rect[1]
+                    for linked in pattern.rois:
+                        x,y,w,h=linked.rect; translated=(x+dx,y+dy,w,h)
+                        if translated[0]<0 or translated[1]<0 or translated[0]+w>entry.size[0] or translated[1]+h>entry.size[1]: continue
+                        resized=force_ratio(translated,self.ratio.value(),entry.size)
+                        proposals.append((score,ROI(resized,linked.class_id,linked.confidence)))
+            # Score-ordered suppression prevents duplicate linked ROIs from
+            # overlapping one another or already annotated ROIs.
+            accepted=[]
+            for _,candidate in sorted(proposals,key=lambda item:item[0],reverse=True):
+                if any(iou(candidate.rect,old.rect)>.5 for old in entry.rois): continue
+                if any(iou(candidate.rect,old.rect)>.5 for old in accepted): continue
+                accepted.append(candidate); entry.rois.append(candidate)
+        self.select(self.current); self.update("Auto-population complete")
+    def choose_model(self):
+        value,_=QFileDialog.getOpenFileName(self,"Choose ONNX classifier","","ONNX model (*.onnx)");
+        if value: self.model_path=Path(value).resolve(); self.session=None; self.update()
+    def load_model(self):
+        if not self.model_path or not self.model_path.is_file(): raise ValueError("Choose an ONNX model first.")
+        if self.session: return
+        import onnxruntime as ort
+        self.session=ort.InferenceSession(str(self.model_path),providers=["CPUExecutionProvider"]); inputs=self.session.get_inputs()
+        if len(inputs)!=1: raise ValueError("Expected one model input.")
+        self.input_name=inputs[0].name; self.kind="bw8" if self.input_name=="images_bw8_uint8_nchw" else "c24" if self.input_name=="images_c24_uint8_nhwc_bgr" else None
+        if not self.kind: raise ValueError(f"Unsupported embedded classifier input: {self.input_name}")
+        raw=self.session.get_modelmeta().custom_metadata_map.get("names", "{}")
+        try: parsed=ast.literal_eval(raw); self.names={int(k):str(v) for k,v in (parsed.items() if isinstance(parsed,dict) else enumerate(parsed))}
+        except (SyntaxError,ValueError): self.names={}
+        for name in self.names.values():
+            if name.casefold() not in {value.casefold() for value in self.classes}:
+                self.classes.append(name); self.class_list.addItem(name)
+    def auto_label(self, all_images):
+        targets=self.entries if all_images else ([self.entries[self.current]] if 0<=self.current<len(self.entries) else [])
+        try: self.load_model()
+        except Exception as e: QMessageBox.critical(self,"ONNX load failed",str(e)); return
+        count=0
+        for entry in targets:
+            image=load_image(entry.path).convert("RGB")
+            for roi in entry.rois:
+                x,y,w,h=roi.rect; crop=image.crop((x,y,x+w,y+h)); tensor=np.asarray(crop.convert("L"),dtype=np.uint8)[None,None] if self.kind=="bw8" else np.asarray(crop,dtype=np.uint8)[...,::-1].copy()[None]
+                scores=self.session.run(None,{self.input_name:tensor})[0][0]; index=int(np.argmax(scores)); roi.class_id=index if index<len(self.classes) else roi.class_id; roi.confidence=float(scores[index]); count+=1
+        self.select(self.current); self.update(f"Auto-labeled {count} ROI(s)")
+    def export(self):
+        samples=[(e,r,i) for e in self.entries for i,r in enumerate(e.rois) if r.class_id is not None and 0<=r.class_id<len(self.classes)]
+        if not samples: QMessageBox.information(self,"No labeled ROIs","Assign a class before exporting."); return
+        ratios=tuple(x.value()/100 for x in self.split)
+        if abs(sum(ratios)-1)>1e-6: QMessageBox.warning(self,"Invalid split","Split percentages must add to 100%."); return
+        parent=QFileDialog.getExistingDirectory(self,"Dataset parent");
+        if not parent: return
+        name,ok=QInputDialog.getText(self,"Dataset folder","Name:",text="classification_dataset");
+        if not ok: return
+        try: output=Path(parent)/valid_name(name,"Dataset folder")
+        except ValueError as e: QMessageBox.warning(self,"Invalid folder",str(e)); return
+        if output.exists(): QMessageBox.warning(self,"Destination exists",str(output)); return
+        by_class={i:[] for i in range(len(self.classes))}; [by_class[r.class_id].append((e,r,i)) for e,r,i in samples]
+        rng=random.Random(42); splits={s:[] for s in ("train","val","test")}
+        # Split each class independently so the class distribution is retained.
+        for group in by_class.values():
+            rng.shuffle(group); counts=split_counts(len(group),ratios); off=0
+            for s,n in zip(splits,counts):
+                splits[s].extend(group[off:off+n]); off+=n
+        if self.balance.isChecked():
+            groups={cid:[x for x in splits["train"] if x[1].class_id==cid] for cid in by_class}; target=max((len(x) for x in groups.values()),default=0) if self.strategy.currentRow()==0 else min((len(x) for x in groups.values()),default=0); splits["train"]=[x for cid,g in groups.items() for x in (g+[rng.choice(g) for _ in range(target-len(g))] if self.strategy.currentRow()==0 and g else g[:target])]
+        written=0
+        try:
+            for split,group in splits.items():
+                for cid in by_class: (output/split/self.classes[cid]).mkdir(parents=True,exist_ok=True)
+                for e,r,i in group:
+                    digest=hashlib.sha1(str(e.path.resolve()).encode()).hexdigest()[:10]; base=f"{e.path.stem}_{digest}_{i:04d}_{written:06d}.png"; image=load_image(e.path); x,y,w,h=r.rect; image.crop((x,y,x+w,y+h)).save(output/split/self.classes[r.class_id]/base); written+=1
+        except Exception as e: QMessageBox.critical(self,"Export failed",f"{written} crop(s) written.\n\n{e}"); return
+        QMessageBox.information(self,"Dataset created",f"Created {written} crop(s):\n{output}")
 
 
-def parse_args():
-    parser = ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, help="Trained Ultralytics classification checkpoint (best.pt)")
-    return parser.parse_args()
+def main():
+    parser=ArgumentParser(description=__doc__); parser.add_argument("--model",type=Path); args=parser.parse_args(); app=QApplication(sys.argv); window=MainWindow(args.model); window.show(); sys.exit(app.exec())
 
 
-def main() -> None:
-    args = parse_args()
-    app = QApplication(sys.argv)
-    window = MainWindow(args.model.resolve() if args.model else None)
-    window.show()
-    sys.exit(app.exec())
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
