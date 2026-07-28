@@ -49,6 +49,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name", help="Override the model_name stored in the checkpoint")
     parser.add_argument("--imgsz", type=int, help="Override the square training input size")
     parser.add_argument("--opset", type=int, default=18, help="ONNX opset (default: 18)")
+    parser.add_argument("--device", default="auto",
+                        help='Export/validation device: "auto", "cpu", or "cuda[:N]" (default: auto)')
     parser.add_argument("--dynamic", action="store_true", help="Allow dynamic batch and image dimensions")
     parser.add_argument("--half", action="store_true", help="Export the classifier core as FP16")
     parser.add_argument("--simplify", action=argparse.BooleanOptionalAction, default=True,
@@ -62,10 +64,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_training_checkpoint(path: Path, model_name_override: str | None):
+def resolve_device(requested: str) -> torch.device:
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(requested)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"CUDA device requested ({requested}) but CUDA is not available")
+    if device.type not in {"cpu", "cuda"}:
+        raise ValueError(f"Unsupported device: {requested!r}; use auto, cpu, or cuda[:N]")
+    return device
+
+
+def load_training_checkpoint(path: Path, model_name_override: str | None, device: torch.device):
     if not path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
     if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
         raise ValueError("Expected a checkpoint produced by the timm classification training script")
     model_name = model_name_override or checkpoint.get("model_name")
@@ -83,7 +96,7 @@ def load_training_checkpoint(path: Path, model_name_override: str | None):
         raise ValueError(f"Unsupported data_config interpolation: {interpolation!r}")
     model = timm.create_model(model_name, pretrained=False, num_classes=len(classes))
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
-    model.eval()
+    model.to(device).eval()
     return model, list(classes), config
 
 
@@ -97,12 +110,12 @@ def model_input_size(config: dict, override: int | None) -> int:
     return override or height
 
 
-def export_onnx(args: argparse.Namespace):
+def export_onnx(args: argparse.Namespace, device: torch.device):
     checkpoint_path = args.model.expanduser().resolve()
-    model, classes, config = load_training_checkpoint(checkpoint_path, args.model_name)
+    model, classes, config = load_training_checkpoint(checkpoint_path, args.model_name, device)
     imgsz = model_input_size(config, args.imgsz)
     output = checkpoint_path.with_suffix(".onnx")
-    input_tensor = torch.zeros(1, 3, imgsz, imgsz)
+    input_tensor = torch.zeros(1, 3, imgsz, imgsz, device=device)
     if args.half:
         model = model.half()
         input_tensor = input_tensor.half()
@@ -116,21 +129,22 @@ def export_onnx(args: argparse.Namespace):
                 3: torch.export.Dim.DYNAMIC,
             }
         }
-    print(f"Exporting {checkpoint_path.name} ({model.__class__.__name__}) to ONNX...")
-    torch.onnx.export(
-        export_model,
-        (input_tensor,),
-        output,
-        input_names=["images"],
-        output_names=["probabilities"],
-        opset_version=args.opset,
-        dynamo=True,
-        dynamic_shapes=dynamic_shapes,
-        external_data=False,
-        optimize=True,
-        verify=True,
-        verbose=False,
-    )
+    print(f"Exporting {checkpoint_path.name} ({model.__class__.__name__}) to ONNX on {device}...")
+    with torch.inference_mode():
+        torch.onnx.export(
+            export_model,
+            (input_tensor,),
+            output,
+            input_names=["images"],
+            output_names=["probabilities"],
+            opset_version=args.opset,
+            dynamo=True,
+            dynamic_shapes=dynamic_shapes,
+            external_data=False,
+            optimize=True,
+            verify=True,
+            verbose=False,
+        )
     if args.simplify:
         try:
             import onnxslim
@@ -220,11 +234,16 @@ def image_paths(dataset: Path):
     return sorted(path for path in dataset.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS)
 
 
-def validate_wrappers(model_path, bw8_path, c24_path, dataset, imgsz, config):
+def validate_wrappers(model_path, bw8_path, c24_path, dataset, imgsz, config, device):
     images = image_paths(dataset)
     if not images:
         raise ValueError(f"No images found below {dataset}")
-    sessions = {name: ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    providers = ["CPUExecutionProvider"]
+    if device.type == "cuda" and "CUDAExecutionProvider" in ort.get_available_providers():
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    elif device.type == "cuda":
+        print("onnxruntime_cuda_unavailable=validation_using_cpu")
+    sessions = {name: ort.InferenceSession(str(path), providers=providers)
                 for name, path in (("reference", model_path), ("bw8", bw8_path), ("c24", c24_path))}
     input_names = {name: session.get_inputs()[0].name for name, session in sessions.items()}
     interpolation = getattr(transforms.InterpolationMode, config["interpolation"].upper())
@@ -319,9 +338,11 @@ def validate_wrappers(model_path, bw8_path, c24_path, dataset, imgsz, config):
 
 def main() -> None:
     args = parse_args()
+    device = resolve_device(args.device)
+    print(f"device={device}")
     if not args.embedded_preprocessing and (args.dataset or args.bw8_output or args.c24_output or args.skip_validation):
         raise ValueError("Dataset and wrapper options require --embedded-preprocessing")
-    onnx_path, imgsz, config = export_onnx(args)
+    onnx_path, imgsz, config = export_onnx(args, device)
     if not args.embedded_preprocessing:
         return
     bw8_path = (args.bw8_output or onnx_path.with_name(f"{onnx_path.stem}-embedded-preprocess-bw8.onnx")).resolve()
@@ -331,7 +352,7 @@ def main() -> None:
     print(f"created_bw8={bw8_path}")
     print(f"created_c24={c24_path}")
     if args.dataset and not args.skip_validation:
-        validate_wrappers(onnx_path, bw8_path, c24_path, args.dataset.resolve(), imgsz, config)
+        validate_wrappers(onnx_path, bw8_path, c24_path, args.dataset.resolve(), imgsz, config, device)
 
 
 if __name__ == "__main__":
