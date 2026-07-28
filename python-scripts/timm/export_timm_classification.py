@@ -105,14 +105,31 @@ def export_onnx(args: argparse.Namespace):
     if args.half:
         model = model.half()
         input_tensor = input_tensor.half()
-    export_model = ProbabilityModel(model)
-    dynamic_axes = {"images": {0: "batch"}, "probabilities": {0: "batch"}} if args.dynamic else None
+    export_model = ProbabilityModel(model).eval()
+    dynamic_shapes = None
     if args.dynamic:
-        dynamic_axes["images"].update({2: "height", 3: "width"})
+        dynamic_shapes = {
+            "images": {
+                0: torch.export.Dim.DYNAMIC,
+                2: torch.export.Dim.DYNAMIC,
+                3: torch.export.Dim.DYNAMIC,
+            }
+        }
     print(f"Exporting {checkpoint_path.name} ({model.__class__.__name__}) to ONNX...")
-    torch.onnx.export(export_model, input_tensor, output, input_names=["images"], output_names=["probabilities"],
-                      opset_version=args.opset, dynamic_axes=dynamic_axes,
-                      do_constant_folding=True, dynamo=False)
+    torch.onnx.export(
+        export_model,
+        (input_tensor,),
+        output,
+        input_names=["images"],
+        output_names=["probabilities"],
+        opset_version=args.opset,
+        dynamo=True,
+        dynamic_shapes=dynamic_shapes,
+        external_data=False,
+        optimize=True,
+        verify=True,
+        verbose=False,
+    )
     if args.simplify:
         try:
             import onnxslim
