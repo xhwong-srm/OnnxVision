@@ -214,6 +214,8 @@ class MainWindow(QMainWindow):
         self.delete_shortcut=QShortcut(QKeySequence(Qt.Key.Key_Delete),self); self.delete_shortcut.activated.connect(self.delete_selected)
         right=QVBoxLayout(); right.addWidget(QLabel("Classes (Ctrl-select ROIs; right-drag moves them)")); self.class_list=QListWidget(); right.addWidget(self.class_list,1)
         b=QPushButton("Add class..."); b.clicked.connect(self.add_class); right.addWidget(b); b=QPushButton("Assign class to selected ROI(s)"); b.clicked.connect(self.assign_class); right.addWidget(b)
+        for text, fn in (("Set all current ROI labels",lambda:self.set_all_labels(False)),("Set all image ROI labels",lambda:self.set_all_labels(True))):
+            b=QPushButton(text); b.clicked.connect(fn); right.addWidget(b)
         right.addWidget(QLabel("Learned anchor patterns")); self.pattern_list=QListWidget(); right.addWidget(self.pattern_list,1)
         for text, fn in (("Draw / learn anchor pattern",self.begin_pattern),("Extend current by median gap",lambda:self.extend_gap(False)),("Extend all by median gap",lambda:self.extend_gap(True)),("Auto-populate current",lambda:self.auto_place(False)),("Auto-populate all",lambda:self.auto_place(True)),("Expand current ROI(s)",lambda:self.random_resize(False)),("Expand all ROI(s)",lambda:self.random_resize(True))):
             b=QPushButton(text); b.clicked.connect(fn); right.addWidget(b)
@@ -306,6 +308,20 @@ class MainWindow(QMainWindow):
         for item,roi in zip(self.items,self.entries[self.current].rois):
             if item.isSelected(): roi.class_id=cid
         self.select(self.current)
+    def set_all_labels(self, all_images):
+        class_id=self.class_list.currentRow()
+        if not 0<=class_id<len(self.classes):
+            self.update("Select a class before assigning labels")
+            return
+        targets=self.entries if all_images else ([self.entries[self.current]] if 0<=self.current<len(self.entries) else [])
+        changed=0
+        for entry in targets:
+            for roi in entry.rois:
+                roi.class_id=class_id
+                roi.confidence=None
+                changed+=1
+        self.select(self.current)
+        self.update(f"Set {changed} ROI label(s) to '{self.classes[class_id]}'")
     def begin_pattern(self):
         if not 0<=self.current<len(self.entries):
             QMessageBox.information(self,"No image","Select a reference image first."); return
