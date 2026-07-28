@@ -28,12 +28,30 @@ def parse_args():
         help="Dataset root containing train/val/test class folders",
     )
     parser.add_argument("--model", default=MODEL_NAME)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument(
         "--patience",
         type=int,
-        default=8,
-        help="Stop after this many epochs without validation improvement; 0 disables early stopping",
+        default=15,
+        help="Stop after this many epochs without a better validation checkpoint; 0 disables early stopping",
+    )
+    parser.add_argument(
+        "--min-epochs",
+        type=int,
+        default=20,
+        help="Train at least this many epochs before early stopping is allowed",
+    )
+    parser.add_argument(
+        "--min-loss-delta",
+        type=float,
+        default=1e-4,
+        help="Minimum validation-loss decrease required when the primary metric and accuracy are tied",
+    )
+    parser.add_argument(
+        "--selection-metric",
+        choices=("accuracy", "macro_f1"),
+        default="macro_f1",
+        help="Primary validation metric used for best-checkpoint selection and early stopping",
     )
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -94,10 +112,35 @@ def make_dataset(root: Path, transform):
     return dataset
 
 
-def run_epoch(model, loader, criterion, device, optimizer=None, scaler=None):
+def classification_metrics(confusion_matrix, classes):
+    per_class = {}
+    f1_scores = []
+    for index, class_name in enumerate(classes):
+        true_positive = confusion_matrix[index][index]
+        actual_count = sum(confusion_matrix[index])
+        predicted_count = sum(row[index] for row in confusion_matrix)
+        precision = true_positive / predicted_count if predicted_count else 0.0
+        recall = true_positive / actual_count if actual_count else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        f1_scores.append(f1)
+        per_class[class_name] = {
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "support": actual_count,
+        }
+    return {
+        "macro_f1": sum(f1_scores) / len(f1_scores),
+        "per_class": per_class,
+        "confusion_matrix": confusion_matrix,
+    }
+
+
+def run_epoch(model, loader, criterion, device, optimizer=None, scaler=None, classes=None):
     training = optimizer is not None
     model.train(training)
     total_loss = total_correct = total_items = 0
+    confusion_matrix = [[0 for _ in classes] for _ in classes] if classes is not None else None
     autocast_device = "cuda" if device.type == "cuda" else "cpu"
     with torch.set_grad_enabled(training):
         for images, targets in loader:
@@ -116,17 +159,34 @@ def run_epoch(model, loader, criterion, device, optimizer=None, scaler=None):
                     loss.backward()
                     optimizer.step()
             total_loss += loss.item() * targets.size(0)
-            total_correct += (logits.argmax(1) == targets).sum().item()
+            predictions = logits.argmax(1)
+            total_correct += (predictions == targets).sum().item()
             total_items += targets.size(0)
-    return total_loss / total_items, total_correct / total_items
+            if confusion_matrix is not None:
+                for target, prediction in zip(targets.tolist(), predictions.tolist()):
+                    confusion_matrix[target][prediction] += 1
+    metrics = classification_metrics(confusion_matrix, classes) if confusion_matrix is not None else None
+    return total_loss / total_items, total_correct / total_items, metrics
 
 
-def save_checkpoint(path, model, optimizer, epoch, val_accuracy, classes, config, model_name):
+def is_better_checkpoint(score, val_accuracy, val_loss, best_score, best_accuracy, best_loss, min_loss_delta):
+    if score > best_score:
+        return True, "higher primary validation metric"
+    if score == best_score and val_accuracy > best_accuracy:
+        return True, "equal primary metric with higher validation accuracy"
+    if score == best_score and val_accuracy == best_accuracy and val_loss < best_loss - min_loss_delta:
+        return True, "equal primary metric and accuracy with lower validation loss"
+    return False, None
+
+
+def save_checkpoint(path, model, optimizer, epoch, val_accuracy, val_loss, val_metrics, classes, config, model_name):
     torch.save(
         {
             "model_name": model_name,
             "epoch": epoch,
             "val_accuracy": val_accuracy,
+            "val_loss": val_loss,
+            "val_metrics": val_metrics,
             "classes": classes,
             "class_to_idx": {name: index for index, name in enumerate(classes)},
             "data_config": config,
@@ -139,6 +199,15 @@ def save_checkpoint(path, model, optimizer, epoch, val_accuracy, classes, config
 
 def main() -> None:
     args = parse_args()
+    if args.epochs < 1:
+        raise ValueError("--epochs must be at least 1")
+    if args.patience < 0:
+        raise ValueError("--patience cannot be negative")
+    if args.min_epochs < 0:
+        raise ValueError("--min-epochs cannot be negative")
+    if args.min_loss_delta < 0:
+        raise ValueError("--min-loss-delta cannot be negative")
+
     torch.manual_seed(args.seed)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     data = args.data.resolve()
@@ -175,6 +244,9 @@ def main() -> None:
         "model": args.model,
         "epochs": args.epochs,
         "patience": args.patience,
+        "min_epochs": args.min_epochs,
+        "min_loss_delta": args.min_loss_delta,
+        "selection_metric": args.selection_metric,
         "batch": args.batch,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
@@ -197,27 +269,99 @@ def main() -> None:
         "timm_version": getattr(timm, "__version__", "unknown"),
         "data_config": config,
     }
+    best_score = -1.0
     best_accuracy = -1.0
+    best_loss = float("inf")
+    best_epoch = 0
+    best_val_metrics = None
     epochs_without_improvement = 0
     history = []
+    stop_reason = "maximum epochs reached"
 
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_accuracy = run_epoch(model, train_loader, criterion, device, optimizer, scaler)
-        val_loss, val_accuracy = run_epoch(model, val_loader, criterion, device)
+        train_loss, train_accuracy, _ = run_epoch(model, train_loader, criterion, device, optimizer, scaler)
+        val_loss, val_accuracy, val_metrics = run_epoch(
+            model,
+            val_loader,
+            criterion,
+            device,
+            classes=train_set.classes,
+        )
+        selection_score = val_accuracy if args.selection_metric == "accuracy" else val_metrics["macro_f1"]
         scheduler.step()
-        row = {"epoch": epoch, "train_loss": train_loss, "train_accuracy": train_accuracy, "val_loss": val_loss, "val_accuracy": val_accuracy}
-        history.append(row)
-        print("epoch {epoch:03d}: train loss={train_loss:.4f} acc={train_accuracy:.4f}; val loss={val_loss:.4f} acc={val_accuracy:.4f}".format(**row))
-        save_checkpoint(output / "last.pt", model, optimizer, epoch, val_accuracy, train_set.classes, config, args.model)
-        if val_accuracy > best_accuracy:
+        improved, improvement_reason = is_better_checkpoint(
+            selection_score,
+            val_accuracy,
+            val_loss,
+            best_score,
+            best_accuracy,
+            best_loss,
+            args.min_loss_delta,
+        )
+        if improved:
+            best_score = selection_score
             best_accuracy = val_accuracy
+            best_loss = val_loss
+            best_epoch = epoch
+            best_val_metrics = val_metrics
             epochs_without_improvement = 0
-            save_checkpoint(output / "best.pt", model, optimizer, epoch, val_accuracy, train_set.classes, config, args.model)
         else:
             epochs_without_improvement += 1
 
-        if args.patience > 0 and epochs_without_improvement >= args.patience:
-            print(f"early stopping after epoch {epoch}: validation accuracy did not improve for {args.patience} epochs")
+        row = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "train_accuracy": train_accuracy,
+            "val_loss": val_loss,
+            "val_accuracy": val_accuracy,
+            "val_macro_f1": val_metrics["macro_f1"],
+            "selection_score": selection_score,
+            "is_best": improved,
+            "epochs_without_improvement": epochs_without_improvement,
+        }
+        history.append(row)
+        print(
+            "epoch {epoch:03d}: train loss={train_loss:.4f} acc={train_accuracy:.4f}; "
+            "val loss={val_loss:.4f} acc={val_accuracy:.4f} macro_f1={val_macro_f1:.4f}".format(**row)
+        )
+        save_checkpoint(
+            output / "last.pt",
+            model,
+            optimizer,
+            epoch,
+            val_accuracy,
+            val_loss,
+            val_metrics,
+            train_set.classes,
+            config,
+            args.model,
+        )
+        if improved:
+            save_checkpoint(
+                output / "best.pt",
+                model,
+                optimizer,
+                epoch,
+                val_accuracy,
+                val_loss,
+                val_metrics,
+                train_set.classes,
+                config,
+                args.model,
+            )
+            print(f"  saved best.pt: {improvement_reason}")
+
+        can_stop = epoch >= args.min_epochs
+        patience_exhausted = args.patience > 0 and epochs_without_improvement >= args.patience
+        if can_stop and patience_exhausted:
+            stop_reason = (
+                f"early stopping after {args.patience} epochs without a better validation checkpoint"
+            )
+            print(
+                f"{stop_reason}; best epoch={best_epoch}, "
+                f"{args.selection_metric}={best_score:.4f}, "
+                f"val loss={best_loss:.4f}, val acc={best_accuracy:.4f}"
+            )
             break
 
     with (output / "history.csv").open("w", newline="", encoding="utf-8") as file:
@@ -229,13 +373,38 @@ def main() -> None:
         "classes": train_set.classes,
         "data_config": config,
         "parameters": parameters,
+        "training_result": {
+            "completed_epochs": len(history),
+            "best_epoch": best_epoch,
+            "selection_metric": args.selection_metric,
+            "best_selection_score": best_score,
+            "best_val_loss": best_loss,
+            "best_val_accuracy": best_accuracy,
+            "best_val_metrics": best_val_metrics,
+            "stop_reason": stop_reason,
+        },
     }
-    (output / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     if test_loader is not None:
         best = torch.load(output / "best.pt", map_location=device, weights_only=False)
         model.load_state_dict(best["model_state_dict"])
-        test_loss, test_accuracy = run_epoch(model, test_loader, criterion, device)
-        print(f"test loss={test_loss:.4f} acc={test_accuracy:.4f}")
+        test_loss, test_accuracy, test_metrics = run_epoch(
+            model,
+            test_loader,
+            criterion,
+            device,
+            classes=train_set.classes,
+        )
+        print(
+            f"test loss={test_loss:.4f} acc={test_accuracy:.4f} "
+            f"macro_f1={test_metrics['macro_f1']:.4f}"
+        )
+        metadata["test_result"] = {
+            "checkpoint_epoch": best["epoch"],
+            "loss": test_loss,
+            "accuracy": test_accuracy,
+            **test_metrics,
+        }
+    (output / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":
