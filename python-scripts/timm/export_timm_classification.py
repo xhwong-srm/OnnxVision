@@ -29,6 +29,7 @@ from torchvision import transforms
 
 
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+MAX_REPORTED_DISAGREEMENTS = 20
 
 
 class ProbabilityModel(torch.nn.Module):
@@ -232,6 +233,12 @@ def validate_wrappers(model_path, bw8_path, c24_path, dataset, imgsz, config):
     class_index = {name: index for index, name in enumerate(classes)}
     correct = {name: 0 for name in sessions}
     agreements = {name: 0 for name in ("bw8", "c24", "bw8_c24")}
+    probability_errors = {
+        name: {"absolute_sum": 0.0, "value_count": 0, "maximum": 0.0}
+        for name in agreements
+    }
+    disagreements = []
+    disagreement_count = 0
     for path in images:
         with Image.open(path) as source:
             rgb = source.convert("RGB")
@@ -240,19 +247,74 @@ def validate_wrappers(model_path, bw8_path, c24_path, dataset, imgsz, config):
                        "bw8": np.asarray(source.convert("L"), dtype=np.uint8)[None, None, ...],
                        "c24": np.asarray(rgb, dtype=np.uint8)[..., ::-1].copy()[None, ...]}
             scores = {name: sessions[name].run(None, {input_names[name]: value})[0][0] for name, value in tensors.items()}
+            gray_reference_scores = sessions["reference"].run(
+                None,
+                {input_names["reference"]: preprocessing(gray_rgb).unsqueeze(0).numpy()},
+            )[0][0]
         predictions = {name: int(np.argmax(value)) for name, value in scores.items()}
+        gray_reference_prediction = int(np.argmax(gray_reference_scores))
         expected = class_index[path.parent.name]
         for name, prediction in predictions.items():
             correct[name] += prediction == expected
-        agreements["bw8"] += predictions["bw8"] == int(np.argmax(sessions["reference"].run(None, {input_names["reference"]: preprocessing(gray_rgb).unsqueeze(0).numpy()})[0][0]))
-        agreements["c24"] += predictions["c24"] == predictions["reference"]
-        agreements["bw8_c24"] += predictions["bw8"] == predictions["c24"]
+        comparison_scores = {
+            "bw8": (gray_reference_scores, scores["bw8"]),
+            "c24": (scores["reference"], scores["c24"]),
+            "bw8_c24": (scores["bw8"], scores["c24"]),
+        }
+        comparison_predictions = {
+            "bw8": (gray_reference_prediction, predictions["bw8"]),
+            "c24": (predictions["reference"], predictions["c24"]),
+            "bw8_c24": (predictions["bw8"], predictions["c24"]),
+        }
+        mismatched_comparisons = []
+        for name, (left_scores, right_scores) in comparison_scores.items():
+            difference = np.abs(left_scores.astype(np.float64) - right_scores.astype(np.float64))
+            probability_errors[name]["absolute_sum"] += float(difference.sum())
+            probability_errors[name]["value_count"] += difference.size
+            probability_errors[name]["maximum"] = max(
+                probability_errors[name]["maximum"],
+                float(difference.max(initial=0.0)),
+            )
+            matches = comparison_predictions[name][0] == comparison_predictions[name][1]
+            agreements[name] += matches
+            if not matches:
+                mismatched_comparisons.append(name)
+        if mismatched_comparisons:
+            disagreement_count += 1
+            if len(disagreements) < MAX_REPORTED_DISAGREEMENTS:
+                disagreements.append({
+                    "image": str(path.relative_to(dataset)),
+                    "expected": classes[expected],
+                    "mismatches": mismatched_comparisons,
+                    "predictions": {
+                        "reference": classes[predictions["reference"]],
+                        "gray_reference": classes[gray_reference_prediction],
+                        "bw8": classes[predictions["bw8"]],
+                        "c24": classes[predictions["c24"]],
+                    },
+                    "probabilities": {
+                        "reference": scores["reference"].tolist(),
+                        "gray_reference": gray_reference_scores.tolist(),
+                        "bw8": scores["bw8"].tolist(),
+                        "c24": scores["c24"].tolist(),
+                    },
+                })
     total = len(images)
     print(f"validation_images={total}")
     for name, count in correct.items():
         print(f"{name}_accuracy={count / total:.6f} ({count}/{total})")
     for name, count in agreements.items():
         print(f"{name}_agreement={count / total:.6f} ({count}/{total})")
+        error = probability_errors[name]
+        mean_error = error["absolute_sum"] / error["value_count"]
+        print(f"{name}_probability_mae={mean_error:.9g}")
+        print(f"{name}_probability_max_error={error['maximum']:.9g}")
+    print(f"reported_disagreements={len(disagreements)}")
+    for index, disagreement in enumerate(disagreements, start=1):
+        print(f"disagreement_{index}={json.dumps(disagreement, separators=(',', ':'))}")
+    omitted = disagreement_count - len(disagreements)
+    if omitted > 0:
+        print(f"unreported_disagreements={omitted}")
 
 
 def main() -> None:
