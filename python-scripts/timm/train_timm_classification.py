@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import sys
-from argparse import ArgumentParser
+from argparse import ArgumentParser, BooleanOptionalAction
 from pathlib import Path
 
 import timm
@@ -56,7 +57,61 @@ def parse_args():
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=-1,
+        help="DataLoader worker processes; -1 selects automatically, 0 loads in the main process",
+    )
+    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument(
+        "--persistent-workers",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Keep DataLoader workers alive between epochs when workers are enabled",
+    )
+    parser.add_argument(
+        "--pin-memory",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Use pinned host memory and asynchronous transfers on accelerators",
+    )
+    parser.add_argument(
+        "--amp",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Use automatic mixed precision on CUDA",
+    )
+    parser.add_argument(
+        "--amp-dtype",
+        choices=("float16", "bfloat16"),
+        default="float16",
+        help="CUDA automatic mixed-precision dtype",
+    )
+    parser.add_argument(
+        "--channels-last",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Use channels-last tensors on CUDA for convolution-heavy models",
+    )
+    parser.add_argument(
+        "--cudnn-benchmark",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Let cuDNN benchmark fixed input shapes and select faster convolution algorithms",
+    )
+    parser.add_argument(
+        "--compile",
+        action=BooleanOptionalAction,
+        default=False,
+        help="Use torch.compile; opt in after benchmarking compatibility on the target machine",
+    )
+    parser.add_argument(
+        "--matmul-precision",
+        choices=("highest", "high", "medium"),
+        default="high",
+        help="Float32 matrix-multiplication precision; high enables faster hardware paths where supported",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--output",
@@ -136,7 +191,19 @@ def classification_metrics(confusion_matrix, classes):
     }
 
 
-def run_epoch(model, loader, criterion, device, optimizer=None, scaler=None, classes=None):
+def run_epoch(
+    model,
+    loader,
+    criterion,
+    device,
+    optimizer=None,
+    scaler=None,
+    classes=None,
+    amp_enabled=False,
+    amp_dtype=torch.float16,
+    channels_last=False,
+    non_blocking=False,
+):
     training = optimizer is not None
     model.train(training)
     total_loss = total_correct = total_items = 0
@@ -144,10 +211,17 @@ def run_epoch(model, loader, criterion, device, optimizer=None, scaler=None, cla
     autocast_device = "cuda" if device.type == "cuda" else "cpu"
     with torch.set_grad_enabled(training):
         for images, targets in loader:
-            images, targets = images.to(device), targets.to(device)
+            images = images.to(device, non_blocking=non_blocking)
+            targets = targets.to(device, non_blocking=non_blocking)
+            if channels_last:
+                images = images.contiguous(memory_format=torch.channels_last)
             if training:
                 optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=autocast_device, enabled=device.type == "cuda"):
+            with torch.autocast(
+                device_type=autocast_device,
+                dtype=amp_dtype,
+                enabled=amp_enabled,
+            ):
                 logits = model(images)
                 loss = criterion(logits, targets)
             if training:
@@ -207,9 +281,31 @@ def main() -> None:
         raise ValueError("--min-epochs cannot be negative")
     if args.min_loss_delta < 0:
         raise ValueError("--min-loss-delta cannot be negative")
+    if args.workers < -1:
+        raise ValueError("--workers must be -1 or greater")
+    if args.prefetch_factor < 1:
+        raise ValueError("--prefetch-factor must be at least 1")
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"CUDA device requested but CUDA is unavailable: {device}")
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
+    torch.set_float32_matmul_precision(args.matmul_precision)
+    torch.backends.cudnn.benchmark = args.cudnn_benchmark and device.type == "cuda"
+
+    cpu_count = os.cpu_count() or 1
+    workers = args.workers
+    if workers == -1:
+        workers = min(8, max(1, cpu_count // 2)) if device.type == "cuda" else 0
+    pin_memory = args.pin_memory and device.type == "cuda"
+    persistent_workers = args.persistent_workers and workers > 0
+    channels_last = args.channels_last and device.type == "cuda"
+    amp_enabled = args.amp and device.type == "cuda"
+    amp_dtype = torch.float16 if args.amp_dtype == "float16" else torch.bfloat16
+    non_blocking = pin_memory and device.type == "cuda"
+
     data = args.data.resolve()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -227,14 +323,34 @@ def main() -> None:
 
     model.reset_classifier(len(train_set.classes))
     model.to(device)
-    loader_args = {"batch_size": args.batch, "num_workers": args.workers, "pin_memory": device.type == "cuda"}
+    if channels_last:
+        model.to(memory_format=torch.channels_last)
+    training_model = torch.compile(model) if args.compile else model
+
+    loader_args = {
+        "batch_size": args.batch,
+        "num_workers": workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers,
+    }
+    if workers > 0:
+        loader_args["prefetch_factor"] = args.prefetch_factor
     train_loader = DataLoader(train_set, shuffle=True, **loader_args)
     val_loader = DataLoader(val_set, shuffle=False, **loader_args)
     test_loader = DataLoader(test_set, shuffle=False, **loader_args) if test_set else None
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(training_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=amp_enabled and amp_dtype == torch.float16,
+    )
+
+    print(
+        f"device={device}; workers={workers}; pin_memory={pin_memory}; "
+        f"amp={amp_enabled} ({args.amp_dtype}); channels_last={channels_last}; "
+        f"compile={args.compile}; cudnn_benchmark={torch.backends.cudnn.benchmark}"
+    )
 
     # Keep the effective configuration alongside every run so it can be reproduced
     # even when the command used to start training is no longer available.
@@ -250,7 +366,18 @@ def main() -> None:
         "batch": args.batch,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
-        "workers": args.workers,
+        "requested_workers": args.workers,
+        "workers": workers,
+        "prefetch_factor": args.prefetch_factor if workers > 0 else None,
+        "persistent_workers": persistent_workers,
+        "pin_memory": pin_memory,
+        "non_blocking_transfers": non_blocking,
+        "amp": amp_enabled,
+        "amp_dtype": args.amp_dtype if amp_enabled else None,
+        "channels_last": channels_last,
+        "compile": args.compile,
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "matmul_precision": args.matmul_precision,
         "seed": args.seed,
         "output": str(output),
         "requested_device": args.device,
@@ -259,7 +386,7 @@ def main() -> None:
         "optimizer": "AdamW",
         "scheduler": {"name": "CosineAnnealingLR", "T_max": args.epochs},
         "loss": "CrossEntropyLoss",
-        "mixed_precision": device.type == "cuda",
+        "mixed_precision": amp_enabled,
         "num_classes": len(train_set.classes),
         "classes": train_set.classes,
         "train_samples": len(train_set),
@@ -279,13 +406,28 @@ def main() -> None:
     stop_reason = "maximum epochs reached"
 
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_accuracy, _ = run_epoch(model, train_loader, criterion, device, optimizer, scaler)
+        train_loss, train_accuracy, _ = run_epoch(
+            training_model,
+            train_loader,
+            criterion,
+            device,
+            optimizer,
+            scaler,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+            channels_last=channels_last,
+            non_blocking=non_blocking,
+        )
         val_loss, val_accuracy, val_metrics = run_epoch(
-            model,
+            training_model,
             val_loader,
             criterion,
             device,
             classes=train_set.classes,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+            channels_last=channels_last,
+            non_blocking=non_blocking,
         )
         selection_score = val_accuracy if args.selection_metric == "accuracy" else val_metrics["macro_f1"]
         scheduler.step()
@@ -388,11 +530,15 @@ def main() -> None:
         best = torch.load(output / "best.pt", map_location=device, weights_only=False)
         model.load_state_dict(best["model_state_dict"])
         test_loss, test_accuracy, test_metrics = run_epoch(
-            model,
+            training_model,
             test_loader,
             criterion,
             device,
             classes=train_set.classes,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+            channels_last=channels_last,
+            non_blocking=non_blocking,
         )
         print(
             f"test loss={test_loss:.4f} acc={test_accuracy:.4f} "
