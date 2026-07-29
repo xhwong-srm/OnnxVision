@@ -153,10 +153,10 @@ def main() -> None:
     parser.add_argument("output", type=Path, help="Destination dataset directory.")
     parser.add_argument("--seed", type=int, default=20260728)
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--resplit", action="store_true", help="Ignore existing split assignments and create new splits.")
-    parser.add_argument("--train", type=float, default=70, help="Training percentage used with --resplit.")
-    parser.add_argument("--val", type=float, default=20, help="Validation percentage used with --resplit.")
-    parser.add_argument("--test", type=float, default=10, help="Test percentage used with --resplit.")
+    parser.add_argument("--resplit", action="store_true", help="Ignore existing split assignments and create new splits. Automatically enabled for class-only sources.")
+    parser.add_argument("--train", type=float, default=70, help="Training percentage used when re-splitting.")
+    parser.add_argument("--val", type=float, default=20, help="Validation percentage used when re-splitting.")
+    parser.add_argument("--test", type=float, default=10, help="Test percentage used when re-splitting.")
     parser.add_argument("--group-duplicates", action="store_true", help="Keep builder duplicate groups in one split.")
     parser.add_argument("--group-by-image", action="store_true", help="Keep all builder ROIs from each source image in one split.")
     parser.add_argument("--balance", choices=("undersample", "oversample", "none"), default="undersample")
@@ -172,8 +172,13 @@ def main() -> None:
             raise SystemExit(f"Output already exists; use --overwrite to replace it: {output}")
         shutil.rmtree(output)
 
+    unsplit_sources = [
+        source for source in sources
+        if not any((source / split).is_dir() for split in SPLITS)
+    ]
+    effective_resplit = args.resplit or bool(unsplit_sources)
     ratios = (args.train / 100, args.val / 100, args.test / 100)
-    if args.resplit and (any(ratio < 0 for ratio in ratios) or abs(sum(ratios) - 1) > 1e-9):
+    if effective_resplit and (any(ratio < 0 for ratio in ratios) or abs(sum(ratios) - 1) > 1e-9):
         raise SystemExit("--train, --val, and --test must be non-negative and add to 100.")
     mode = "image" if args.group_by_image else "duplicate" if args.group_duplicates else "sample"
 
@@ -183,6 +188,7 @@ def main() -> None:
             {
                 class_dir.name
                 for source in sources
+                if source not in unsplit_sources and (source / split).is_dir()
                 for class_dir in (source / split).iterdir()
                 if class_dir.is_dir()
             }
@@ -195,8 +201,15 @@ def main() -> None:
                     entries.extend((path, source, class_name) for path in image_files(source_class))
             collected[(split, class_name)] = entries
 
+    for source in unsplit_sources:
+        for class_dir in sorted((path for path in source.iterdir() if path.is_dir()), key=lambda path: path.name.lower()):
+            key = "train", class_dir.name
+            collected.setdefault(key, []).extend(
+                (path, source, class_dir.name) for path in image_files(class_dir)
+            )
+
     rng = random.Random(args.seed)
-    if args.resplit:
+    if effective_resplit:
         all_entries = [entry for entries in collected.values() for entry in entries]
         before_filter = len(all_entries)
         all_entries = [entry for entry in all_entries if not is_oversample_copy(entry)]
@@ -210,6 +223,9 @@ def main() -> None:
     else:
         selected = dict(collected)
         removed_oversamples = 0
+
+    if not any(selected.values()):
+        raise SystemExit("No images found in the source datasets.")
 
     train_classes = sorted({class_name for split, class_name in selected if split == "train"})
     train_counts = [len(selected[("train", class_name)]) for class_name in train_classes]
@@ -259,8 +275,9 @@ def main() -> None:
         writer.writerows(sorted(manifest_rows, key=lambda row: row["output"].lower()))
 
     print(f"Created: {output}")
-    print(f"Split mode: {'resplit' if args.resplit else 'preserve'}; grouping: {mode}; balance: {args.balance}")
-    if args.resplit:
+    split_mode = "resplit (automatic for class-only source)" if unsplit_sources and not args.resplit else "resplit" if effective_resplit else "preserve"
+    print(f"Split mode: {split_mode}; grouping: {mode}; balance: {args.balance}")
+    if effective_resplit:
         print(f"Prior oversample copies removed before split: {removed_oversamples}")
     if train_target is not None:
         print(f"Train target per class: {train_target} (nearest complete groups)")

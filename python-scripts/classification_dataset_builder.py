@@ -3,7 +3,7 @@
 The editor works on full source images.  ROIs can be drawn, moved with the
 right mouse button, multi-selected with Ctrl, learned as a template pattern,
 auto-populated to image edges, classified with an embedded ONNX classifier,
-and exported as class-folder train/val/test crops.
+and exported as class-folder crops, optionally split into train/val/test.
 """
 from __future__ import annotations
 
@@ -563,6 +563,7 @@ class MainWindow(QMainWindow):
         if not samples: QMessageBox.information(self,"No labeled ROIs","Assign a class before exporting."); return
         ratios=tuple(x.value()/100 for x in self.split)
         if abs(sum(ratios)-1)>1e-6: QMessageBox.warning(self,"Invalid split","Split percentages must add to 100%."); return
+        unsplit=ratios==(1.0,0.0,0.0)
         parent=QFileDialog.getExistingDirectory(self,"Dataset parent");
         if not parent: return
         name,ok=QInputDialog.getText(self,"Dataset folder","Name:",text="classification_dataset");
@@ -572,9 +573,10 @@ class MainWindow(QMainWindow):
         if output.exists(): QMessageBox.warning(self,"Destination exists",str(output)); return
         by_class={i:[] for i in range(len(self.classes))}; [by_class[r.class_id].append((e,r,i)) for e,r,i in samples]
         rng=random.Random(42)
-        splits=split_samples(samples,ratios,rng,self.group_duplicates.isChecked(),self.group_by_source.isChecked())
+        splits={"":list(samples)} if unsplit else split_samples(samples,ratios,rng,self.group_duplicates.isChecked(),self.group_by_source.isChecked())
         if self.balance.isChecked():
-            groups={cid:[x for x in splits["train"] if x[1].class_id==cid] for cid in by_class}; target=max((len(x) for x in groups.values()),default=0) if self.strategy.currentRow()==0 else min((len(x) for x in groups.values()),default=0); splits["train"]=[x for cid,g in groups.items() for x in (g+[rng.choice(g) for _ in range(target-len(g))] if self.strategy.currentRow()==0 and g else g[:target])]
+            balance_key="" if unsplit else "train"
+            groups={cid:[x for x in splits[balance_key] if x[1].class_id==cid] for cid in by_class}; target=max((len(x) for x in groups.values()),default=0) if self.strategy.currentRow()==0 else min((len(x) for x in groups.values()),default=0); splits[balance_key]=[x for cid,g in groups.items() for x in (g+[rng.choice(g) for _ in range(target-len(g))] if self.strategy.currentRow()==0 and g else g[:target])]
         image_ids={e.path.resolve():source_image_id(e.path) for e in self.entries}
         group_indices={}
         for entry in self.entries:
