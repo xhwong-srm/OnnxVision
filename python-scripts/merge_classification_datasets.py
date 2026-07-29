@@ -13,10 +13,11 @@ from pathlib import Path
 IMAGE_EXTENSIONS = {".bmp", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
 SPLITS = ("train", "val", "test")
 BUILDER_NAME = re.compile(
-    r"^(?P<image_id>[0-9a-f]{12})_r(?P<roi>\d+)_g(?P<group>\d+)_n(?P<occurrence>\d+)(?:_m\d+)*$",
+    r"^(?P<image_id>[0-9a-f]{12})_r(?P<roi>\d+)_g(?P<group>\d+)_n(?P<occurrence>\d+)$",
     re.IGNORECASE,
 )
 LEGACY_BUILDER_NAME = re.compile(r"^.+_(?P<image_id>[0-9a-f]{10})_\d+_\d+$", re.IGNORECASE)
+LEGACY_OVERSAMPLE_SUFFIX = re.compile(r"_n\d+$", re.IGNORECASE)
 
 
 def image_files(folder: Path) -> list[Path]:
@@ -32,8 +33,29 @@ def builder_identity(entry: tuple[Path, Path, str]) -> tuple[str | None, str | N
     match = BUILDER_NAME.fullmatch(path.stem)
     if match:
         return match["image_id"].lower(), match["group"]
-    legacy = LEGACY_BUILDER_NAME.fullmatch(path.stem)
+    legacy_stem = LEGACY_OVERSAMPLE_SUFFIX.sub("", path.stem)
+    legacy = LEGACY_BUILDER_NAME.fullmatch(legacy_stem)
     return (legacy["image_id"].lower(), None) if legacy else (None, None)
+
+
+def is_oversample_copy(entry: tuple[Path, Path, str]) -> bool:
+    """Return whether a file is an encoded builder or merge oversample copy."""
+    match = BUILDER_NAME.fullmatch(entry[0].stem)
+    if match:
+        return int(match["occurrence"]) > 0
+    return bool(LEGACY_OVERSAMPLE_SUFFIX.search(entry[0].stem))
+
+
+def oversample_name(path: Path, occurrence: int) -> str:
+    """Use the builder's nNNN occurrence convention for a repeated sample."""
+    match = BUILDER_NAME.fullmatch(path.stem)
+    if match:
+        return (
+            f"{match['image_id']}_r{int(match['roi']):04d}"
+            f"_g{int(match['group']):04d}_n{occurrence:03d}{path.suffix}"
+        )
+    base = LEGACY_OVERSAMPLE_SUFFIX.sub("", path.stem)
+    return f"{base}_n{occurrence:03d}{path.suffix}"
 
 
 def grouping_key(entry: tuple[Path, Path, str], mode: str) -> tuple[str, ...]:
@@ -173,6 +195,9 @@ def main() -> None:
     rng = random.Random(args.seed)
     if args.resplit:
         all_entries = [entry for entries in collected.values() for entry in entries]
+        before_filter = len(all_entries)
+        all_entries = [entry for entry in all_entries if not is_oversample_copy(entry)]
+        removed_oversamples = before_filter - len(all_entries)
         split_result = split_entries(all_entries, ratios, rng, mode)
         selected = {
             (split, class_name): [entry for entry in split_result[split] if entry[2] == class_name]
@@ -181,6 +206,7 @@ def main() -> None:
         }
     else:
         selected = dict(collected)
+        removed_oversamples = 0
 
     train_classes = sorted({class_name for split, class_name in selected if split == "train"})
     train_counts = [len(selected[("train", class_name)]) for class_name in train_classes]
@@ -203,12 +229,13 @@ def main() -> None:
         destination_dir.mkdir(parents=True, exist_ok=True)
         for source_path, source_root, _ in entries:
             destination = destination_dir / source_path.name
-            copy_index = 1
-            while destination in used_destinations:
-                if used_destinations[destination] != source_path.resolve():
-                    raise RuntimeError(f"Destination filename collision: {destination}")
-                destination = destination_dir / f"{source_path.stem}_m{copy_index:03d}{source_path.suffix}"
-                copy_index += 1
+            if destination in used_destinations and used_destinations[destination] != source_path.resolve():
+                raise RuntimeError(f"Destination filename collision: {destination}")
+            match = BUILDER_NAME.fullmatch(source_path.stem)
+            occurrence = int(match["occurrence"]) + 1 if match else 1
+            while destination in used_destinations or destination.exists():
+                destination = destination_dir / oversample_name(source_path, occurrence)
+                occurrence += 1
             if destination.exists():
                 raise RuntimeError(f"Destination filename collision: {destination}")
             used_destinations[destination] = source_path.resolve()
@@ -230,6 +257,8 @@ def main() -> None:
 
     print(f"Created: {output}")
     print(f"Split mode: {'resplit' if args.resplit else 'preserve'}; grouping: {mode}; balance: {args.balance}")
+    if args.resplit:
+        print(f"Prior oversample copies removed before split: {removed_oversamples}")
     if train_target is not None:
         print(f"Train target per class: {train_target} (nearest complete groups)")
     for key in sorted(selected):
