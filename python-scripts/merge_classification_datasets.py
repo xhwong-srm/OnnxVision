@@ -1,22 +1,66 @@
-"""Merge two folder-based classification datasets with deterministic train undersampling."""
+"""Merge classification datasets with deterministic, duplicate-group-aware train undersampling."""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import random
+import re
 import shutil
 from pathlib import Path
 
 
 IMAGE_EXTENSIONS = {".bmp", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
 SPLITS = ("train", "val", "test")
+BUILDER_NAME = re.compile(
+    r"^(?P<image_id>[0-9a-f]{12})_r(?P<roi>\d+)_g(?P<group>\d+)_n(?P<occurrence>\d+)$",
+    re.IGNORECASE,
+)
 
 
 def image_files(folder: Path) -> list[Path]:
     return sorted(
         (path for path in folder.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS),
         key=lambda path: path.as_posix().lower(),
+    )
+
+
+def duplicate_group_key(entry: tuple[Path, Path]) -> tuple[str, ...]:
+    """Identify a builder duplicate group; legacy filenames remain independent."""
+    path, source_root = entry
+    match = BUILDER_NAME.fullmatch(path.stem)
+    if match:
+        return match["image_id"].lower(), match["group"]
+    return "legacy", str(source_root).lower(), str(path).lower()
+
+
+def grouped_sample(entries: list[tuple[Path, Path]], target: int, rng: random.Random) -> list[tuple[Path, Path]]:
+    """Choose complete duplicate groups with a total count closest to target."""
+    grouped: dict[tuple[str, ...], list[tuple[Path, Path]]] = {}
+    for entry in entries:
+        grouped.setdefault(duplicate_group_key(entry), []).append(entry)
+    groups = list(grouped.values())
+    rng.shuffle(groups)
+    if not groups or target <= 0:
+        return []
+
+    limit = min(sum(map(len, groups)), target + max(map(len, groups)))
+    parents: dict[int, tuple[int, int] | None] = {0: None}
+    for index, group in enumerate(groups):
+        size = len(group)
+        for current in sorted(tuple(parents), reverse=True):
+            total = current + size
+            if total <= limit and total not in parents:
+                parents[total] = current, index
+    chosen_total = min(parents, key=lambda total: (abs(total - target), total > target, -total))
+    chosen_groups = []
+    while chosen_total:
+        previous, index = parents[chosen_total]
+        chosen_groups.append(index)
+        chosen_total = previous
+    return sorted(
+        (entry for index in chosen_groups for entry in groups[index]),
+        key=lambda item: item[0].as_posix().lower(),
     )
 
 
@@ -59,8 +103,7 @@ def main() -> None:
     train_target = min(len(collected[("train", class_name)]) for class_name in train_classes)
     for key, entries in collected.items():
         if key[0] == "train":
-            chosen = rng.sample(entries, train_target)
-            selected[key] = sorted(chosen, key=lambda item: item[0].as_posix().lower())
+            selected[key] = grouped_sample(entries, train_target, rng)
         else:
             selected[key] = entries
 
@@ -93,7 +136,7 @@ def main() -> None:
         writer.writerows(sorted(manifest_rows, key=lambda row: row["output"].lower()))
 
     print(f"Created: {output}")
-    print(f"Train target per class: {train_target}")
+    print(f"Train target per class: {train_target} (nearest complete duplicate groups)")
     for key in sorted(selected):
         print(f"{key[0]}/{key[1]}: {len(selected[key])}")
     print(f"Manifest: {manifest_path}")

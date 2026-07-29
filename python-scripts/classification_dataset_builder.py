@@ -12,6 +12,7 @@ import hashlib
 import random
 import shutil
 import sys
+from collections import defaultdict
 from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +46,15 @@ def valid_name(value: str, kind: str = "Name") -> str:
 def load_image(path: Path) -> Image.Image:
     with Image.open(path) as image:
         return ImageOps.exif_transpose(image).copy()
+
+
+def source_image_id(path: Path, length: int = 12) -> str:
+    """Return a stable ID that survives moving or copying the source image."""
+    digest = hashlib.sha1()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()[:length]
 
 
 def iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
@@ -534,12 +544,28 @@ class MainWindow(QMainWindow):
         splits=split_samples(samples,ratios,rng,self.group_duplicates.isChecked(),self.group_by_source.isChecked())
         if self.balance.isChecked():
             groups={cid:[x for x in splits["train"] if x[1].class_id==cid] for cid in by_class}; target=max((len(x) for x in groups.values()),default=0) if self.strategy.currentRow()==0 else min((len(x) for x in groups.values()),default=0); splits["train"]=[x for cid,g in groups.items() for x in (g+[rng.choice(g) for _ in range(target-len(g))] if self.strategy.currentRow()==0 and g else g[:target])]
+        image_ids={e.path.resolve():source_image_id(e.path) for e in self.entries}
+        group_indices={}
+        for entry in self.entries:
+            entry_groups={}
+            for index,roi in enumerate(entry.rois):
+                group_key=("duplicate",roi.duplicate_group) if roi.duplicate_group is not None else ("roi",index)
+                if group_key not in entry_groups:
+                    entry_groups[group_key]=len(entry_groups)
+                group_indices[(entry.path.resolve(),index)]=entry_groups[group_key]
+        occurrences=defaultdict(int)
         written=0
         try:
             for split,group in splits.items():
                 for cid in by_class: (output/split/self.classes[cid]).mkdir(parents=True,exist_ok=True)
                 for e,r,i in group:
-                    digest=hashlib.sha1(str(e.path.resolve()).encode()).hexdigest()[:10]; base=f"{e.path.stem}_{digest}_{i:04d}_{written:06d}.png"; image=load_image(e.path); x,y,w,h=r.rect; image.crop((x,y,x+w,y+h)).save(output/split/self.classes[r.class_id]/base); written+=1
+                    image_id=image_ids[e.path.resolve()]
+                    group_index=group_indices[(e.path.resolve(),i)]
+                    occurrence_key=(image_id,i,group_index)
+                    occurrence=occurrences[occurrence_key]
+                    occurrences[occurrence_key]+=1
+                    base=f"{image_id}_r{i:04d}_g{group_index:04d}_n{occurrence:03d}.png"
+                    image=load_image(e.path); x,y,w,h=r.rect; image.crop((x,y,x+w,y+h)).save(output/split/self.classes[r.class_id]/base); written+=1
         except Exception as e: QMessageBox.critical(self,"Export failed",f"{written} crop(s) written.\n\n{e}"); return
         QMessageBox.information(self,"Dataset created",f"Created {written} crop(s):\n{output}")
 
