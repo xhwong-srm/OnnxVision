@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import random
 import shutil
 import sys
@@ -179,6 +180,141 @@ def split_samples(samples, ratios, rng, group_duplicates=False, group_by_source=
     return splits
 
 
+def split_entries(entries, ratios, rng):
+    """Split whole source images so annotations from one image never leak."""
+    shuffled = list(entries)
+    rng.shuffle(shuffled)
+    counts = split_counts(len(shuffled), ratios)
+    result = {}
+    offset = 0
+    for name, count in zip(("train", "val", "test"), counts):
+        result[name] = shuffled[offset:offset + count]
+        offset += count
+    return result
+
+
+def export_coco_detection_dataset(entries, classes, output, ratios, seed=42):
+    """Write full images and bounding boxes in COCO detection format."""
+    splits = split_entries(entries, ratios, random.Random(seed))
+    categories = [
+        {"id": class_id + 1, "name": name, "supercategory": ""}
+        for class_id, name in enumerate(classes)
+    ]
+    total_images = 0
+    total_annotations = 0
+
+    for split_name, split_entries_for_name in splits.items():
+        if not split_entries_for_name:
+            continue
+        image_dir = output / "images" / split_name
+        annotation_dir = output / "annotations"
+        image_dir.mkdir(parents=True, exist_ok=True)
+        annotation_dir.mkdir(parents=True, exist_ok=True)
+        coco_images = []
+        coco_annotations = []
+
+        for image_id, entry in enumerate(split_entries_for_name, start=1):
+            file_name = f"{source_image_id(entry.path)}_{image_id:06d}.png"
+            image = load_image(entry.path)
+            image.save(image_dir / file_name)
+            coco_images.append({
+                "id": image_id,
+                "file_name": f"images/{split_name}/{file_name}",
+                "width": image.width,
+                "height": image.height,
+            })
+            for roi in entry.rois:
+                if roi.class_id is None or not 0 <= roi.class_id < len(classes):
+                    continue
+                x, y, width, height = roi.rect
+                annotation_id = len(coco_annotations) + 1
+                coco_annotations.append({
+                    "id": annotation_id,
+                    "image_id": image_id,
+                    "category_id": roi.class_id + 1,
+                    "bbox": [x, y, width, height],
+                    "area": width * height,
+                    "iscrowd": 0,
+                })
+
+        document = {
+            "info": {"description": "ROI Dataset Builder COCO detection export"},
+            "licenses": [],
+            "images": coco_images,
+            "annotations": coco_annotations,
+            "categories": categories,
+        }
+        with (annotation_dir / f"instances_{split_name}.json").open("w", encoding="utf-8") as handle:
+            json.dump(document, handle, indent=2)
+            handle.write("\n")
+        total_images += len(coco_images)
+        total_annotations += len(coco_annotations)
+
+    return total_images, total_annotations
+
+
+def load_coco_detection_dataset(dataset_root):
+    """Load COCO split files into editable entries and a shared class list."""
+    dataset_root = Path(dataset_root).resolve()
+    annotation_files = sorted((dataset_root / "annotations").glob("instances_*.json"))
+    if not annotation_files:
+        annotation_files = sorted(dataset_root.glob("**/instances_*.json"))
+    if not annotation_files:
+        raise ValueError("No COCO instances_*.json files were found.")
+
+    documents = []
+    classes = []
+    class_lookup = {}
+    for annotation_path in annotation_files:
+        with annotation_path.open("r", encoding="utf-8") as handle:
+            document = json.load(handle)
+        category_map = {}
+        for category in document.get("categories", []):
+            name = str(category.get("name", "")).strip()
+            if not name:
+                continue
+            key = name.casefold()
+            if key not in class_lookup:
+                class_lookup[key] = len(classes)
+                classes.append(name)
+            category_map[category["id"]] = class_lookup[key]
+        documents.append((annotation_path, document, category_map))
+
+    entries_by_path = {}
+    for annotation_path, document, category_map in documents:
+        annotations_by_image = defaultdict(list)
+        for annotation in document.get("annotations", []):
+            annotations_by_image[annotation.get("image_id")].append(annotation)
+        for image_record in document.get("images", []):
+            relative_path = Path(str(image_record.get("file_name", "")))
+            candidates = (
+                dataset_root / relative_path,
+                annotation_path.parent / relative_path,
+                dataset_root / "images" / relative_path,
+            )
+            image_path = next((candidate.resolve() for candidate in candidates if candidate.is_file()), None)
+            if image_path is None:
+                raise FileNotFoundError(f"COCO image was not found: {relative_path}")
+            if image_path not in entries_by_path:
+                image = load_image(image_path)
+                entries_by_path[image_path] = Entry(image_path, image.size)
+            entry = entries_by_path[image_path]
+            image_width, image_height = entry.size
+            for annotation in annotations_by_image.get(image_record.get("id"), []):
+                class_id = category_map.get(annotation.get("category_id"))
+                bbox = annotation.get("bbox")
+                if class_id is None or not isinstance(bbox, list) or len(bbox) != 4:
+                    continue
+                x, y, width, height = (round(float(value)) for value in bbox)
+                x = max(0, min(x, image_width - 1))
+                y = max(0, min(y, image_height - 1))
+                width = max(1, min(width, image_width - x))
+                height = max(1, min(height, image_height - y))
+                entry.rois.append(ROI((x, y, width, height), class_id))
+
+    return list(entries_by_path.values()), classes
+
+
 @dataclass
 class ROI:
     rect: tuple[int, int, int, int]
@@ -252,7 +388,7 @@ class MainWindow(QMainWindow):
         super().__init__(); self.setWindowTitle("Classification ROI Dataset Builder"); self.resize(1450, 850); self.entries=[]; self.classes=[]; self.patterns=[]; self.current=-1; self.items=[]; self.pattern_items=[]; self.learning_pattern=False; self.pattern_roi_indices=[]; self.model_path=Path(initial_model).resolve() if initial_model else None; self.session=None; self.input_name=None; self.kind=None; self.names={}
         root=QWidget(); self.setCentralWidget(root); layout=QHBoxLayout(root)
         left=QVBoxLayout(); left.addWidget(QLabel("Images")); self.images=QListWidget(); self.images.currentRowChanged.connect(self.select); left.addWidget(self.images,1)
-        for text, fn in (("Add images...",self.add_images),("Add folder...",self.add_folder),("Remove repeated images",self.remove_repeated_images),("Delete ROIs on current",self.clear_current),("Delete ROIs on all",self.clear_all),("Clear images",self.clear_images)):
+        for text, fn in (("Add images...",self.add_images),("Add folder...",self.add_folder),("Load COCO detection dataset...",self.load_detection),("Remove repeated images",self.remove_repeated_images),("Delete ROIs on current",self.clear_current),("Delete ROIs on all",self.clear_all),("Clear images",self.clear_images)):
             b=QPushButton(text); b.clicked.connect(fn); left.addWidget(b)
         layout.addLayout(left,1)
         center=QVBoxLayout(); self.scene=QGraphicsScene(); self.pixmap=QGraphicsPixmapItem(); self.scene.addItem(self.pixmap); self.view=ImageView(self.created); self.view.setScene(self.scene); center.addWidget(self.view,1)
@@ -289,6 +425,7 @@ class MainWindow(QMainWindow):
         right.addWidget(self.group_by_source)
         self.balance=QCheckBox("Balance training split"); right.addWidget(self.balance); self.strategy=QListWidget(); self.strategy.addItems(["Oversample","Undersample"]); self.strategy.setCurrentRow(0); self.strategy.setMaximumHeight(45); right.addWidget(self.strategy)
         b=QPushButton("Export classification dataset..."); b.clicked.connect(self.export); right.addWidget(b)
+        b=QPushButton("Export COCO detection dataset..."); b.clicked.connect(self.export_detection); right.addWidget(b)
         right_panel=QWidget(); right_panel.setLayout(right)
         right_scroll=QScrollArea(); right_scroll.setWidgetResizable(True); right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); right_scroll.setWidget(right_panel); right_scroll.setMinimumWidth(300)
         layout.addWidget(right_scroll,1); self.update()
@@ -303,6 +440,29 @@ class MainWindow(QMainWindow):
         files,_=QFileDialog.getOpenFileNames(self,"Add images","","Images (*.bmp *.jpg *.jpeg *.png *.tif *.tiff *.webp)"); self.add_paths([Path(x) for x in files])
     def add_folder(self):
         folder=QFileDialog.getExistingDirectory(self,"Add image folder"); self.add_paths(sorted(Path(folder).iterdir())) if folder else None
+    def load_detection(self):
+        folder=QFileDialog.getExistingDirectory(self,"Choose COCO detection dataset")
+        if not folder: return
+        try:
+            loaded_entries,loaded_classes=load_coco_detection_dataset(folder)
+        except Exception as e:
+            QMessageBox.critical(self,"COCO load failed",str(e)); return
+        if self.entries and QMessageBox.question(
+            self,"Replace current dataset",
+            "Loading COCO will replace the current images, ROIs, classes, and learned patterns. Continue?"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.entries=loaded_entries
+        self.classes=loaded_classes
+        self.patterns=[]
+        self.class_list.clear()
+        self.class_list.addItems(self.classes)
+        self.pattern_list.clear()
+        self.images.clear()
+        self.images.addItems([f"{len(entry.rois)} ROI | {entry.path.name}" for entry in self.entries])
+        self.current=-1
+        if self.entries: self.images.setCurrentRow(0)
+        self.update(f"Loaded {len(self.entries)} image(s) and {sum(len(entry.rois) for entry in self.entries)} box(es)")
     def add_paths(self, paths):
         for path in paths:
             if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES and not any(e.path.resolve()==path.resolve() for e in self.entries):
@@ -558,6 +718,34 @@ class MainWindow(QMainWindow):
                 x,y,w,h=roi.rect; crop=image.crop((x,y,x+w,y+h)); tensor=np.asarray(crop.convert("L"),dtype=np.uint8)[None,None] if self.kind=="bw8" else np.asarray(crop,dtype=np.uint8)[...,::-1].copy()[None]
                 scores=self.session.run(None,{self.input_name:tensor})[0][0]; index=int(np.argmax(scores)); roi.class_id=index if index<len(self.classes) else roi.class_id; roi.confidence=float(scores[index]); count+=1
         self.select(self.current); self.update(f"Auto-labeled {count} ROI(s)")
+    def export_detection(self):
+        labeled_entries=[
+            entry for entry in self.entries
+            if any(roi.class_id is not None and 0 <= roi.class_id < len(self.classes) for roi in entry.rois)
+        ]
+        if not labeled_entries:
+            QMessageBox.information(self,"No labeled ROIs","Assign a class before exporting."); return
+        ratios=tuple(x.value()/100 for x in self.split)
+        if abs(sum(ratios)-1)>1e-6:
+            QMessageBox.warning(self,"Invalid split","Split percentages must add to 100%."); return
+        parent=QFileDialog.getExistingDirectory(self,"Dataset parent")
+        if not parent: return
+        name,ok=QInputDialog.getText(self,"Dataset folder","Name:",text="detection_dataset_coco")
+        if not ok: return
+        try: output=Path(parent)/valid_name(name,"Dataset folder")
+        except ValueError as e: QMessageBox.warning(self,"Invalid folder",str(e)); return
+        if output.exists(): QMessageBox.warning(self,"Destination exists",str(output)); return
+        try:
+            image_count,annotation_count=export_coco_detection_dataset(
+                labeled_entries,self.classes,output,ratios
+            )
+        except Exception as e:
+            QMessageBox.critical(self,"Export failed",str(e)); return
+        QMessageBox.information(
+            self,"Dataset created",
+            f"Created COCO detection dataset with {image_count} image(s) and "
+            f"{annotation_count} box(es):\n{output}"
+        )
     def export(self):
         samples=[(e,r,i) for e in self.entries for i,r in enumerate(e.rois) if r.class_id is not None and 0<=r.class_id<len(self.classes)]
         if not samples: QMessageBox.information(self,"No labeled ROIs","Assign a class before exporting."); return
