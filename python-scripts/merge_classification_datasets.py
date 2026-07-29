@@ -149,8 +149,8 @@ def grouped_oversample(entries, target: int, rng: random.Random, mode: str):
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("source", nargs=2, type=Path)
-    parser.add_argument("output", type=Path)
+    parser.add_argument("source", nargs="+", type=Path, help="Two or more source dataset directories.")
+    parser.add_argument("output", type=Path, help="Destination dataset directory.")
     parser.add_argument("--seed", type=int, default=20260728)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--resplit", action="store_true", help="Ignore existing split assignments and create new splits.")
@@ -161,6 +161,9 @@ def main() -> None:
     parser.add_argument("--group-by-image", action="store_true", help="Keep all builder ROIs from each source image in one split.")
     parser.add_argument("--balance", choices=("undersample", "oversample", "none"), default="undersample")
     args = parser.parse_args()
+
+    if len(args.source) < 2:
+        parser.error("at least two source datasets are required")
 
     sources = [path.resolve() for path in args.source]
     output = args.output.resolve()
