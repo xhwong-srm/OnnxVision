@@ -22,12 +22,12 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QBrush, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PySide6.QtGui import QColor, QBrush, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QGraphicsItem,
+    QAbstractItemView, QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QGraphicsItem,
     QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsScene, QGraphicsView,
     QHBoxLayout, QInputDialog, QLabel, QListWidget, QMainWindow, QMessageBox,
-    QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
+    QPushButton, QScrollArea, QSpinBox, QToolButton, QVBoxLayout, QWidget,
 )
 
 SUPPORTED_SUFFIXES = {".bmp", ".dng", ".gif", ".heic", ".jpeg", ".jpg", ".mpo", ".png", ".tif", ".tiff", ".webp"}
@@ -340,18 +340,116 @@ class Pattern:
     rois: list[ROI]
 
 
+class CollapsibleSection(QWidget):
+    def __init__(self, title, content_layout, expanded=False):
+        super().__init__()
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
+        self.toggle = QToolButton()
+        self.toggle.setText(title)
+        self.toggle.setCheckable(True)
+        self.toggle.setChecked(expanded)
+        self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.toggle.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self.content = QWidget()
+        self.content.setLayout(content_layout)
+        self.content.setVisible(expanded)
+        self.toggle.toggled.connect(self.set_expanded)
+        outer.addWidget(self.toggle)
+        outer.addWidget(self.content)
+
+    def set_expanded(self, expanded):
+        self.toggle.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self.content.setVisible(expanded)
+
+
 class RoiItem(QGraphicsRectItem):
-    def __init__(self, rect, bounds, label, changed):
-        super().__init__(QRectF(0, 0, rect[2], rect[3])); self.setPos(rect[0], rect[1]); self.bounds = bounds; self.label = label; self.changed = changed
+    HANDLE_SIZE = 10
+
+    def __init__(self, rect, bounds, label, changed, ratio):
+        super().__init__(QRectF(0, 0, rect[2], rect[3])); self.setPos(rect[0], rect[1]); self.bounds = bounds; self.label = label; self.changed = changed; self.ratio = ratio; self.resize_corner = None; self.resize_anchor = None
         self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable | QGraphicsItem.GraphicsItemFlag.ItemIsSelectable); self.setAcceptHoverEvents(True); self.setZValue(2)
         self.setPen(QPen(Qt.GlobalColor.yellow, 2)); self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
     def scene_rect(self): return QRectF(self.pos(), self.rect().size())
     def boundingRect(self): return self.rect().adjusted(-5, -5, 5, 5)
+    def corner_at(self, position):
+        width, height = self.rect().width(), self.rect().height()
+        corners = {
+            "top_left": QPointF(0, 0),
+            "top_right": QPointF(width, 0),
+            "bottom_left": QPointF(0, height),
+            "bottom_right": QPointF(width, height),
+        }
+        return next((name for name, point in corners.items() if abs(position.x()-point.x())<=self.HANDLE_SIZE and abs(position.y()-point.y())<=self.HANDLE_SIZE), None)
     def paint(self, painter, option, widget=None):
-        painter.setPen(QPen(Qt.GlobalColor.cyan if self.isSelected() else Qt.GlobalColor.yellow, 3)); painter.drawRect(self.rect()); painter.drawText(self.rect().adjusted(4, 2, -2, -2), self.label)
+        painter.setPen(QPen(Qt.GlobalColor.cyan if self.isSelected() else Qt.GlobalColor.yellow, 3))
+        painter.drawRect(self.rect())
+        metrics = painter.fontMetrics()
+        badge_height = min(self.rect().height(), metrics.height() + 6)
+        available_width = max(0, self.rect().width() - 6)
+        text = metrics.elidedText(self.label, Qt.TextElideMode.ElideRight, int(available_width))
+        badge_width = min(self.rect().width(), metrics.horizontalAdvance(text) + 8)
+        badge = QRectF(self.rect().x(), self.rect().y(), badge_width, badge_height)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(0, 0, 0, 190)))
+        painter.drawRoundedRect(badge, 3, 3)
+        painter.setPen(QPen(Qt.GlobalColor.white))
+        painter.drawText(badge.adjusted(4, 0, -4, 0), Qt.AlignmentFlag.AlignVCenter, text)
+        if self.isSelected():
+            painter.setPen(QPen(Qt.GlobalColor.black, 1))
+            painter.setBrush(QBrush(Qt.GlobalColor.white))
+            half = self.HANDLE_SIZE / 2
+            for point in (self.rect().topLeft(), self.rect().topRight(), self.rect().bottomLeft(), self.rect().bottomRight()):
+                painter.drawRect(QRectF(point.x()-half, point.y()-half, self.HANDLE_SIZE, self.HANDLE_SIZE))
+    def hoverMoveEvent(self, event):
+        corner = self.corner_at(event.pos())
+        if corner in {"top_left", "bottom_right"}: self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        elif corner: self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+        else: self.setCursor(Qt.CursorShape.SizeAllCursor)
+        super().hoverMoveEvent(event)
+    def mousePressEvent(self, event):
+        if event.button()==Qt.MouseButton.LeftButton:
+            self.resize_corner=self.corner_at(event.pos())
+            if self.resize_corner:
+                rect=self.scene_rect()
+                anchor_x=rect.right() if "left" in self.resize_corner else rect.left()
+                anchor_y=rect.bottom() if "top" in self.resize_corner else rect.top()
+                self.resize_anchor=QPointF(anchor_x,anchor_y)
+                event.accept()
+                return
+        super().mousePressEvent(event)
     def mouseMoveEvent(self, event):
+        if self.resize_corner and self.resize_anchor is not None:
+            left_side="left" in self.resize_corner
+            top_side="top" in self.resize_corner
+            maximum_width=self.resize_anchor.x() if left_side else self.bounds.width()-self.resize_anchor.x()
+            maximum_height=self.resize_anchor.y() if top_side else self.bounds.height()-self.resize_anchor.y()
+            width=max(2.0,min(abs(event.scenePos().x()-self.resize_anchor.x()),maximum_width))
+            height=max(2.0,min(abs(event.scenePos().y()-self.resize_anchor.y()),maximum_height))
+            ratio=float(self.ratio())
+            if ratio>0:
+                if width/height>ratio: height=width/ratio
+                else: width=height*ratio
+                scale=min(1.0,maximum_width/width,maximum_height/height)
+                width*=scale; height*=scale
+            x=self.resize_anchor.x()-width if left_side else self.resize_anchor.x()
+            y=self.resize_anchor.y()-height if top_side else self.resize_anchor.y()
+            self.prepareGeometryChange()
+            self.setPos(x,y)
+            self.setRect(0,0,width,height)
+            self.changed(self.scene_rect())
+            event.accept()
+            return
         super().mouseMoveEvent(event); r = self.scene_rect(); self.setPos(max(0, min(r.x(), self.bounds.width() - r.width())), max(0, min(r.y(), self.bounds.height() - r.height()))); self.changed(self.scene_rect())
-    def mouseReleaseEvent(self, event): self.changed(self.scene_rect()); super().mouseReleaseEvent(event)
+    def mouseReleaseEvent(self, event):
+        if self.resize_corner:
+            self.changed(self.scene_rect()); self.resize_corner=None; self.resize_anchor=None; event.accept(); return
+        self.changed(self.scene_rect()); super().mouseReleaseEvent(event)
 
 
 class ImageView(QGraphicsView):
@@ -387,8 +485,8 @@ class MainWindow(QMainWindow):
     def __init__(self, initial_model=None):
         super().__init__(); self.setWindowTitle("Classification ROI Dataset Builder"); self.resize(1450, 850); self.entries=[]; self.classes=[]; self.patterns=[]; self.current=-1; self.items=[]; self.pattern_items=[]; self.learning_pattern=False; self.pattern_roi_indices=[]; self.model_path=Path(initial_model).resolve() if initial_model else None; self.session=None; self.input_name=None; self.kind=None; self.names={}
         root=QWidget(); self.setCentralWidget(root); layout=QHBoxLayout(root)
-        left=QVBoxLayout(); left.addWidget(QLabel("Images")); self.images=QListWidget(); self.images.currentRowChanged.connect(self.select); left.addWidget(self.images,1)
-        for text, fn in (("Add images...",self.add_images),("Add folder...",self.add_folder),("Load COCO detection dataset...",self.load_detection),("Remove repeated images",self.remove_repeated_images),("Delete ROIs on current",self.clear_current),("Delete ROIs on all",self.clear_all),("Clear images",self.clear_images)):
+        left=QVBoxLayout(); left.addWidget(QLabel("Images")); self.images=QListWidget(); self.images.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection); self.images.currentRowChanged.connect(self.select); left.addWidget(self.images,1)
+        for text, fn in (("Add images...",self.add_images),("Add folder...",self.add_folder),("Load COCO detection dataset...",self.load_detection),("Remove selected image(s)",self.remove_selected_images),("Remove repeated images",self.remove_repeated_images),("Delete ROIs on current",self.clear_current),("Delete ROIs on all",self.clear_all),("Clear images",self.clear_images)):
             b=QPushButton(text); b.clicked.connect(fn); left.addWidget(b)
         layout.addLayout(left,1)
         center=QVBoxLayout(); self.scene=QGraphicsScene(); self.pixmap=QGraphicsPixmapItem(); self.scene.addItem(self.pixmap); self.view=ImageView(self.created); self.view.setScene(self.scene); center.addWidget(self.view,1)
@@ -397,35 +495,54 @@ class MainWindow(QMainWindow):
             b=QPushButton(text); b.clicked.connect(fn); nav.addWidget(b)
         center.addLayout(nav); self.status=QLabel(); self.status.setAlignment(Qt.AlignmentFlag.AlignCenter); center.addWidget(self.status); layout.addLayout(center,4)
         self.delete_shortcut=QShortcut(QKeySequence(Qt.Key.Key_Delete),self); self.delete_shortcut.activated.connect(self.delete_selected)
-        right=QVBoxLayout(); right.addWidget(QLabel("Classes (Ctrl-select ROIs; right-drag moves them)")); self.class_list=QListWidget(); right.addWidget(self.class_list,1)
-        b=QPushButton("Add class..."); b.clicked.connect(self.add_class); right.addWidget(b); b=QPushButton("Assign class to selected ROI(s)"); b.clicked.connect(self.assign_class); right.addWidget(b)
+        self.next_class_shortcut=QShortcut(QKeySequence(Qt.Key.Key_Tab),self); self.next_class_shortcut.activated.connect(lambda:self.cycle_selected_classes(1))
+        self.previous_class_shortcut=QShortcut(QKeySequence(Qt.Key.Key_Backtab),self); self.previous_class_shortcut.activated.connect(lambda:self.cycle_selected_classes(-1))
+        right=QVBoxLayout()
+
+        classes_section=QVBoxLayout(); classes_section.addWidget(QLabel("Ctrl-select ROIs; Tab / Shift+Tab changes class"))
+        self.class_list=QListWidget(); classes_section.addWidget(self.class_list)
+        b=QPushButton("Add class..."); b.clicked.connect(self.add_class); classes_section.addWidget(b); b=QPushButton("Assign class to selected ROI(s)"); b.clicked.connect(self.assign_class); classes_section.addWidget(b)
         for text, fn in (("Set all current ROI labels",lambda:self.set_all_labels(False)),("Set all image ROI labels",lambda:self.set_all_labels(True))):
-            b=QPushButton(text); b.clicked.connect(fn); right.addWidget(b)
-        right.addWidget(QLabel("Learned anchor patterns")); self.pattern_list=QListWidget(); right.addWidget(self.pattern_list,1)
-        for text, fn in (("Draw / learn anchor pattern",self.begin_pattern),("Extend current by median gap",lambda:self.extend_gap(False)),("Extend all by median gap",lambda:self.extend_gap(True)),("Auto-populate current",lambda:self.auto_place(False)),("Auto-populate all",lambda:self.auto_place(True)),("Expand current ROI(s)",lambda:self.random_resize(False)),("Expand all ROI(s)",lambda:self.random_resize(True))):
-            b=QPushButton(text); b.clicked.connect(fn); right.addWidget(b)
-        duplicate_row=QHBoxLayout(); duplicate_row.addWidget(QLabel("Duplicates / ROI")); self.duplicate_count=QSpinBox(); self.duplicate_count.setRange(1,1000); self.duplicate_count.setValue(10); duplicate_row.addWidget(self.duplicate_count); right.addLayout(duplicate_row)
+            b=QPushButton(text); b.clicked.connect(fn); classes_section.addWidget(b)
+        right.addWidget(CollapsibleSection("Classes",classes_section,True))
+
+        patterns_section=QVBoxLayout(); self.pattern_list=QListWidget(); patterns_section.addWidget(self.pattern_list)
+        for text, fn in (("Draw / learn anchor pattern",self.begin_pattern),("Extend current by median gap",lambda:self.extend_gap(False)),("Extend all by median gap",lambda:self.extend_gap(True)),("Auto-populate current",lambda:self.auto_place(False)),("Auto-populate all",lambda:self.auto_place(True))):
+            b=QPushButton(text); b.clicked.connect(fn); patterns_section.addWidget(b)
+        self.threshold=self.spin(.75,0,1,.05); patterns_section.addWidget(QLabel("Pattern threshold")); patterns_section.addWidget(self.threshold)
+        self.occurrence_nms=self.spin(.30,0,1,.05); patterns_section.addWidget(QLabel("Occurrence NMS")); patterns_section.addWidget(self.occurrence_nms)
+        patterns_section.addWidget(QLabel("Maximum occurrences / pattern")); self.maximum_occurrences=QSpinBox(); self.maximum_occurrences.setRange(1,10000); self.maximum_occurrences.setValue(500); patterns_section.addWidget(self.maximum_occurrences)
+        right.addWidget(CollapsibleSection("Patterns and auto-population",patterns_section))
+
+        roi_tools_section=QVBoxLayout()
+        duplicate_row=QHBoxLayout(); duplicate_row.addWidget(QLabel("Duplicates / ROI")); self.duplicate_count=QSpinBox(); self.duplicate_count.setRange(1,1000); self.duplicate_count.setValue(10); duplicate_row.addWidget(self.duplicate_count); roi_tools_section.addLayout(duplicate_row)
         for text, fn in (("Duplicate current ROI(s)",lambda:self.duplicate_rois(False)),("Duplicate all ROI(s)",lambda:self.duplicate_rois(True))):
-            b=QPushButton(text); b.clicked.connect(fn); right.addWidget(b)
-        self.threshold=self.spin(.75,0,1,.05); right.addWidget(QLabel("Pattern threshold")); right.addWidget(self.threshold)
-        self.occurrence_nms=self.spin(.30,0,1,.05); right.addWidget(QLabel("Occurrence NMS")); right.addWidget(self.occurrence_nms)
-        right.addWidget(QLabel("Maximum occurrences / pattern")); self.maximum_occurrences=QSpinBox(); self.maximum_occurrences.setRange(1,10000); self.maximum_occurrences.setValue(500); right.addWidget(self.maximum_occurrences)
-        right.addWidget(QLabel("Expansion %: left / right / top / bottom (min-max)")); self.ranges=[]
+            b=QPushButton(text); b.clicked.connect(fn); roi_tools_section.addWidget(b)
+        for text, fn in (("Expand current ROI(s)",lambda:self.random_resize(False)),("Expand all ROI(s)",lambda:self.random_resize(True))):
+            b=QPushButton(text); b.clicked.connect(fn); roi_tools_section.addWidget(b)
+        roi_tools_section.addWidget(QLabel("Expansion %: left / right / top / bottom (min-max)")); self.ranges=[]
         for side in ("Left","Right","Top","Bottom"):
-            row=QHBoxLayout(); row.addWidget(QLabel(side)); lo=self.spin(0,0,100,1); hi=self.spin(0,0,100,1); row.addWidget(lo); row.addWidget(hi); right.addLayout(row); self.ranges.append((lo,hi))
-        right.addWidget(QLabel("ROI width / height ratio (0 disables)")); self.ratio=self.spin(0,0,1000,.01); right.addWidget(self.ratio)
-        b=QPushButton("Choose ONNX model..."); b.clicked.connect(self.choose_model); right.addWidget(b); self.model_label=QLabel(); self.model_label.setWordWrap(True); right.addWidget(self.model_label)
-        for text, fn in (("Auto-label current",lambda:self.auto_label(False)),("Auto-label all",lambda:self.auto_label(True))): b=QPushButton(text); b.clicked.connect(fn); right.addWidget(b)
-        right.addWidget(QLabel("Split % (train / val / test)")); self.split=[self.spin(x,0,100,1) for x in (70,20,10)]; row=QHBoxLayout(); [row.addWidget(x) for x in self.split]; right.addLayout(row)
+            row=QHBoxLayout(); row.addWidget(QLabel(side)); lo=self.spin(0,0,100,1); hi=self.spin(0,0,100,1); row.addWidget(lo); row.addWidget(hi); roi_tools_section.addLayout(row); self.ranges.append((lo,hi))
+        roi_tools_section.addWidget(QLabel("ROI width / height ratio (0 disables)")); self.ratio=self.spin(0,0,1000,.01); roi_tools_section.addWidget(self.ratio)
+        right.addWidget(CollapsibleSection("ROI duplication and sizing",roi_tools_section))
+
+        model_section=QVBoxLayout()
+        b=QPushButton("Choose ONNX model..."); b.clicked.connect(self.choose_model); model_section.addWidget(b); self.model_label=QLabel(); self.model_label.setWordWrap(True); model_section.addWidget(self.model_label)
+        for text, fn in (("Auto-label current",lambda:self.auto_label(False)),("Auto-label all",lambda:self.auto_label(True))): b=QPushButton(text); b.clicked.connect(fn); model_section.addWidget(b)
+        right.addWidget(CollapsibleSection("ONNX auto-labeling",model_section))
+
+        export_section=QVBoxLayout(); export_section.addWidget(QLabel("Split % (train / val / test)")); self.split=[self.spin(x,0,100,1) for x in (70,20,10)]; row=QHBoxLayout(); [row.addWidget(x) for x in self.split]; export_section.addLayout(row)
         self.group_duplicates=QCheckBox("Keep duplicate ROIs in one split")
         self.group_duplicates.setToolTip("When enabled, ROIs created together by Duplicate stay in one split even after resizing, moving, or relabeling.")
-        right.addWidget(self.group_duplicates)
+        export_section.addWidget(self.group_duplicates)
         self.group_by_source=QCheckBox("Keep all ROIs from same image in one split")
         self.group_by_source.setToolTip("When enabled, every ROI and duplicate from a source image stays together. This takes priority over duplicate grouping.")
-        right.addWidget(self.group_by_source)
-        self.balance=QCheckBox("Balance training split"); right.addWidget(self.balance); self.strategy=QListWidget(); self.strategy.addItems(["Oversample","Undersample"]); self.strategy.setCurrentRow(0); self.strategy.setMaximumHeight(45); right.addWidget(self.strategy)
-        b=QPushButton("Export classification dataset..."); b.clicked.connect(self.export); right.addWidget(b)
-        b=QPushButton("Export COCO detection dataset..."); b.clicked.connect(self.export_detection); right.addWidget(b)
+        export_section.addWidget(self.group_by_source)
+        self.balance=QCheckBox("Balance training split"); export_section.addWidget(self.balance); self.strategy=QListWidget(); self.strategy.addItems(["Oversample","Undersample"]); self.strategy.setCurrentRow(0); self.strategy.setMaximumHeight(45); export_section.addWidget(self.strategy)
+        b=QPushButton("Export classification dataset..."); b.clicked.connect(self.export); export_section.addWidget(b)
+        b=QPushButton("Export COCO detection dataset..."); b.clicked.connect(self.export_detection); export_section.addWidget(b)
+        right.addWidget(CollapsibleSection("Dataset export",export_section,True))
+        right.addStretch()
         right_panel=QWidget(); right_panel.setLayout(right)
         right_scroll=QScrollArea(); right_scroll.setWidgetResizable(True); right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); right_scroll.setWidget(right_panel); right_scroll.setMinimumWidth(300)
         layout.addWidget(right_scroll,1); self.update()
@@ -470,6 +587,26 @@ class MainWindow(QMainWindow):
                 except Exception: pass
         self.images.clear(); self.images.addItems([f"0 ROI | {e.path.name}" for e in self.entries]);
         if self.entries and self.current<0: self.images.setCurrentRow(0)
+    def remove_selected_images(self):
+        selected=sorted({index.row() for index in self.images.selectedIndexes()})
+        if not selected:
+            self.update("Select one or more images to remove")
+            return
+        old_current=self.current
+        selected_set=set(selected)
+        self.entries=[entry for index,entry in enumerate(self.entries) if index not in selected_set]
+        self.images.blockSignals(True)
+        self.images.clear()
+        self.images.addItems([f"{len(entry.rois)} ROI | {entry.path.name}" for entry in self.entries])
+        self.images.blockSignals(False)
+        self.current=-1
+        if self.entries:
+            removed_before=sum(index<old_current for index in selected)
+            next_row=max(0,min(len(self.entries)-1,old_current-removed_before))
+            self.images.setCurrentRow(next_row)
+        else:
+            self.select(-1)
+        self.update(f"Removed {len(selected)} image(s) from the builder; source files were not deleted")
     def remove_repeated_images(self):
         if not self.entries:
             self.update("No images to check")
@@ -516,7 +653,7 @@ class MainWindow(QMainWindow):
     def pixmap_from(image):
         image=image.convert("RGBA"); data=image.tobytes("raw","RGBA"); return QPixmap.fromImage(QImage(data,image.width,image.height,QImage.Format.Format_RGBA8888).copy())
     def add_item(self,index,roi):
-        item=RoiItem(roi.rect,self.view.bounds,f"{index+1}:{self.classes[roi.class_id] if roi.class_id is not None and roi.class_id<len(self.classes) else '?'}",lambda r,i=index:self.changed(i,r)); self.scene.addItem(item); self.items.append(item)
+        item=RoiItem(roi.rect,self.view.bounds,f"{index+1}:{self.classes[roi.class_id] if roi.class_id is not None and roi.class_id<len(self.classes) else '?'}",lambda r,i=index:self.changed(i,r),self.ratio.value); self.scene.addItem(item); self.items.append(item)
     def changed(self,index,r):
         if 0<=self.current<len(self.entries) and index<len(self.entries[self.current].rois): self.entries[self.current].rois[index].rect=(round(r.x()),round(r.y()),round(r.width()),round(r.height())); self.images.item(self.current).setText(f"{len(self.entries[self.current].rois)} ROI | {self.entries[self.current].path.name}")
     def created(self,r):
@@ -555,6 +692,28 @@ class MainWindow(QMainWindow):
         for item,roi in zip(self.items,self.entries[self.current].rois):
             if item.isSelected(): roi.class_id=cid
         self.select(self.current)
+    def cycle_selected_classes(self, step):
+        if not self.classes or not 0<=self.current<len(self.entries):
+            self.update("Add at least one class before cycling ROI labels")
+            return
+        selected=[i for i,item in enumerate(self.items) if item.isSelected()]
+        if not selected:
+            self.update("Select one or more ROI(s), then press Tab to change class")
+            return
+        rois=self.entries[self.current].rois
+        for index in selected:
+            current=rois[index].class_id
+            if current is None or not 0<=current<len(self.classes):
+                rois[index].class_id=0 if step>0 else len(self.classes)-1
+            else:
+                rois[index].class_id=(current+step)%len(self.classes)
+            rois[index].confidence=None
+        self.select(self.current)
+        for index in selected:
+            if index<len(self.items): self.items[index].setSelected(True)
+        assigned={rois[index].class_id for index in selected}
+        if len(assigned)==1: self.class_list.setCurrentRow(next(iter(assigned)))
+        self.update(f"Changed class for {len(selected)} selected ROI(s)")
     def set_all_labels(self, all_images):
         class_id=self.class_list.currentRow()
         if not 0<=class_id<len(self.classes):
