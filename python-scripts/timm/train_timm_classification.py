@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import gc
 import json
 import os
 import sys
@@ -352,7 +353,6 @@ def main() -> None:
         loader_args["prefetch_factor"] = args.prefetch_factor
     train_loader = DataLoader(train_set, shuffle=True, **loader_args)
     val_loader = DataLoader(val_set, shuffle=False, **loader_args)
-    test_loader = DataLoader(test_set, shuffle=False, **loader_args) if test_set else None
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(training_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -525,6 +525,15 @@ def main() -> None:
         writer = csv.DictWriter(file, fieldnames=history[0].keys())
         writer.writeheader()
         writer.writerows(history)
+
+    # Persistent train/validation workers and optimizer state are no longer
+    # needed. Release them before final evaluation so Windows does not have to
+    # start another group of CUDA-importing worker processes at peak commit.
+    del train_loader, val_loader, optimizer, scheduler, scaler
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
     metadata = {
         "model_name": args.model,
         "classes": train_set.classes,
@@ -541,9 +550,22 @@ def main() -> None:
             "stop_reason": stop_reason,
         },
     }
-    if test_loader is not None:
-        best = torch.load(output / "best.pt", map_location=device, weights_only=False)
+    if test_set is not None:
+        # Test evaluation is a one-shot pass, so extra worker processes provide
+        # little benefit and can exhaust the Windows pagefile after training.
+        test_loader = DataLoader(
+            test_set,
+            batch_size=args.batch,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=pin_memory,
+            persistent_workers=False,
+        )
+        best = torch.load(output / "best.pt", map_location="cpu", weights_only=False)
+        checkpoint_epoch = best["epoch"]
         model.load_state_dict(best["model_state_dict"])
+        del best
+        gc.collect()
         test_loss, test_accuracy, test_metrics = run_epoch(
             training_model,
             test_loader,
@@ -560,7 +582,7 @@ def main() -> None:
             f"macro_f1={test_metrics['macro_f1']:.4f}"
         )
         metadata["test_result"] = {
-            "checkpoint_epoch": best["epoch"],
+            "checkpoint_epoch": checkpoint_epoch,
             "loss": test_loss,
             "accuracy": test_accuracy,
             **test_metrics,
