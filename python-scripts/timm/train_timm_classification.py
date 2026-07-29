@@ -18,9 +18,24 @@ from torchvision import datasets, transforms
 
 MODEL_NAME = "mobilenetv3_small_100.lamb_in1k"
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+SELECTED_CONFIG_PATH = Path(__file__).resolve().with_name("tune_timm_gpu.selected.json")
+
+
+def load_selected_config() -> dict:
+    if not SELECTED_CONFIG_PATH.is_file():
+        return {}
+    try:
+        document = json.loads(SELECTED_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Cannot read selected GPU config {SELECTED_CONFIG_PATH}: {error}") from error
+    config = document.get("config")
+    if not isinstance(config, dict):
+        raise ValueError(f"Selected GPU config must contain an object named 'config': {SELECTED_CONFIG_PATH}")
+    return config
 
 
 def parse_args():
+    selected_config = load_selected_config()
     parser = ArgumentParser(description=__doc__)
     parser.add_argument(
         "--data",
@@ -54,44 +69,44 @@ def parse_args():
         default="macro_f1",
         help="Primary validation metric used for best-checkpoint selection and early stopping",
     )
-    parser.add_argument("--batch", type=int, default=32)
+    parser.add_argument("--batch", type=int, default=selected_config.get("batch", 32))
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument(
         "--workers",
         type=int,
-        default=-1,
+        default=selected_config.get("workers", -1),
         help="DataLoader worker processes; -1 selects automatically, 0 loads in the main process",
     )
-    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument("--prefetch-factor", type=int, default=selected_config.get("prefetch_factor", 2) or 2)
     parser.add_argument(
         "--persistent-workers",
         action=BooleanOptionalAction,
-        default=True,
+        default=selected_config.get("persistent_workers", True),
         help="Keep DataLoader workers alive between epochs when workers are enabled",
     )
     parser.add_argument(
         "--pin-memory",
         action=BooleanOptionalAction,
-        default=True,
+        default=selected_config.get("pin_memory", True),
         help="Use pinned host memory and asynchronous transfers on accelerators",
     )
     parser.add_argument(
         "--amp",
         action=BooleanOptionalAction,
-        default=True,
+        default=selected_config.get("amp", True),
         help="Use automatic mixed precision on CUDA",
     )
     parser.add_argument(
         "--amp-dtype",
         choices=("float16", "bfloat16"),
-        default="float16",
+        default=selected_config.get("amp_dtype", "float16"),
         help="CUDA automatic mixed-precision dtype",
     )
     parser.add_argument(
         "--channels-last",
         action=BooleanOptionalAction,
-        default=True,
+        default=selected_config.get("channels_last", True),
         help="Use channels-last tensors on CUDA for convolution-heavy models",
     )
     parser.add_argument(
@@ -103,7 +118,7 @@ def parse_args():
     parser.add_argument(
         "--compile",
         action=BooleanOptionalAction,
-        default=False,
+        default=selected_config.get("compile", False),
         help="Use torch.compile; opt in after benchmarking compatibility on the target machine",
     )
     parser.add_argument(

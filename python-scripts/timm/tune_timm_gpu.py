@@ -28,6 +28,7 @@ from train_timm_classification import MODEL_NAME, image_transform, make_dataset
 
 
 RESULT_PREFIX = "TIMM_GPU_TUNER_RESULT="
+SELECTED_CONFIG_PATH = Path(__file__).resolve().with_name("tune_timm_gpu.selected.json")
 
 
 @dataclass(frozen=True)
@@ -428,12 +429,31 @@ def write_reports(
     results: list[dict],
     selected: dict,
     gpu: dict,
-) -> tuple[Path, Path]:
+) -> tuple[Path, Path, Path]:
     args.output.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     json_path = args.output / f"gpu-tuning-{timestamp}.json"
     csv_path = args.output / f"gpu-tuning-{timestamp}.csv"
     selected_config = TrialConfig(**selected["config"])
+    selected_config_path = SELECTED_CONFIG_PATH
+    selected_config_path.write_text(
+        json.dumps(
+            {
+                "created_at": datetime.now().astimezone().isoformat(),
+                "source": str(Path(__file__).resolve()),
+                "config": asdict(selected_config),
+                "benchmark": {
+                    "samples_per_second": selected["samples_per_second"],
+                    "milliseconds_per_batch": selected["milliseconds_per_batch"],
+                    "peak_reserved_mb": selected["peak_reserved_mb"],
+                    "vram_fraction": selected["vram_fraction"],
+                    "device": str(args.device),
+                },
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     report = {
         "created_at": datetime.now().astimezone().isoformat(),
         "gpu": gpu,
@@ -479,7 +499,7 @@ def write_reports(
         for result in results:
             row = {**result["config"], **{key: value for key, value in result.items() if key != "config"}}
             writer.writerow({key: row.get(key) for key in fieldnames})
-    return json_path, csv_path
+    return json_path, csv_path, selected_config_path
 
 
 def main() -> int:
@@ -601,7 +621,7 @@ def main() -> int:
             selected = compile_result
 
     selected_config = TrialConfig(**selected["config"])
-    json_path, csv_path = write_reports(args, results, selected, gpu)
+    json_path, csv_path, selected_config_path = write_reports(args, results, selected, gpu)
     print("\nSelected configuration")
     print(json.dumps(selected_config.__dict__, indent=2))
     print(
@@ -611,7 +631,7 @@ def main() -> int:
     )
     print("\nTraining command")
     print(format_training_command(args, selected_config))
-    print(f"\nReports:\n  {json_path}\n  {csv_path}")
+    print(f"\nReports:\n  {json_path}\n  {csv_path}\nSelected config:\n  {selected_config_path}")
     return 0
 
 
