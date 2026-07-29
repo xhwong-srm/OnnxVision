@@ -575,8 +575,8 @@ class MainWindow(QMainWindow):
             b=QPushButton(text); b.clicked.connect(fn); classes_section.addWidget(b)
         right.addWidget(CollapsibleSection("Classes",classes_section,True))
 
-        patterns_section=QVBoxLayout(); self.pattern_list=QListWidget(); patterns_section.addWidget(self.pattern_list)
-        for text, fn in (("Draw / learn anchor pattern",self.begin_pattern),("Extend current by median gap",lambda:self.extend_gap(False)),("Extend all by median gap",lambda:self.extend_gap(True)),("Auto-populate current",lambda:self.auto_place(False)),("Auto-populate all",lambda:self.auto_place(True))):
+        patterns_section=QVBoxLayout(); self.pattern_list=QListWidget(); self.pattern_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection); patterns_section.addWidget(self.pattern_list)
+        for text, fn in (("Draw / learn anchor pattern",self.begin_pattern),("Delete selected pattern(s)",self.delete_selected_patterns),("Extend current by median gap",lambda:self.extend_gap(False)),("Extend all by median gap",lambda:self.extend_gap(True)),("Auto-populate current",lambda:self.auto_place(False)),("Auto-populate all",lambda:self.auto_place(True))):
             b=QPushButton(text); b.clicked.connect(fn); patterns_section.addWidget(b)
         self.threshold=self.spin(.75,0,1,.05); patterns_section.addWidget(QLabel("Pattern threshold")); patterns_section.addWidget(self.threshold)
         self.occurrence_nms=self.spin(.30,0,1,.05); patterns_section.addWidget(QLabel("Occurrence NMS")); patterns_section.addWidget(self.occurrence_nms)
@@ -828,7 +828,11 @@ class MainWindow(QMainWindow):
     def clear_all(self):
         for e in self.entries: e.rois.clear()
         self.select(self.current)
-    def clear_images(self): self.entries.clear(); self.patterns.clear(); self.images.clear(); self.select(-1)
+    def clear_images(self):
+        self.entries.clear()
+        self.images.clear()
+        self.select(-1)
+        self.update(f"Cleared images; retained {len(self.patterns)} learned pattern(s)")
     def navigate(self, amount):
         if self.entries: self.images.setCurrentRow(max(0,min(len(self.entries)-1,self.current+amount)))
     def navigate_roi(self, amount):
@@ -903,6 +907,26 @@ class MainWindow(QMainWindow):
         self.pattern_roi_indices=[i for i,item in enumerate(self.items) if item.isSelected()] or list(range(len(self.items)))
         self.learning_pattern=True
         self.update(f"Draw the anchor pattern; {len(self.pattern_roi_indices)} ROI(s) will follow it")
+    def delete_selected_patterns(self):
+        selected_rows=sorted({index.row() for index in self.pattern_list.selectedIndexes()})
+        selected=[index for index in selected_rows if 0<=index<len(self.patterns)]
+        if not selected_rows:
+            self.update("Select one or more learned patterns to delete")
+            return
+        if not selected:
+            self.pattern_list.clear()
+            self.pattern_list.addItems([f"{pattern.name} ({len(pattern.rois)} linked ROI)" for pattern in self.patterns])
+            self.update("Pattern list was stale and has been refreshed")
+            return
+        removed_names={self.patterns[index].name for index in selected}
+        selected_set=set(selected)
+        self.patterns=[pattern for index,pattern in enumerate(self.patterns) if index not in selected_set]
+        for entry in self.entries:
+            for name in removed_names: entry.pattern_matches.pop(name,None)
+        self.pattern_list.clear()
+        self.pattern_list.addItems([f"{pattern.name} ({len(pattern.rois)} linked ROI)" for pattern in self.patterns])
+        self.select(self.current)
+        self.update(f"Deleted {len(selected)} learned pattern(s)")
 
     def learn_pattern(self, pattern_rect):
         self.learning_pattern=False
@@ -913,6 +937,8 @@ class MainWindow(QMainWindow):
         if not ok: return
         try: name=valid_name(value,"Pattern name")
         except ValueError as e: QMessageBox.warning(self,"Invalid pattern",str(e)); return
+        if name.casefold() in {pattern.name.casefold() for pattern in self.patterns}:
+            QMessageBox.warning(self,"Duplicate pattern name","Pattern names must be unique."); return
         linked=[ROI(self.entries[self.current].rois[i].rect,self.entries[self.current].rois[i].class_id,self.entries[self.current].rois[i].confidence) for i in self.pattern_roi_indices if i<len(self.entries[self.current].rois)]
         self.patterns.append(Pattern(name,self.entries[self.current].path,pattern_rect,template,linked)); self.pattern_list.addItem(f"{name} ({len(linked)} linked ROI)"); self.update(f"Learned {name}; auto-populate can now place linked ROI(s)")
     def extend_gap(self, all_images):
