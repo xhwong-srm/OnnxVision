@@ -58,6 +58,21 @@ def source_image_id(path: Path, length: int = 12) -> str:
     return digest.hexdigest()[:length]
 
 
+def find_entries_by_source_id(entries, value):
+    """Find loaded images by the 12-character content hash used in exports."""
+    normalized = value.strip().lower()
+    if len(normalized) != 12:
+        raise ValueError("Enter exactly 12 hexadecimal characters.")
+    try:
+        int(normalized, 16)
+    except ValueError as error:
+        raise ValueError("The image hash may contain only 0-9 and A-F.") from error
+    return [
+        index for index, entry in enumerate(entries)
+        if source_image_id(entry.path).lower() == normalized
+    ]
+
+
 def iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
     ax, ay, aw, ah = a; bx, by, bw, bh = b
     area = max(0, min(ax + aw, bx + bw) - max(ax, bx)) * max(0, min(ay + ah, by + bh) - max(ay, by))
@@ -519,7 +534,7 @@ class MainWindow(QMainWindow):
         super().__init__(); self.setWindowTitle("Classification ROI Dataset Builder"); self.resize(1450, 850); self.entries=[]; self.classes=[]; self.patterns=[]; self.current=-1; self.items=[]; self.pattern_items=[]; self.roi_clipboard=[]; self.learning_pattern=False; self.pattern_roi_indices=[]; self.model_path=Path(initial_model).resolve() if initial_model else None; self.session=None; self.input_name=None; self.kind=None; self.names={}
         root=QWidget(); self.setCentralWidget(root); layout=QHBoxLayout(root)
         left=QVBoxLayout(); left.addWidget(QLabel("Images")); self.images=QListWidget(); self.images.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection); self.images.currentRowChanged.connect(self.select); left.addWidget(self.images,1)
-        for text, fn in (("Add images...",self.add_images),("Add folder...",self.add_folder),("Load COCO detection dataset...",self.load_detection),("Remove selected image(s)",self.remove_selected_images),("Remove repeated images",self.remove_repeated_images),("Delete ROIs on current",self.clear_current),("Delete ROIs on all",self.clear_all),("Clear images",self.clear_images)):
+        for text, fn in (("Add images...",self.add_images),("Add folder...",self.add_folder),("Load COCO detection dataset...",self.load_detection),("Locate image by 12-char hash...",self.locate_image_by_hash),("Remove selected image(s)",self.remove_selected_images),("Remove repeated images",self.remove_repeated_images),("Delete ROIs on current",self.clear_current),("Delete ROIs on all",self.clear_all),("Clear images",self.clear_images)):
             b=QPushButton(text); b.clicked.connect(fn); left.addWidget(b)
         layout.addLayout(left,1)
         center=QVBoxLayout(); self.scene=QGraphicsScene(); self.pixmap=QGraphicsPixmapItem(); self.scene.addItem(self.pixmap); self.view=ImageView(self.created,self.sort_current_rois); self.view.setScene(self.scene); center.addWidget(self.view,1)
@@ -632,6 +647,30 @@ class MainWindow(QMainWindow):
                 except Exception: pass
         self.images.clear(); self.images.addItems([f"0 ROI | {e.path.name}" for e in self.entries]);
         if self.entries and self.current<0: self.images.setCurrentRow(0)
+    def locate_image_by_hash(self):
+        if not self.entries:
+            self.update("Load images before locating by hash")
+            return
+        value,ok=QInputDialog.getText(
+            self,"Locate image","12-character image hash:",
+        )
+        if not ok: return
+        try:
+            matches=find_entries_by_source_id(self.entries,value)
+        except (OSError,ValueError) as e:
+            QMessageBox.warning(self,"Invalid image hash",str(e))
+            return
+        if not matches:
+            QMessageBox.information(self,"Image not found",f"No loaded image has hash {value.strip().lower()}.")
+            return
+        target=matches[0]
+        self.images.clearSelection()
+        self.images.setCurrentRow(target)
+        self.images.item(target).setSelected(True)
+        self.images.scrollToItem(self.images.item(target))
+        self.images.setFocus()
+        duplicate_note=f"; {len(matches)} identical-content images found" if len(matches)>1 else ""
+        self.update(f"Located {self.entries[target].path.name} [{value.strip().lower()}]{duplicate_note}")
     def remove_selected_images(self):
         selected=sorted({index.row() for index in self.images.selectedIndexes()})
         if not selected:
