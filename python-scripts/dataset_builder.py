@@ -27,12 +27,16 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QGraphicsItem,
     QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsScene, QGraphicsView,
     QHBoxLayout, QInputDialog, QLabel, QListWidget, QMainWindow, QMessageBox,
-    QPushButton, QScrollArea, QSpinBox, QToolButton, QVBoxLayout, QWidget,
+    QProgressDialog, QPushButton, QScrollArea, QSpinBox, QToolButton, QVBoxLayout, QWidget,
 )
 
 SUPPORTED_SUFFIXES = {".bmp", ".dng", ".gif", ".heic", ".jpeg", ".jpg", ".mpo", ".png", ".tif", ".tiff", ".webp"}
 BAD = set('<>:"/\\|?*')
 RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
+class ExportCancelled(Exception):
+    pass
 
 
 def valid_name(value: str, kind: str = "Name") -> str:
@@ -208,7 +212,7 @@ def split_entries(entries, ratios, rng):
     return result
 
 
-def export_coco_detection_dataset(entries, classes, output, ratios, seed=42):
+def export_coco_detection_dataset(entries, classes, output, ratios, seed=42, progress=None):
     """Write full images and bounding boxes in COCO detection format."""
     splits = split_entries(entries, ratios, random.Random(seed))
     categories = [
@@ -217,6 +221,8 @@ def export_coco_detection_dataset(entries, classes, output, ratios, seed=42):
     ]
     total_images = 0
     total_annotations = 0
+    image_total = sum(len(group) for group in splits.values())
+    processed = 0
 
     for split_name, split_entries_for_name in splits.items():
         if not split_entries_for_name:
@@ -231,7 +237,7 @@ def export_coco_detection_dataset(entries, classes, output, ratios, seed=42):
         for image_id, entry in enumerate(split_entries_for_name, start=1):
             file_name = f"{source_image_id(entry.path)}_{image_id:06d}.png"
             image = load_image(entry.path)
-            image.save(image_dir / file_name)
+            image.save(image_dir / file_name, compress_level=1)
             coco_images.append({
                 "id": image_id,
                 "file_name": f"images/{split_name}/{file_name}",
@@ -251,6 +257,9 @@ def export_coco_detection_dataset(entries, classes, output, ratios, seed=42):
                     "area": width * height,
                     "iscrowd": 0,
                 })
+            processed += 1
+            if progress:
+                progress(processed, image_total, f"Exporting {split_name}: {entry.path.name}")
 
         document = {
             "info": {"description": "ROI Dataset Builder COCO detection export"},
@@ -609,6 +618,20 @@ class MainWindow(QMainWindow):
     @staticmethod
     def spin(value, low, high, step):
         b=QDoubleSpinBox(); b.setRange(low,high); b.setSingleStep(step); b.setDecimals(2 if step < 1 else 0); b.setValue(value); return b
+    def export_progress(self, title, total):
+        dialog=QProgressDialog("Preparing export...","Cancel",0,max(1,total),self)
+        dialog.setWindowTitle(title)
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setValue(0)
+        def update_progress(value, maximum, message):
+            dialog.setMaximum(max(1,maximum))
+            dialog.setLabelText(message)
+            dialog.setValue(value)
+            QApplication.processEvents()
+            if dialog.wasCanceled(): raise ExportCancelled()
+        return dialog,update_progress
     def update(self, message=None):
         if message: self.status.setText(message); return
         n=len(self.entries[self.current].rois) if 0<=self.current<len(self.entries) else 0; self.status.setText(f"{self.current+1}/{len(self.entries)}  {n} ROI(s)  | Ctrl-select, right-drag move")
@@ -1043,12 +1066,22 @@ class MainWindow(QMainWindow):
         try: output=Path(parent)/valid_name(name,"Dataset folder")
         except ValueError as e: QMessageBox.warning(self,"Invalid folder",str(e)); return
         if output.exists(): QMessageBox.warning(self,"Destination exists",str(output)); return
+        dialog,progress=self.export_progress("Export COCO detection dataset",len(labeled_entries))
         try:
             image_count,annotation_count=export_coco_detection_dataset(
-                labeled_entries,self.classes,output,ratios
+                labeled_entries,self.classes,output,ratios,progress=progress
             )
+        except ExportCancelled:
+            dialog.close()
+            if output.exists(): shutil.rmtree(output)
+            self.update("COCO export cancelled")
+            return
         except Exception as e:
+            dialog.close()
+            if output.exists(): shutil.rmtree(output)
             QMessageBox.critical(self,"Export failed",str(e)); return
+        dialog.setValue(dialog.maximum())
+        dialog.close()
         QMessageBox.information(
             self,"Dataset created",
             f"Created COCO detection dataset with {image_count} image(s) and "
@@ -1073,7 +1106,20 @@ class MainWindow(QMainWindow):
         if self.balance.isChecked():
             balance_key="" if unsplit else "train"
             groups={cid:[x for x in splits[balance_key] if x[1].class_id==cid] for cid in by_class}; target=max((len(x) for x in groups.values()),default=0) if self.strategy.currentRow()==0 else min((len(x) for x in groups.values()),default=0); splits[balance_key]=[x for cid,g in groups.items() for x in (g+[rng.choice(g) for _ in range(target-len(g))] if self.strategy.currentRow()==0 and g else g[:target])]
-        image_ids={e.path.resolve():source_image_id(e.path) for e in self.entries}
+        sample_paths=sorted({e.path.resolve() for e,_,_ in samples})
+        crop_total=sum(len(group) for group in splits.values())
+        dialog,progress=self.export_progress("Export classification dataset",len(sample_paths)+crop_total)
+        image_ids={}
+        progress_value=0
+        try:
+            for path in sample_paths:
+                image_ids[path]=source_image_id(path)
+                progress_value+=1
+                progress(progress_value,len(sample_paths)+crop_total,f"Preparing: {path.name}")
+        except ExportCancelled:
+            dialog.close()
+            self.update("Classification export cancelled")
+            return
         group_indices={}
         for entry in self.entries:
             entry_groups={}
@@ -1085,17 +1131,37 @@ class MainWindow(QMainWindow):
         occurrences=defaultdict(int)
         written=0
         try:
+            samples_by_path=defaultdict(list)
             for split,group in splits.items():
                 for cid in by_class: (output/split/self.classes[cid]).mkdir(parents=True,exist_ok=True)
-                for e,r,i in group:
-                    image_id=image_ids[e.path.resolve()]
-                    group_index=group_indices[(e.path.resolve(),i)]
+                for sample in group: samples_by_path[sample[0].path.resolve()].append((split,*sample))
+            for path,path_samples in samples_by_path.items():
+                image=load_image(path)
+                for split,e,r,i in path_samples:
+                    image_id=image_ids[path]
+                    group_index=group_indices[(path,i)]
                     occurrence_key=(image_id,i,group_index)
                     occurrence=occurrences[occurrence_key]
                     occurrences[occurrence_key]+=1
                     base=f"{image_id}_r{i:04d}_g{group_index:04d}_n{occurrence:03d}.png"
-                    image=load_image(e.path); x,y,w,h=r.rect; image.crop((x,y,x+w,y+h)).save(output/split/self.classes[r.class_id]/base); written+=1
-        except Exception as e: QMessageBox.critical(self,"Export failed",f"{written} crop(s) written.\n\n{e}"); return
+                    x,y,w,h=r.rect
+                    image.crop((x,y,x+w,y+h)).save(
+                        output/split/self.classes[r.class_id]/base,compress_level=1
+                    )
+                    written+=1
+                    progress_value+=1
+                    progress(progress_value,len(sample_paths)+crop_total,f"Exporting {split or 'dataset'}: {path.name}")
+        except ExportCancelled:
+            dialog.close()
+            if output.exists(): shutil.rmtree(output)
+            self.update("Classification export cancelled")
+            return
+        except Exception as e:
+            dialog.close()
+            if output.exists(): shutil.rmtree(output)
+            QMessageBox.critical(self,"Export failed",f"Export stopped after {written} crop(s).\n\n{e}"); return
+        dialog.setValue(dialog.maximum())
+        dialog.close()
         QMessageBox.information(self,"Dataset created",f"Created {written} crop(s):\n{output}")
 
 
