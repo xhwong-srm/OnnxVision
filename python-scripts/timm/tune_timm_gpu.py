@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import ctypes
 import json
 import os
 import subprocess
@@ -68,7 +69,15 @@ def fraction(value: str) -> float:
 def parse_worker_candidates(value: str) -> list[int]:
     if value.lower() == "auto":
         cpu_count = os.cpu_count() or 1
-        return sorted({0, min(2, cpu_count), min(4, cpu_count), min(8, cpu_count)})
+        worker_limit = min(16, max(1, cpu_count - 2))
+        workers = [0]
+        candidate = 1
+        while candidate <= worker_limit:
+            workers.append(candidate)
+            candidate *= 2
+        if workers[-1] != worker_limit:
+            workers.append(worker_limit)
+        return workers
     try:
         workers = sorted({int(item.strip()) for item in value.split(",")})
     except ValueError as error:
@@ -99,11 +108,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prefetch-factors",
         type=parse_worker_candidates,
-        default=[2, 4],
-        help="Comma-separated prefetch-factor candidates used when workers > 0",
+        default=None,
+        help=(
+            "Prefetch candidates used when workers > 0; default derives 1,2,4,8 "
+            "within a host-RAM budget"
+        ),
+    )
+    parser.add_argument(
+        "--max-prefetch-ram-fraction",
+        type=fraction,
+        default=0.25,
+        help="Maximum fraction of currently available RAM budgeted for prefetched batches",
     )
     parser.add_argument("--warmup-steps", type=non_negative_int, default=3)
     parser.add_argument("--measure-steps", type=positive_int, default=10)
+    parser.add_argument(
+        "--final-measure-steps",
+        type=positive_int,
+        default=100,
+        help="Measured steps used to validate the strongest short-run candidates",
+    )
+    parser.add_argument(
+        "--final-candidates",
+        type=positive_int,
+        default=3,
+        help="Number of short-run winners remeasured with --final-measure-steps",
+    )
     parser.add_argument(
         "--max-vram-fraction",
         type=fraction,
@@ -120,7 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--test-compile",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Benchmark torch.compile on the final uncompiled winner",
+        help="Include torch.compile for the strongest uncompiled candidate",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -279,6 +309,7 @@ def run_training_trial(args: argparse.Namespace) -> int:
 def trial_command(
     args: argparse.Namespace,
     config: TrialConfig,
+    measure_steps: int | None = None,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -293,7 +324,7 @@ def trial_command(
         "--warmup-steps",
         str(args.warmup_steps),
         "--measure-steps",
-        str(args.measure_steps),
+        str(args.measure_steps if measure_steps is None else measure_steps),
         "--seed",
         str(args.seed),
         "--_batch",
@@ -316,7 +347,13 @@ def trial_command(
     return command
 
 
-def run_isolated_trial(args: argparse.Namespace, config: TrialConfig) -> dict:
+def run_isolated_trial(
+    args: argparse.Namespace,
+    config: TrialConfig,
+    *,
+    measure_steps: int | None = None,
+    benchmark_stage: str = "screening",
+) -> dict:
     print(
         "  "
         f"batch={config.batch:<4} workers={config.workers} "
@@ -328,7 +365,7 @@ def run_isolated_trial(args: argparse.Namespace, config: TrialConfig) -> dict:
         flush=True,
     )
     completed = subprocess.run(
-        trial_command(args, config),
+        trial_command(args, config, measure_steps),
         capture_output=True,
         text=True,
         check=False,
@@ -342,6 +379,7 @@ def run_isolated_trial(args: argparse.Namespace, config: TrialConfig) -> dict:
         result = {"config": asdict(config), "status": "failed", "error": error}
     else:
         result = json.loads(result_line[len(RESULT_PREFIX) :])
+    result["benchmark_stage"] = benchmark_stage
 
     if result["status"] == "success":
         print(
@@ -380,6 +418,88 @@ def compute_profiles(bfloat16_supported: bool) -> list[dict]:
             ]
         )
     return profiles
+
+
+def available_system_memory_bytes() -> int | None:
+    if sys.platform == "win32":
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [
+                ("length", ctypes.c_ulong),
+                ("memory_load", ctypes.c_ulong),
+                ("total_physical", ctypes.c_ulonglong),
+                ("available_physical", ctypes.c_ulonglong),
+                ("total_page_file", ctypes.c_ulonglong),
+                ("available_page_file", ctypes.c_ulonglong),
+                ("total_virtual", ctypes.c_ulonglong),
+                ("available_virtual", ctypes.c_ulonglong),
+                ("available_extended_virtual", ctypes.c_ulonglong),
+            ]
+
+        status = MemoryStatus()
+        status.length = ctypes.sizeof(status)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return int(status.available_physical)
+        return None
+    if hasattr(os, "sysconf"):
+        try:
+            return int(os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+        except (OSError, ValueError):
+            return None
+    return None
+
+
+def automatic_prefetch_factors(
+    *,
+    batch: int,
+    workers: int,
+    input_size: tuple[int, ...],
+    available_memory: int | None,
+    max_ram_fraction: float,
+) -> list[int]:
+    if workers <= 0:
+        return []
+    candidates = [1, 2, 4, 8]
+    if available_memory is None:
+        return candidates[:3]
+
+    elements_per_sample = 1
+    for dimension in input_size:
+        elements_per_sample *= dimension
+    batch_bytes = batch * elements_per_sample * 4
+    budget = available_memory * max_ram_fraction
+    maximum = max(1, int(budget // (workers * batch_bytes)))
+    allowed = [factor for factor in candidates if factor <= maximum]
+    return allowed or [1]
+
+
+def compute_mode_key(result: dict) -> tuple:
+    config = result["config"]
+    return (
+        config["amp"],
+        config["amp_dtype"] if config["amp"] else None,
+        config["channels_last"],
+    )
+
+
+def select_compute_finalists(results: list[dict], top_count: int) -> list[dict]:
+    ranked = sorted(results, key=lambda item: item["samples_per_second"], reverse=True)
+    selected = ranked[:top_count]
+    selected_keys = {
+        config_key(TrialConfig(**result["config"])) for result in selected
+    }
+    covered_modes = {compute_mode_key(result) for result in selected}
+
+    # workers=0 can hide a compute mode that becomes much faster once loading is
+    # overlapped. Always advance the best batch from every compute mode so the
+    # DataLoader phase, rather than synchronous decoding, makes that decision.
+    for result in ranked:
+        mode = compute_mode_key(result)
+        key = config_key(TrialConfig(**result["config"]))
+        if mode not in covered_modes and key not in selected_keys:
+            selected.append(result)
+            selected_keys.add(key)
+            covered_modes.add(mode)
+    return selected
 
 
 def successful_and_safe(result: dict, max_vram_fraction: float) -> bool:
@@ -463,9 +583,12 @@ def write_reports(
             "min_batch": args.min_batch,
             "max_batch": args.max_batch,
             "workers": args.workers,
-            "prefetch_factors": args.prefetch_factors,
+            "prefetch_factors": args.prefetch_factors or "auto",
+            "max_prefetch_ram_fraction": args.max_prefetch_ram_fraction,
             "warmup_steps": args.warmup_steps,
             "measure_steps": args.measure_steps,
+            "final_measure_steps": args.final_measure_steps,
+            "final_candidates": args.final_candidates,
             "max_vram_fraction": args.max_vram_fraction,
             "test_compile": args.test_compile,
         },
@@ -486,6 +609,7 @@ def write_reports(
         "amp_dtype",
         "channels_last",
         "compile",
+        "benchmark_stage",
         "samples_per_second",
         "milliseconds_per_batch",
         "peak_allocated_mb",
@@ -508,7 +632,9 @@ def main() -> int:
         return run_training_trial(args)
     if args.min_batch > args.max_batch:
         raise ValueError("--min-batch cannot exceed --max-batch")
-    if not args.prefetch_factors or args.prefetch_factors[0] < 1:
+    if args.prefetch_factors is not None and (
+        not args.prefetch_factors or args.prefetch_factors[0] < 1
+    ):
         raise ValueError("--prefetch-factors must contain positive integers")
 
     device = torch.device(args.device)
@@ -534,7 +660,8 @@ def main() -> int:
     )
     print(
         f"Safe VRAM limit: {args.max_vram_fraction:.0%}; "
-        f"warmup={args.warmup_steps}, measured steps={args.measure_steps}"
+        f"warmup={args.warmup_steps}, screening steps={args.measure_steps}, "
+        f"final steps={args.final_measure_steps}"
     )
 
     results: list[dict] = []
@@ -569,19 +696,38 @@ def main() -> int:
             "--max-vram-fraction after checking other GPU workloads."
         )
 
-    compute_results.sort(key=lambda item: item["samples_per_second"], reverse=True)
-    finalists = compute_results[: args.top_compute_configs]
+    input_size = tuple(compute_results[0]["input_size"])
+    available_memory = available_system_memory_bytes()
+    print(f"Model input size: {input_size}")
+    if available_memory is not None:
+        print(f"Available host RAM: {available_memory / (1024**3):.1f} GiB")
+
+    finalists = select_compute_finalists(compute_results, args.top_compute_configs)
+    print(
+        f"Advancing {len(finalists)} candidates: the global top "
+        f"{args.top_compute_configs} plus the best batch from each compute mode."
+    )
     print("\nPhase 2: DataLoader search on the strongest compute configurations")
     loader_results: list[dict] = []
     for finalist in finalists:
         base = TrialConfig(**finalist["config"])
+        previous_worker_throughput: float | None = None
+        low_gain_count = 0
         for workers in args.workers:
             if workers == 0:
                 loader_variants = [(None, False, False), (None, False, True)]
             else:
+                prefetch_factors = args.prefetch_factors or automatic_prefetch_factors(
+                    batch=base.batch,
+                    workers=workers,
+                    input_size=input_size,
+                    available_memory=available_memory,
+                    max_ram_fraction=args.max_prefetch_ram_fraction,
+                )
                 loader_variants = [
-                    (prefetch, True, True) for prefetch in args.prefetch_factors
+                    (prefetch, True, True) for prefetch in prefetch_factors
                 ]
+            worker_results = []
             for prefetch, persistent, pin_memory in loader_variants:
                 config = TrialConfig(
                     batch=base.batch,
@@ -605,6 +751,22 @@ def main() -> int:
                     append_trial(results, seen, result)
                 if successful_and_safe(result, args.max_vram_fraction):
                     loader_results.append(result)
+                    worker_results.append(result)
+
+            if workers > 0 and worker_results:
+                worker_throughput = max(
+                    result["samples_per_second"] for result in worker_results
+                )
+                if previous_worker_throughput is not None:
+                    gain = worker_throughput / previous_worker_throughput - 1
+                    low_gain_count = low_gain_count + 1 if gain < 0.05 else 0
+                previous_worker_throughput = worker_throughput
+                if low_gain_count >= 2:
+                    print(
+                        "    stopping worker expansion: throughput improved by "
+                        "less than 5% at two consecutive worker counts"
+                    )
+                    break
 
     candidates = loader_results or compute_results
     selected = max(candidates, key=lambda item: item["samples_per_second"])
@@ -614,11 +776,47 @@ def main() -> int:
         compile_config = TrialConfig(**{**selected["config"], "compile": True})
         compile_result = run_isolated_trial(args, compile_config)
         append_trial(results, seen, compile_result)
-        if (
-            successful_and_safe(compile_result, args.max_vram_fraction)
-            and compile_result["samples_per_second"] > selected["samples_per_second"]
-        ):
-            selected = compile_result
+        if successful_and_safe(compile_result, args.max_vram_fraction):
+            candidates.append(compile_result)
+
+    print("\nFinal validation: sustained throughput on the short-run winners")
+    validation_configs: list[TrialConfig] = []
+    validation_keys: set[tuple] = set()
+    for candidate in sorted(
+        candidates,
+        key=lambda item: item["samples_per_second"],
+        reverse=True,
+    ):
+        config = TrialConfig(**candidate["config"])
+        key = config_key(config)
+        if key not in validation_keys:
+            validation_configs.append(config)
+            validation_keys.add(key)
+        if len(validation_configs) >= args.final_candidates:
+            break
+
+    validation_results = []
+    for config in validation_configs:
+        queue_depth = (
+            config.workers * (config.prefetch_factor or 0)
+            if config.workers > 0
+            else 0
+        )
+        final_measure_steps = max(args.final_measure_steps, 2 * queue_depth)
+        result = run_isolated_trial(
+            args,
+            config,
+            measure_steps=final_measure_steps,
+            benchmark_stage="final_validation",
+        )
+        results.append(result)
+        if successful_and_safe(result, args.max_vram_fraction):
+            validation_results.append(result)
+    if validation_results:
+        selected = max(
+            validation_results,
+            key=lambda item: item["samples_per_second"],
+        )
 
     selected_config = TrialConfig(**selected["config"])
     json_path, csv_path, selected_config_path = write_reports(args, results, selected, gpu)
