@@ -1,4 +1,4 @@
-"""Merge classification datasets with deterministic, duplicate-group-aware train undersampling."""
+"""Merge classification datasets with optional grouped re-splitting and train balancing."""
 
 from __future__ import annotations
 
@@ -13,9 +13,10 @@ from pathlib import Path
 IMAGE_EXTENSIONS = {".bmp", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
 SPLITS = ("train", "val", "test")
 BUILDER_NAME = re.compile(
-    r"^(?P<image_id>[0-9a-f]{12})_r(?P<roi>\d+)_g(?P<group>\d+)_n(?P<occurrence>\d+)$",
+    r"^(?P<image_id>[0-9a-f]{12})_r(?P<roi>\d+)_g(?P<group>\d+)_n(?P<occurrence>\d+)(?:_m\d+)*$",
     re.IGNORECASE,
 )
+LEGACY_BUILDER_NAME = re.compile(r"^.+_(?P<image_id>[0-9a-f]{10})_\d+_\d+$", re.IGNORECASE)
 
 
 def image_files(folder: Path) -> list[Path]:
@@ -25,21 +26,70 @@ def image_files(folder: Path) -> list[Path]:
     )
 
 
-def duplicate_group_key(entry: tuple[Path, Path]) -> tuple[str, ...]:
-    """Identify a builder duplicate group; legacy filenames remain independent."""
-    path, source_root = entry
+def builder_identity(entry: tuple[Path, Path, str]) -> tuple[str | None, str | None]:
+    """Return image and duplicate-group IDs encoded by the builder filename."""
+    path, _, _ = entry
     match = BUILDER_NAME.fullmatch(path.stem)
     if match:
         return match["image_id"].lower(), match["group"]
-    return "legacy", str(source_root).lower(), str(path).lower()
+    legacy = LEGACY_BUILDER_NAME.fullmatch(path.stem)
+    return (legacy["image_id"].lower(), None) if legacy else (None, None)
 
 
-def grouped_sample(entries: list[tuple[Path, Path]], target: int, rng: random.Random) -> list[tuple[Path, Path]]:
-    """Choose complete duplicate groups with a total count closest to target."""
-    grouped: dict[tuple[str, ...], list[tuple[Path, Path]]] = {}
+def grouping_key(entry: tuple[Path, Path, str], mode: str) -> tuple[str, ...]:
+    path, source_root, _ = entry
+    image_id, duplicate_group = builder_identity(entry)
+    if mode == "image" and image_id is not None:
+        return "image", image_id
+    if mode == "duplicate" and duplicate_group is not None:
+        return "duplicate", image_id, duplicate_group
+    return "sample", str(source_root).lower(), str(path).lower()
+
+
+def grouped_entries(entries: list[tuple[Path, Path, str]], mode: str) -> list[list[tuple[Path, Path, str]]]:
+    grouped: dict[tuple[str, ...], list[tuple[Path, Path, str]]] = {}
     for entry in entries:
-        grouped.setdefault(duplicate_group_key(entry), []).append(entry)
-    groups = list(grouped.values())
+        grouped.setdefault(grouping_key(entry, mode), []).append(entry)
+    return list(grouped.values())
+
+
+def split_counts(count: int, ratios: tuple[float, float, float]) -> list[int]:
+    exact = [count * ratio for ratio in ratios]
+    result = [int(value) for value in exact]
+    for index in sorted(range(3), key=lambda i: exact[i] - result[i], reverse=True)[:count - sum(result)]:
+        result[index] += 1
+    return result
+
+
+def split_entries(entries, ratios, rng, mode):
+    splits = {name: [] for name in SPLITS}
+    if mode != "sample":
+        groups = grouped_entries(entries, mode)
+        rng.shuffle(groups)
+        counts = split_counts(len(groups), ratios)
+        offset = 0
+        for split, count in zip(SPLITS, counts):
+            for group in groups[offset:offset + count]:
+                splits[split].extend(group)
+            offset += count
+        return splits
+
+    by_class = {}
+    for entry in entries:
+        by_class.setdefault(entry[2], []).append(entry)
+    for class_entries in by_class.values():
+        rng.shuffle(class_entries)
+        counts = split_counts(len(class_entries), ratios)
+        offset = 0
+        for split, count in zip(SPLITS, counts):
+            splits[split].extend(class_entries[offset:offset + count])
+            offset += count
+    return splits
+
+
+def grouped_sample(entries, target: int, rng: random.Random, mode: str):
+    """Choose complete groups with a total count closest to target."""
+    groups = grouped_entries(entries, mode)
     rng.shuffle(groups)
     if not groups or target <= 0:
         return []
@@ -64,12 +114,30 @@ def grouped_sample(entries: list[tuple[Path, Path]], target: int, rng: random.Ra
     )
 
 
+def grouped_oversample(entries, target: int, rng: random.Random, mode: str):
+    """Repeat complete groups until reaching the count nearest to target."""
+    groups = grouped_entries(entries, mode)
+    selected = list(entries)
+    while groups and len(selected) < target:
+        remaining = target - len(selected)
+        group = min(groups, key=lambda value: (abs(len(value) - remaining), rng.random()))
+        selected.extend(group)
+    return sorted(selected, key=lambda item: item[0].as_posix().lower())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("source", nargs=2, type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--seed", type=int, default=20260728)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--resplit", action="store_true", help="Ignore existing split assignments and create new splits.")
+    parser.add_argument("--train", type=float, default=70, help="Training percentage used with --resplit.")
+    parser.add_argument("--val", type=float, default=20, help="Validation percentage used with --resplit.")
+    parser.add_argument("--test", type=float, default=10, help="Test percentage used with --resplit.")
+    parser.add_argument("--group-duplicates", action="store_true", help="Keep builder duplicate groups in one split.")
+    parser.add_argument("--group-by-image", action="store_true", help="Keep all builder ROIs from each source image in one split.")
+    parser.add_argument("--balance", choices=("undersample", "oversample", "none"), default="undersample")
     args = parser.parse_args()
 
     sources = [path.resolve() for path in args.source]
@@ -79,7 +147,12 @@ def main() -> None:
             raise SystemExit(f"Output already exists; use --overwrite to replace it: {output}")
         shutil.rmtree(output)
 
-    collected: dict[tuple[str, str], list[tuple[Path, Path]]] = {}
+    ratios = (args.train / 100, args.val / 100, args.test / 100)
+    if args.resplit and (any(ratio < 0 for ratio in ratios) or abs(sum(ratios) - 1) > 1e-9):
+        raise SystemExit("--train, --val, and --test must be non-negative and add to 100.")
+    mode = "image" if args.group_by_image else "duplicate" if args.group_duplicates else "sample"
+
+    collected: dict[tuple[str, str], list[tuple[Path, Path, str]]] = {}
     for split in SPLITS:
         class_names = sorted(
             {
@@ -94,31 +167,51 @@ def main() -> None:
             for source in sources:
                 source_class = source / split / class_name
                 if source_class.is_dir():
-                    entries.extend((path, source) for path in image_files(source_class))
+                    entries.extend((path, source, class_name) for path in image_files(source_class))
             collected[(split, class_name)] = entries
 
     rng = random.Random(args.seed)
-    selected: dict[tuple[str, str], list[tuple[Path, Path]]] = {}
-    train_classes = sorted({class_name for split, class_name in collected if split == "train"})
-    train_target = min(len(collected[("train", class_name)]) for class_name in train_classes)
-    for key, entries in collected.items():
-        if key[0] == "train":
-            selected[key] = grouped_sample(entries, train_target, rng)
-        else:
-            selected[key] = entries
+    if args.resplit:
+        all_entries = [entry for entries in collected.values() for entry in entries]
+        split_result = split_entries(all_entries, ratios, rng, mode)
+        selected = {
+            (split, class_name): [entry for entry in split_result[split] if entry[2] == class_name]
+            for split in SPLITS
+            for class_name in sorted({entry[2] for entry in all_entries})
+        }
+    else:
+        selected = dict(collected)
+
+    train_classes = sorted({class_name for split, class_name in selected if split == "train"})
+    train_counts = [len(selected[("train", class_name)]) for class_name in train_classes]
+    train_target = None
+    if args.balance != "none" and train_counts:
+        train_target = min(train_counts) if args.balance == "undersample" else max(train_counts)
+        for class_name in train_classes:
+            key = "train", class_name
+            if args.balance == "undersample":
+                selected[key] = grouped_sample(selected[key], train_target, rng, mode)
+            else:
+                selected[key] = grouped_oversample(selected[key], train_target, rng, mode)
 
     manifest_path = output / "merge_manifest.csv"
     output.mkdir(parents=True)
     manifest_rows: list[dict[str, str]] = []
-    used_destinations: set[Path] = set()
+    used_destinations: dict[Path, Path] = {}
     for (split, class_name), entries in selected.items():
         destination_dir = output / split / class_name
         destination_dir.mkdir(parents=True, exist_ok=True)
-        for source_path, source_root in entries:
+        for source_path, source_root, _ in entries:
             destination = destination_dir / source_path.name
-            if destination in used_destinations or destination.exists():
+            copy_index = 1
+            while destination in used_destinations:
+                if used_destinations[destination] != source_path.resolve():
+                    raise RuntimeError(f"Destination filename collision: {destination}")
+                destination = destination_dir / f"{source_path.stem}_m{copy_index:03d}{source_path.suffix}"
+                copy_index += 1
+            if destination.exists():
                 raise RuntimeError(f"Destination filename collision: {destination}")
-            used_destinations.add(destination)
+            used_destinations[destination] = source_path.resolve()
             shutil.copy2(source_path, destination)
             manifest_rows.append(
                 {
@@ -136,7 +229,9 @@ def main() -> None:
         writer.writerows(sorted(manifest_rows, key=lambda row: row["output"].lower()))
 
     print(f"Created: {output}")
-    print(f"Train target per class: {train_target} (nearest complete duplicate groups)")
+    print(f"Split mode: {'resplit' if args.resplit else 'preserve'}; grouping: {mode}; balance: {args.balance}")
+    if train_target is not None:
+        print(f"Train target per class: {train_target} (nearest complete groups)")
     for key in sorted(selected):
         print(f"{key[0]}/{key[1]}: {len(selected[key])}")
     print(f"Manifest: {manifest_path}")
