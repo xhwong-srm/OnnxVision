@@ -131,11 +131,50 @@ def split_counts(count, ratios):
     return result
 
 
+def split_samples(samples, ratios, rng, group_duplicates=False, group_by_source=False):
+    """Split labeled ROI samples, optionally grouping duplicates or source images."""
+    split_names = ("train", "val", "test")
+    splits = {name: [] for name in split_names}
+    if group_duplicates or group_by_source:
+        sample_groups = {}
+        for sample in samples:
+            entry, roi, index = sample
+            if group_by_source:
+                key = entry.path.resolve()
+            elif roi.duplicate_group is not None:
+                key = (entry.path.resolve(), roi.duplicate_group)
+            else:
+                key = (entry.path.resolve(), index)
+            sample_groups.setdefault(key, []).append(sample)
+        groups = list(sample_groups.values())
+        rng.shuffle(groups)
+        counts = split_counts(len(groups), ratios)
+        offset = 0
+        for name, count in zip(split_names, counts):
+            for group in groups[offset:offset + count]:
+                splits[name].extend(group)
+            offset += count
+        return splits
+
+    by_class = {}
+    for sample in samples:
+        by_class.setdefault(sample[1].class_id, []).append(sample)
+    for group in by_class.values():
+        rng.shuffle(group)
+        counts = split_counts(len(group), ratios)
+        offset = 0
+        for name, count in zip(split_names, counts):
+            splits[name].extend(group[offset:offset + count])
+            offset += count
+    return splits
+
+
 @dataclass
 class ROI:
     rect: tuple[int, int, int, int]
     class_id: int | None = None
     confidence: float | None = None
+    duplicate_group: int | None = None
 
 
 @dataclass
@@ -231,7 +270,14 @@ class MainWindow(QMainWindow):
         right.addWidget(QLabel("ROI width / height ratio (0 disables)")); self.ratio=self.spin(0,0,1000,.01); right.addWidget(self.ratio)
         b=QPushButton("Choose ONNX model..."); b.clicked.connect(self.choose_model); right.addWidget(b); self.model_label=QLabel(); self.model_label.setWordWrap(True); right.addWidget(self.model_label)
         for text, fn in (("Auto-label current",lambda:self.auto_label(False)),("Auto-label all",lambda:self.auto_label(True))): b=QPushButton(text); b.clicked.connect(fn); right.addWidget(b)
-        right.addWidget(QLabel("Split % (train / val / test)")); self.split=[self.spin(x,0,100,1) for x in (70,20,10)]; row=QHBoxLayout(); [row.addWidget(x) for x in self.split]; right.addLayout(row); self.balance=QCheckBox("Balance training split"); right.addWidget(self.balance); self.strategy=QListWidget(); self.strategy.addItems(["Oversample","Undersample"]); self.strategy.setCurrentRow(0); self.strategy.setMaximumHeight(45); right.addWidget(self.strategy)
+        right.addWidget(QLabel("Split % (train / val / test)")); self.split=[self.spin(x,0,100,1) for x in (70,20,10)]; row=QHBoxLayout(); [row.addWidget(x) for x in self.split]; right.addLayout(row)
+        self.group_duplicates=QCheckBox("Keep duplicate ROIs in one split")
+        self.group_duplicates.setToolTip("When enabled, ROIs created together by Duplicate stay in one split even after resizing, moving, or relabeling.")
+        right.addWidget(self.group_duplicates)
+        self.group_by_source=QCheckBox("Keep all ROIs from same image in one split")
+        self.group_by_source.setToolTip("When enabled, every ROI and duplicate from a source image stays together. This takes priority over duplicate grouping.")
+        right.addWidget(self.group_by_source)
+        self.balance=QCheckBox("Balance training split"); right.addWidget(self.balance); self.strategy=QListWidget(); self.strategy.addItems(["Oversample","Undersample"]); self.strategy.setCurrentRow(0); self.strategy.setMaximumHeight(45); right.addWidget(self.strategy)
         b=QPushButton("Export classification dataset..."); b.clicked.connect(self.export); right.addWidget(b)
         right_panel=QWidget(); right_panel.setLayout(right)
         right_scroll=QScrollArea(); right_scroll.setWidgetResizable(True); right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); right_scroll.setWidget(right_panel); right_scroll.setMinimumWidth(300)
@@ -413,7 +459,9 @@ class MainWindow(QMainWindow):
                 indices={i for i,item in enumerate(self.items) if item.isSelected()}
                 source=[roi for i,roi in enumerate(source) if i in indices]
             for roi in source:
-                entry.rois.extend(ROI(roi.rect,roi.class_id,roi.confidence) for _ in range(count))
+                if roi.duplicate_group is None:
+                    roi.duplicate_group=id(roi)
+                entry.rois.extend(ROI(roi.rect,roi.class_id,roi.confidence,roi.duplicate_group) for _ in range(count))
                 duplicated+=count
         self.select(self.current); self.update(f"Duplicated {duplicated} ROI(s) at their original locations")
     def auto_place(self, all_images):
@@ -482,12 +530,8 @@ class MainWindow(QMainWindow):
         except ValueError as e: QMessageBox.warning(self,"Invalid folder",str(e)); return
         if output.exists(): QMessageBox.warning(self,"Destination exists",str(output)); return
         by_class={i:[] for i in range(len(self.classes))}; [by_class[r.class_id].append((e,r,i)) for e,r,i in samples]
-        rng=random.Random(42); splits={s:[] for s in ("train","val","test")}
-        # Split each class independently so the class distribution is retained.
-        for group in by_class.values():
-            rng.shuffle(group); counts=split_counts(len(group),ratios); off=0
-            for s,n in zip(splits,counts):
-                splits[s].extend(group[off:off+n]); off+=n
+        rng=random.Random(42)
+        splits=split_samples(samples,ratios,rng,self.group_duplicates.isChecked(),self.group_by_source.isChecked())
         if self.balance.isChecked():
             groups={cid:[x for x in splits["train"] if x[1].class_id==cid] for cid in by_class}; target=max((len(x) for x in groups.values()),default=0) if self.strategy.currentRow()==0 else min((len(x) for x in groups.values()),default=0); splits["train"]=[x for cid,g in groups.items() for x in (g+[rng.choice(g) for _ in range(target-len(g))] if self.strategy.currentRow()==0 and g else g[:target])]
         written=0
