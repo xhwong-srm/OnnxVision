@@ -252,7 +252,7 @@ class MainWindow(QMainWindow):
         super().__init__(); self.setWindowTitle("Classification ROI Dataset Builder"); self.resize(1450, 850); self.entries=[]; self.classes=[]; self.patterns=[]; self.current=-1; self.items=[]; self.pattern_items=[]; self.learning_pattern=False; self.pattern_roi_indices=[]; self.model_path=Path(initial_model).resolve() if initial_model else None; self.session=None; self.input_name=None; self.kind=None; self.names={}
         root=QWidget(); self.setCentralWidget(root); layout=QHBoxLayout(root)
         left=QVBoxLayout(); left.addWidget(QLabel("Images")); self.images=QListWidget(); self.images.currentRowChanged.connect(self.select); left.addWidget(self.images,1)
-        for text, fn in (("Add images...",self.add_images),("Add folder...",self.add_folder),("Delete ROIs on current",self.clear_current),("Delete ROIs on all",self.clear_all),("Clear images",self.clear_images)):
+        for text, fn in (("Add images...",self.add_images),("Add folder...",self.add_folder),("Remove repeated images",self.remove_repeated_images),("Delete ROIs on current",self.clear_current),("Delete ROIs on all",self.clear_all),("Clear images",self.clear_images)):
             b=QPushButton(text); b.clicked.connect(fn); left.addWidget(b)
         layout.addLayout(left,1)
         center=QVBoxLayout(); self.scene=QGraphicsScene(); self.pixmap=QGraphicsPixmapItem(); self.scene.addItem(self.pixmap); self.view=ImageView(self.created); self.view.setScene(self.scene); center.addWidget(self.view,1)
@@ -310,6 +310,37 @@ class MainWindow(QMainWindow):
                 except Exception: pass
         self.images.clear(); self.images.addItems([f"0 ROI | {e.path.name}" for e in self.entries]);
         if self.entries and self.current<0: self.images.setCurrentRow(0)
+    def remove_repeated_images(self):
+        if not self.entries:
+            self.update("No images to check")
+            return
+        unique=[]
+        seen={}
+        removed=[]
+        failed=[]
+        for entry in self.entries:
+            try:
+                digest=source_image_id(entry.path,40)
+            except Exception:
+                unique.append(entry); failed.append(entry.path.name); continue
+            if digest in seen:
+                removed.append((entry.path.name,seen[digest].path.name))
+            else:
+                seen[digest]=entry
+                unique.append(entry)
+        if not removed:
+            message="No repeated images found."
+            if failed: message+=f"\n\nCould not read {len(failed)} image(s)."
+            QMessageBox.information(self,"Repeated images",message)
+            return
+        self.entries=unique
+        self.images.clear()
+        self.images.addItems([f"{len(e.rois)} ROI | {e.path.name}" for e in self.entries])
+        self.current=-1
+        if self.entries: self.images.setCurrentRow(0)
+        message=f"Removed {len(removed)} repeated image(s); kept the first occurrence of each."
+        if failed: message+=f"\n\nCould not read {len(failed)} image(s)."
+        QMessageBox.information(self,"Repeated images",message)
     def select(self,index):
         self.current=index
         for item in self.items + self.pattern_items: self.scene.removeItem(item)
