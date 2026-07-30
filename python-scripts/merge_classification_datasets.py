@@ -38,6 +38,30 @@ def builder_identity(entry: tuple[Path, Path, str]) -> tuple[str | None, str | N
     return (legacy["image_id"].lower(), None) if legacy else (None, None)
 
 
+def parse_group_selection(value: str) -> set[int]:
+    """Parse zero-based group indices such as ``3`` or ``1-3,7``."""
+    selected: set[int] = set()
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            raise argparse.ArgumentTypeError("group selection contains an empty item")
+        if "-" in part:
+            start_text, end_text = part.split("-", 1)
+            if not start_text.isdigit() or not end_text.isdigit():
+                raise argparse.ArgumentTypeError(f"invalid group range: {part!r}")
+            start, end = int(start_text), int(end_text)
+            if start > end:
+                raise argparse.ArgumentTypeError(f"group range must be ascending: {part!r}")
+            selected.update(range(start, end + 1))
+        elif part.isdigit():
+            selected.add(int(part))
+        else:
+            raise argparse.ArgumentTypeError(f"invalid group index: {part!r}")
+    if not selected:
+        raise argparse.ArgumentTypeError("select at least one group")
+    return selected
+
+
 def is_oversample_copy(entry: tuple[Path, Path, str]) -> bool:
     """Return whether a file is an encoded builder or merge oversample copy."""
     match = BUILDER_NAME.fullmatch(entry[0].stem)
@@ -75,16 +99,16 @@ def grouped_entries(entries: list[tuple[Path, Path, str]], mode: str) -> list[li
     return list(grouped.values())
 
 
-def split_counts(count: int, ratios: tuple[float, float, float]) -> list[int]:
+def split_counts(count: int, ratios: tuple[float, ...]) -> list[int]:
     exact = [count * ratio for ratio in ratios]
     result = [int(value) for value in exact]
-    for index in sorted(range(3), key=lambda i: exact[i] - result[i], reverse=True)[:count - sum(result)]:
+    for index in sorted(range(len(ratios)), key=lambda i: exact[i] - result[i], reverse=True)[:count - sum(result)]:
         result[index] += 1
     return result
 
 
-def split_entries(entries, ratios, rng, mode):
-    splits = {name: [] for name in SPLITS}
+def split_entries(entries, ratios, rng, mode, split_names=SPLITS):
+    splits = {name: [] for name in split_names}
     if mode != "sample":
         class_names = sorted({entry[2] for entry in entries})
         class_totals = {
@@ -96,7 +120,7 @@ def split_entries(entries, ratios, rng, mode):
             for class_name in class_names
         }
         counts = {
-            class_name: [0] * len(SPLITS)
+            class_name: [0] * len(split_names)
             for class_name in class_names
         }
         groups = grouped_entries(entries, mode)
@@ -116,8 +140,8 @@ def split_entries(entries, ratios, rng, mode):
                     cost += ((updated - target) ** 2 - (counts[class_name][index] - target) ** 2) / max(target, 1)
                 return cost
 
-            split_index = min(range(len(SPLITS)), key=lambda index: (assignment_cost(index), index))
-            splits[SPLITS[split_index]].extend(group)
+            split_index = min(range(len(split_names)), key=lambda index: (assignment_cost(index), index))
+            splits[split_names[split_index]].extend(group)
             for class_name in class_names:
                 counts[class_name][split_index] += group_counts[class_name]
         return splits
@@ -129,10 +153,44 @@ def split_entries(entries, ratios, rng, mode):
         rng.shuffle(class_entries)
         counts = split_counts(len(class_entries), ratios)
         offset = 0
-        for split, count in zip(SPLITS, counts):
+        for split, count in zip(split_names, counts):
             splits[split].extend(class_entries[offset:offset + count])
             offset += count
     return splits
+
+
+def split_entries_with_train_groups(entries, ratios, rng, train_groups):
+    """Put selected builder groups in train and split all other groups between val/test."""
+    train_entries = []
+    evaluation_entries = []
+    unsupported = []
+    for entry in entries:
+        image_id, duplicate_group = builder_identity(entry)
+        if image_id is None or duplicate_group is None:
+            unsupported.append(entry[0])
+        elif int(duplicate_group) in train_groups:
+            train_entries.append(entry)
+        else:
+            evaluation_entries.append(entry)
+    if unsupported:
+        examples = ", ".join(str(path) for path in unsupported[:3])
+        suffix = "" if len(unsupported) <= 3 else f" (and {len(unsupported) - 3} more)"
+        raise SystemExit(
+            "--train-groups requires builder filenames containing image and group IDs; "
+            f"unsupported: {examples}{suffix}"
+        )
+
+    val_test_total = ratios[1] + ratios[2]
+    if evaluation_entries and val_test_total <= 0:
+        raise SystemExit("--train-groups requires a non-zero --val or --test percentage.")
+    evaluation_ratios = (
+        ratios[1] / val_test_total if val_test_total else 0.0,
+        ratios[2] / val_test_total if val_test_total else 0.0,
+    )
+    evaluation = split_entries(
+        evaluation_entries, evaluation_ratios, rng, "duplicate", ("val", "test")
+    )
+    return {"train": train_entries, **evaluation}
 
 
 def grouped_sample(entries, target: int, rng: random.Random, mode: str):
@@ -185,6 +243,15 @@ def main() -> None:
     parser.add_argument("--test", type=float, default=10, help="Test percentage used when re-splitting.")
     parser.add_argument("--group-duplicates", action="store_true", help="Keep builder duplicate groups in one split.")
     parser.add_argument("--group-by-image", action="store_true", help="Keep all builder ROIs from each source image in one split.")
+    parser.add_argument(
+        "--train-groups",
+        type=parse_group_selection,
+        metavar="GROUPS",
+        help=(
+            "Allow only these zero-based builder group indices in train; put all other groups "
+            "in val/test. Accepts specific indices and inclusive ranges, for example 3 or 1-3,7."
+        ),
+    )
     parser.add_argument("--balance", choices=("undersample", "oversample", "none"), default="undersample")
     args = parser.parse_args()
 
@@ -202,11 +269,16 @@ def main() -> None:
         source for source in sources
         if not any((source / split).is_dir() for split in SPLITS)
     ]
-    effective_resplit = args.resplit or bool(unsplit_sources)
+    effective_resplit = args.resplit or bool(unsplit_sources) or args.train_groups is not None
     ratios = (args.train / 100, args.val / 100, args.test / 100)
     if effective_resplit and (any(ratio < 0 for ratio in ratios) or abs(sum(ratios) - 1) > 1e-9):
         raise SystemExit("--train, --val, and --test must be non-negative and add to 100.")
     mode = "image" if args.group_by_image else "duplicate" if args.group_duplicates else "sample"
+    effective_balance = (
+        "none"
+        if args.train_groups is not None and args.balance == "undersample"
+        else args.balance
+    )
 
     collected: dict[tuple[str, str], list[tuple[Path, Path, str]]] = {}
     for split in SPLITS:
@@ -240,7 +312,11 @@ def main() -> None:
         before_filter = len(all_entries)
         all_entries = [entry for entry in all_entries if not is_oversample_copy(entry)]
         removed_oversamples = before_filter - len(all_entries)
-        split_result = split_entries(all_entries, ratios, rng, mode)
+        split_result = (
+            split_entries_with_train_groups(all_entries, ratios, rng, args.train_groups)
+            if args.train_groups is not None
+            else split_entries(all_entries, ratios, rng, mode)
+        )
         selected = {
             (split, class_name): [entry for entry in split_result[split] if entry[2] == class_name]
             for split in SPLITS
@@ -256,11 +332,11 @@ def main() -> None:
     train_classes = sorted({class_name for split, class_name in selected if split == "train"})
     train_counts = [len(selected[("train", class_name)]) for class_name in train_classes]
     train_target = None
-    if args.balance != "none" and train_counts:
-        train_target = min(train_counts) if args.balance == "undersample" else max(train_counts)
+    if effective_balance != "none" and train_counts:
+        train_target = min(train_counts) if effective_balance == "undersample" else max(train_counts)
         for class_name in train_classes:
             key = "train", class_name
-            if args.balance == "undersample":
+            if effective_balance == "undersample":
                 selected[key] = grouped_sample(selected[key], train_target, rng, mode)
             else:
                 selected[key] = grouped_oversample(selected[key], train_target, rng, mode)
@@ -302,7 +378,12 @@ def main() -> None:
 
     print(f"Created: {output}")
     split_mode = "resplit (automatic for class-only source)" if unsplit_sources and not args.resplit else "resplit" if effective_resplit else "preserve"
-    print(f"Split mode: {split_mode}; grouping: {mode}; balance: {args.balance}")
+    print(f"Split mode: {split_mode}; grouping: {mode}; balance: {effective_balance}")
+    if args.train_groups is not None:
+        groups = ",".join(str(index) for index in sorted(args.train_groups))
+        print(f"Train groups (zero-based): {groups}; all other groups restricted to val/test")
+        if args.balance == "undersample":
+            print("Train undersampling disabled so every selected group remains represented.")
     if effective_resplit:
         print(f"Prior oversample copies removed before split: {removed_oversamples}")
     if train_target is not None:
