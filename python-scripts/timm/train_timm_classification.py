@@ -15,7 +15,7 @@ import numpy as np
 import timm
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler, Subset
 from torchvision import datasets, transforms
 
 
@@ -138,6 +138,25 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--train-percent",
+        type=float,
+        default=100.0,
+        help=(
+            "Percentage of each class to use from the training split. "
+            "For example, 10 uses 50 of 500 images from every class."
+        ),
+    )
+    parser.add_argument(
+        "--balance-train",
+        action=BooleanOptionalAction,
+        default=False,
+        help=(
+            "Draw an equal number of training samples from each class per epoch, "
+            "using replacement as needed. "
+            "Validation and test data are never balanced."
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path(__file__).resolve().parent / "runs" / "mobilenetv3",
@@ -196,6 +215,59 @@ def make_dataset(root: Path, transform):
     if not dataset.classes:
         raise ValueError(f"No class folders found in {root}")
     return dataset
+
+
+def class_counts(targets, class_count):
+    counts = [0] * class_count
+    for target in targets:
+        counts[target] += 1
+    return counts
+
+
+def stratified_subset_indices(targets, class_count, percent, seed):
+    """Select the requested percentage independently and deterministically per class."""
+    rng = random.Random(seed)
+    by_class = [[] for _ in range(class_count)]
+    for index, target in enumerate(targets):
+        by_class[target].append(index)
+    selected = []
+    for indices in by_class:
+        rng.shuffle(indices)
+        selected_count = max(1, int(len(indices) * percent / 100))
+        selected.extend(indices[:selected_count])
+    selected.sort()
+    return selected
+
+
+class ClassBalancedSampler(Sampler[int]):
+    """Draw an equal number of samples per class, with replacement as needed."""
+
+    def __init__(self, targets, seed):
+        self.class_indices = []
+        for class_index in range(max(targets) + 1):
+            indices = [index for index, target in enumerate(targets) if target == class_index]
+            if indices:
+                self.class_indices.append(torch.tensor(indices, dtype=torch.int64))
+        self.num_samples = len(targets)
+        self.generator = torch.Generator().manual_seed(seed)
+
+    def __len__(self):
+        return self.num_samples
+
+    def __iter__(self):
+        base_count, remainder = divmod(self.num_samples, len(self.class_indices))
+        selected = []
+        for index, indices in enumerate(self.class_indices):
+            count = base_count + (index < remainder)
+            choices = torch.randint(len(indices), (count,), generator=self.generator)
+            selected.append(indices[choices])
+        combined = torch.cat(selected)
+        order = torch.randperm(len(combined), generator=self.generator)
+        yield from combined[order].tolist()
+
+
+def balanced_sampler(targets, seed):
+    return ClassBalancedSampler(targets, seed)
 
 
 def seed_worker(worker_id):
@@ -322,6 +394,8 @@ def main() -> None:
         raise ValueError("--workers must be -1 or greater")
     if args.prefetch_factor < 1:
         raise ValueError("--prefetch-factor must be at least 1")
+    if not 0 < args.train_percent <= 100:
+        raise ValueError("--train-percent must be greater than 0 and at most 100")
 
     if args.deterministic:
         # This must be set before CUDA creates a cuBLAS workspace.
@@ -361,15 +435,27 @@ def main() -> None:
     model = timm.create_model(args.model, pretrained=True, num_classes=0)
     train_transform, config = image_transform(model, train=True)
     eval_transform, _ = image_transform(model, train=False)
-    train_set = make_dataset(data / "train", train_transform)
+    full_train_set = make_dataset(data / "train", train_transform)
     val_set = make_dataset(data / "val", eval_transform)
-    if train_set.classes != val_set.classes:
-        raise ValueError(f"Train/val classes differ: {train_set.classes} != {val_set.classes}")
+    if full_train_set.classes != val_set.classes:
+        raise ValueError(f"Train/val classes differ: {full_train_set.classes} != {val_set.classes}")
     test_set = make_dataset(data / "test", eval_transform) if (data / "test").is_dir() else None
-    if test_set is not None and train_set.classes != test_set.classes:
-        raise ValueError(f"Train/test classes differ: {train_set.classes} != {test_set.classes}")
+    if test_set is not None and full_train_set.classes != test_set.classes:
+        raise ValueError(f"Train/test classes differ: {full_train_set.classes} != {test_set.classes}")
 
-    model.reset_classifier(len(train_set.classes))
+    train_indices = stratified_subset_indices(
+        full_train_set.targets,
+        len(full_train_set.classes),
+        args.train_percent,
+        args.seed,
+    )
+    train_set = Subset(full_train_set, train_indices)
+    train_targets = [full_train_set.targets[index] for index in train_indices]
+    original_train_counts = class_counts(full_train_set.targets, len(full_train_set.classes))
+    selected_train_counts = class_counts(train_targets, len(full_train_set.classes))
+    train_sampler = balanced_sampler(train_targets, args.seed) if args.balance_train else None
+
+    model.reset_classifier(len(full_train_set.classes))
     model.to(device)
     if channels_last:
         model.to(memory_format=torch.channels_last)
@@ -385,7 +471,8 @@ def main() -> None:
         loader_args["prefetch_factor"] = args.prefetch_factor
     train_loader = DataLoader(
         train_set,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         generator=torch.Generator().manual_seed(args.seed),
         worker_init_fn=seed_worker,
         **loader_args,
@@ -409,7 +496,17 @@ def main() -> None:
         f"device={device}; workers={workers}; pin_memory={pin_memory}; "
         f"amp={amp_enabled} ({args.amp_dtype}); channels_last={channels_last}; "
         f"compile={args.compile}; deterministic={args.deterministic}; "
-        f"cudnn_benchmark={torch.backends.cudnn.benchmark}"
+        f"cudnn_benchmark={torch.backends.cudnn.benchmark}; "
+        f"train_percent={args.train_percent:g}; balance_train={args.balance_train}"
+    )
+    print(
+        "train samples by class: "
+        + ", ".join(
+            f"{class_name}={selected}/{original}"
+            for class_name, selected, original in zip(
+                full_train_set.classes, selected_train_counts, original_train_counts
+            )
+        )
     )
 
     # Keep the effective configuration alongside every run so it can be reproduced
@@ -440,6 +537,9 @@ def main() -> None:
         "cudnn_benchmark": torch.backends.cudnn.benchmark,
         "matmul_precision": args.matmul_precision,
         "seed": args.seed,
+        "train_percent": args.train_percent,
+        "balance_train": args.balance_train,
+        "balance_method": "exact class-balanced sampling with replacement" if args.balance_train else None,
         "output": str(output),
         "requested_device": args.device,
         "device": str(device),
@@ -448,9 +548,12 @@ def main() -> None:
         "scheduler": {"name": "CosineAnnealingLR", "T_max": args.epochs},
         "loss": "CrossEntropyLoss",
         "mixed_precision": amp_enabled,
-        "num_classes": len(train_set.classes),
-        "classes": train_set.classes,
+        "num_classes": len(full_train_set.classes),
+        "classes": full_train_set.classes,
+        "original_train_samples": len(full_train_set),
         "train_samples": len(train_set),
+        "original_train_samples_per_class": dict(zip(full_train_set.classes, original_train_counts)),
+        "train_samples_per_class": dict(zip(full_train_set.classes, selected_train_counts)),
         "val_samples": len(val_set),
         "test_samples": len(test_set) if test_set is not None else 0,
         "torch_version": torch.__version__,
@@ -484,7 +587,7 @@ def main() -> None:
             val_loader,
             criterion,
             device,
-            classes=train_set.classes,
+            classes=full_train_set.classes,
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
             channels_last=channels_last,
@@ -535,7 +638,7 @@ def main() -> None:
             val_accuracy,
             val_loss,
             val_metrics,
-            train_set.classes,
+            full_train_set.classes,
             config,
             args.model,
         )
@@ -548,7 +651,7 @@ def main() -> None:
                 val_accuracy,
                 val_loss,
                 val_metrics,
-                train_set.classes,
+                full_train_set.classes,
                 config,
                 args.model,
             )
@@ -582,7 +685,7 @@ def main() -> None:
 
     metadata = {
         "model_name": args.model,
-        "classes": train_set.classes,
+        "classes": full_train_set.classes,
         "data_config": config,
         "parameters": parameters,
         "training_result": {
@@ -619,7 +722,7 @@ def main() -> None:
             test_loader,
             criterion,
             device,
-            classes=train_set.classes,
+            classes=full_train_set.classes,
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
             channels_last=channels_last,
