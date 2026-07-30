@@ -144,10 +144,17 @@ def parse_args():
 
 
 def image_transform(model, *, train: bool):
-    config = timm.data.resolve_data_config(model.pretrained_cfg)
+    config = dict(timm.data.resolve_data_config(model.pretrained_cfg))
     input_size = tuple(config["input_size"])
     height, width = input_size[-2:]
     interpolation = getattr(transforms.InterpolationMode, config.get("interpolation", "bicubic").upper())
+    # This trainer deliberately resizes the complete image instead of applying
+    # timm's pretrained evaluation crop. Record the transform we actually use
+    # so checkpoints, exports, and metadata do not advertise an unused crop.
+    config.pop("crop_pct", None)
+    config.pop("crop_mode", None)
+    config["resize_mode"] = "stretch_to_input_size"
+    config["antialias"] = True
     operations = [transforms.Resize((height, width), interpolation=interpolation, antialias=True)]
     if train:
         operations.extend(
