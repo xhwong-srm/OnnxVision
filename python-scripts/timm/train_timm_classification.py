@@ -6,10 +6,12 @@ import csv
 import gc
 import json
 import os
+import random
 import sys
 from argparse import ArgumentParser, BooleanOptionalAction
 from pathlib import Path
 
+import numpy as np
 import timm
 import torch
 from torch import nn
@@ -117,6 +119,12 @@ def parse_args():
         help="Let cuDNN benchmark fixed input shapes and select faster convolution algorithms",
     )
     parser.add_argument(
+        "--deterministic",
+        action=BooleanOptionalAction,
+        default=False,
+        help="Favor reproducibility over speed with deterministic algorithms and seeded data loaders",
+    )
+    parser.add_argument(
         "--compile",
         action=BooleanOptionalAction,
         default=selected_config.get("compile", False),
@@ -188,6 +196,12 @@ def make_dataset(root: Path, transform):
     if not dataset.classes:
         raise ValueError(f"No class folders found in {root}")
     return dataset
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def classification_metrics(confusion_matrix, classes):
@@ -309,6 +323,12 @@ def main() -> None:
     if args.prefetch_factor < 1:
         raise ValueError("--prefetch-factor must be at least 1")
 
+    if args.deterministic:
+        # This must be set before CUDA creates a cuBLAS workspace.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -316,7 +336,12 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
     torch.set_float32_matmul_precision(args.matmul_precision)
-    torch.backends.cudnn.benchmark = args.cudnn_benchmark and device.type == "cuda"
+    if args.deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True)
+    else:
+        torch.backends.cudnn.benchmark = args.cudnn_benchmark and device.type == "cuda"
 
     cpu_count = os.cpu_count() or 1
     workers = args.workers
@@ -358,8 +383,20 @@ def main() -> None:
     }
     if workers > 0:
         loader_args["prefetch_factor"] = args.prefetch_factor
-    train_loader = DataLoader(train_set, shuffle=True, **loader_args)
-    val_loader = DataLoader(val_set, shuffle=False, **loader_args)
+    train_loader = DataLoader(
+        train_set,
+        shuffle=True,
+        generator=torch.Generator().manual_seed(args.seed),
+        worker_init_fn=seed_worker,
+        **loader_args,
+    )
+    val_loader = DataLoader(
+        val_set,
+        shuffle=False,
+        generator=torch.Generator().manual_seed(args.seed + 1),
+        worker_init_fn=seed_worker,
+        **loader_args,
+    )
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(training_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -371,7 +408,8 @@ def main() -> None:
     print(
         f"device={device}; workers={workers}; pin_memory={pin_memory}; "
         f"amp={amp_enabled} ({args.amp_dtype}); channels_last={channels_last}; "
-        f"compile={args.compile}; cudnn_benchmark={torch.backends.cudnn.benchmark}"
+        f"compile={args.compile}; deterministic={args.deterministic}; "
+        f"cudnn_benchmark={torch.backends.cudnn.benchmark}"
     )
 
     # Keep the effective configuration alongside every run so it can be reproduced
@@ -398,6 +436,7 @@ def main() -> None:
         "amp_dtype": args.amp_dtype if amp_enabled else None,
         "channels_last": channels_last,
         "compile": args.compile,
+        "deterministic": args.deterministic,
         "cudnn_benchmark": torch.backends.cudnn.benchmark,
         "matmul_precision": args.matmul_precision,
         "seed": args.seed,
@@ -567,6 +606,8 @@ def main() -> None:
             num_workers=0,
             pin_memory=pin_memory,
             persistent_workers=False,
+            generator=torch.Generator().manual_seed(args.seed + 2),
+            worker_init_fn=seed_worker,
         )
         best = torch.load(output / "best.pt", map_location="cpu", weights_only=False)
         checkpoint_epoch = best["epoch"]
