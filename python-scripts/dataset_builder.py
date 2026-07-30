@@ -178,12 +178,40 @@ def split_samples(samples, ratios, rng, group_duplicates=False, group_by_source=
             sample_groups.setdefault(key, []).append(sample)
         groups = list(sample_groups.values())
         rng.shuffle(groups)
-        counts = split_counts(len(groups), ratios)
-        offset = 0
-        for name, count in zip(split_names, counts):
-            for group in groups[offset:offset + count]:
-                splits[name].extend(group)
-            offset += count
+        groups.sort(key=len, reverse=True)
+        class_ids = sorted({sample[1].class_id for sample in samples})
+        class_totals = {
+            class_id: sum(sample[1].class_id == class_id for sample in samples)
+            for class_id in class_ids
+        }
+        targets = {
+            class_id: split_counts(class_totals[class_id], ratios)
+            for class_id in class_ids
+        }
+        current = {class_id: [0] * len(split_names) for class_id in class_ids}
+        for group in groups:
+            group_counts = {
+                class_id: sum(sample[1].class_id == class_id for sample in group)
+                for class_id in class_ids
+            }
+
+            def assignment_cost(split_index):
+                cost = 0.0
+                for class_id in class_ids:
+                    target = targets[class_id][split_index]
+                    updated = current[class_id][split_index] + group_counts[class_id]
+                    previous_error = current[class_id][split_index] - target
+                    updated_error = updated - target
+                    cost += (updated_error ** 2 - previous_error ** 2) / max(target, 1)
+                return cost
+
+            split_index = min(
+                range(len(split_names)),
+                key=lambda index: (assignment_cost(index), index),
+            )
+            splits[split_names[split_index]].extend(group)
+            for class_id in class_ids:
+                current[class_id][split_index] += group_counts[class_id]
         return splits
 
     by_class = {}

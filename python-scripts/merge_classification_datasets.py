@@ -86,14 +86,40 @@ def split_counts(count: int, ratios: tuple[float, float, float]) -> list[int]:
 def split_entries(entries, ratios, rng, mode):
     splits = {name: [] for name in SPLITS}
     if mode != "sample":
+        class_names = sorted({entry[2] for entry in entries})
+        class_totals = {
+            class_name: sum(entry[2] == class_name for entry in entries)
+            for class_name in class_names
+        }
+        targets = {
+            class_name: split_counts(class_totals[class_name], ratios)
+            for class_name in class_names
+        }
+        counts = {
+            class_name: [0] * len(SPLITS)
+            for class_name in class_names
+        }
         groups = grouped_entries(entries, mode)
         rng.shuffle(groups)
-        counts = split_counts(len(groups), ratios)
-        offset = 0
-        for split, count in zip(SPLITS, counts):
-            for group in groups[offset:offset + count]:
-                splits[split].extend(group)
-            offset += count
+        groups.sort(key=len, reverse=True)
+        for group in groups:
+            group_counts = {
+                class_name: sum(entry[2] == class_name for entry in group)
+                for class_name in class_names
+            }
+
+            def assignment_cost(index: int) -> float:
+                cost = 0.0
+                for class_name in class_names:
+                    target = targets[class_name][index]
+                    updated = counts[class_name][index] + group_counts[class_name]
+                    cost += ((updated - target) ** 2 - (counts[class_name][index] - target) ** 2) / max(target, 1)
+                return cost
+
+            split_index = min(range(len(SPLITS)), key=lambda index: (assignment_cost(index), index))
+            splits[SPLITS[split_index]].extend(group)
+            for class_name in class_names:
+                counts[class_name][split_index] += group_counts[class_name]
         return splits
 
     by_class = {}
