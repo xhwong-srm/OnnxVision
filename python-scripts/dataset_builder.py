@@ -2,8 +2,9 @@
 
 The editor works on full source images.  ROIs can be drawn, moved with the
 right mouse button, multi-selected with Ctrl, learned as a template pattern,
-auto-populated to image edges, classified with an embedded ONNX classifier,
-and exported as class-folder crops, optionally split into train/val/test.
+auto-populated to image edges or placed by a YOLO detection ONNX model,
+classified with an embedded ONNX classifier, and exported as class-folder
+crops, optionally split into train/val/test.
 """
 from __future__ import annotations
 
@@ -601,7 +602,7 @@ class ImageView(QGraphicsView):
 
 class MainWindow(QMainWindow):
     def __init__(self, initial_model=None):
-        super().__init__(); self.setWindowTitle("Classification ROI Dataset Builder"); self.resize(1450, 850); self.entries=[]; self.classes=[]; self.patterns=[]; self.current=-1; self.items=[]; self.pattern_items=[]; self.roi_clipboard=[]; self.learning_pattern=False; self.pattern_roi_indices=[]; self.model_path=Path(initial_model).resolve() if initial_model else None; self.session=None; self.input_name=None; self.kind=None; self.names={}
+        super().__init__(); self.setWindowTitle("Classification ROI Dataset Builder"); self.resize(1450, 850); self.entries=[]; self.classes=[]; self.patterns=[]; self.current=-1; self.items=[]; self.pattern_items=[]; self.roi_clipboard=[]; self.learning_pattern=False; self.pattern_roi_indices=[]; self.model_path=Path(initial_model).resolve() if initial_model else None; self.session=None; self.input_name=None; self.input_info=None; self.model_task=None; self.kind=None; self.names={}; self.model_class_ids={}
         root=QWidget(); self.setCentralWidget(root); layout=QHBoxLayout(root)
         left=QVBoxLayout(); left.addWidget(QLabel("Images")); self.images=QListWidget(); self.images.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection); self.images.currentRowChanged.connect(self.select); left.addWidget(self.images,1)
         for text, fn in (("Add images...",self.add_images),("Add folder...",self.add_folder),("Load COCO detection dataset(s)...",self.load_detection),("Locate image by 12-char hash...",self.locate_image_by_hash),("Remove selected image(s)",self.remove_selected_images),("Remove repeated images",self.remove_repeated_images),("Delete ROIs on current",self.clear_current),("Delete ROIs on all",self.clear_all),("Clear images",self.clear_images)):
@@ -659,7 +660,9 @@ class MainWindow(QMainWindow):
         model_section=QVBoxLayout()
         b=QPushButton("Choose ONNX model..."); b.clicked.connect(self.choose_model); model_section.addWidget(b); self.model_label=QLabel(); self.model_label.setWordWrap(True); model_section.addWidget(self.model_label)
         for text, fn in (("Auto-label current",lambda:self.auto_label(False)),("Auto-label all",lambda:self.auto_label(True))): b=QPushButton(text); b.clicked.connect(fn); model_section.addWidget(b)
-        right.addWidget(CollapsibleSection("ONNX auto-labeling",model_section))
+        self.detection_confidence=self.spin(.25,0,1,.05); model_section.addWidget(QLabel("Detection confidence")); model_section.addWidget(self.detection_confidence)
+        for text, fn in (("Auto-place detections on current",lambda:self.auto_detect(False)),("Auto-place detections on all",lambda:self.auto_detect(True))): b=QPushButton(text); b.clicked.connect(fn); model_section.addWidget(b)
+        right.addWidget(CollapsibleSection("ONNX labeling and detection",model_section))
 
         export_section=QVBoxLayout(); export_section.addWidget(QLabel("Split % (train / val / test)")); self.split=[self.spin(x,0,100,1) for x in (70,20,10)]; row=QHBoxLayout(); [row.addWidget(x) for x in self.split]; export_section.addLayout(row)
         self.group_duplicates=QCheckBox("Keep duplicate ROIs in one split")
@@ -1124,33 +1127,75 @@ class MainWindow(QMainWindow):
                 accepted.append(candidate); entry.rois.append(candidate)
         self.select(self.current); self.update("Auto-population complete")
     def choose_model(self):
-        value,_=QFileDialog.getOpenFileName(self,"Choose ONNX classifier","","ONNX model (*.onnx)");
-        if value: self.model_path=Path(value).resolve(); self.session=None; self.update()
+        value,_=QFileDialog.getOpenFileName(self,"Choose ONNX model","","ONNX model (*.onnx)");
+        if value: self.model_path=Path(value).resolve(); self.session=None; self.model_task=None; self.update()
     def load_model(self):
         if not self.model_path or not self.model_path.is_file(): raise ValueError("Choose an ONNX model first.")
         if self.session: return
         import onnxruntime as ort
         self.session=ort.InferenceSession(str(self.model_path),providers=["CPUExecutionProvider"]); inputs=self.session.get_inputs()
         if len(inputs)!=1: raise ValueError("Expected one model input.")
-        self.input_name=inputs[0].name; self.kind="bw8" if self.input_name=="images_bw8_uint8_nchw" else "c24" if self.input_name=="images_c24_uint8_nhwc_bgr" else None
-        if not self.kind: raise ValueError(f"Unsupported embedded classifier input: {self.input_name}")
+        self.input_info=inputs[0]; self.input_name=self.input_info.name
+        self.kind="bw8" if self.input_name=="images_bw8_uint8_nchw" else "c24" if self.input_name=="images_c24_uint8_nhwc_bgr" else None
+        output_names={output.name for output in self.session.get_outputs()}
+        self.model_task="detect" if {"boxes","scores","class_ids"} <= output_names else "classify"
+        if self.model_task=="classify" and not self.kind: raise ValueError(f"Unsupported embedded classifier input: {self.input_name}")
+        if self.model_task=="detect" and not self.kind and self.input_info.type!="tensor(float)":
+            raise ValueError(f"Unsupported detection input: {self.input_name} ({self.input_info.type})")
         raw=self.session.get_modelmeta().custom_metadata_map.get("names", "{}")
-        try: parsed=ast.literal_eval(raw); self.names={int(k):str(v) for k,v in (parsed.items() if isinstance(parsed,dict) else enumerate(parsed))}
-        except (SyntaxError,ValueError): self.names={}
-        for name in self.names.values():
-            if name.casefold() not in {value.casefold() for value in self.classes}:
-                self.classes.append(name); self.class_list.addItem(name)
+        try:
+            try: parsed=json.loads(raw)
+            except json.JSONDecodeError: parsed=ast.literal_eval(raw)
+            self.names={int(k):str(v) for k,v in (parsed.items() if isinstance(parsed,dict) else enumerate(parsed))}
+        except (SyntaxError,ValueError,TypeError): self.names={}
+        existing={name.casefold():index for index,name in enumerate(self.classes)}
+        self.model_class_ids={}
+        for model_id,name in sorted(self.names.items()):
+            class_id=existing.get(name.casefold())
+            if class_id is None:
+                class_id=len(self.classes); self.classes.append(name); self.class_list.addItem(name); existing[name.casefold()]=class_id
+            self.model_class_ids[model_id]=class_id
+    def model_input(self, image):
+        if self.kind=="bw8": return np.asarray(image.convert("L"),dtype=np.uint8)[None,None]
+        if self.kind=="c24": return np.asarray(image.convert("RGB"),dtype=np.uint8)[...,::-1].copy()[None]
+        height,width=int(self.input_info.shape[2]),int(self.input_info.shape[3])
+        return np.asarray(image.convert("RGB").resize((width,height)),dtype=np.float32).transpose(2,0,1)[None]/255.0
     def auto_label(self, all_images):
         targets=self.entries if all_images else ([self.entries[self.current]] if 0<=self.current<len(self.entries) else [])
         try: self.load_model()
         except Exception as e: QMessageBox.critical(self,"ONNX load failed",str(e)); return
+        if self.model_task!="classify": QMessageBox.information(self,"Classifier required","The selected ONNX model is an object detector. Use Auto-place detections."); return
         count=0
         for entry in targets:
             image=load_image(entry.path).convert("RGB")
             for roi in entry.rois:
-                x,y,w,h=roi.rect; crop=image.crop((x,y,x+w,y+h)); tensor=np.asarray(crop.convert("L"),dtype=np.uint8)[None,None] if self.kind=="bw8" else np.asarray(crop,dtype=np.uint8)[...,::-1].copy()[None]
-                scores=self.session.run(None,{self.input_name:tensor})[0][0]; index=int(np.argmax(scores)); roi.class_id=index if index<len(self.classes) else roi.class_id; roi.confidence=float(scores[index]); count+=1
+                x,y,w,h=roi.rect; scores=self.session.run(None,{self.input_name:self.model_input(image.crop((x,y,x+w,y+h)))})[0][0]; index=int(np.argmax(scores)); roi.class_id=self.model_class_ids.get(index,roi.class_id); roi.confidence=float(scores[index]); count+=1
         self.select(self.current); self.update(f"Auto-labeled {count} ROI(s)")
+    def auto_detect(self, all_images):
+        targets=self.entries if all_images else ([self.entries[self.current]] if 0<=self.current<len(self.entries) else [])
+        if not targets: self.update("Add or select an image before auto-placing detections"); return
+        try: self.load_model()
+        except Exception as e: QMessageBox.critical(self,"ONNX load failed",str(e)); return
+        if self.model_task!="detect": QMessageBox.information(self,"Detector required","The selected ONNX model is a classifier. Use Auto-label."); return
+        if not self.names: QMessageBox.critical(self,"Class names missing","The detector ONNX metadata does not contain class names."); return
+        added=0; threshold=self.detection_confidence.value()
+        try:
+            for entry in targets:
+                image=load_image(entry.path).convert("RGB"); width,height=image.size
+                outputs={output.name:np.asarray(value) for output,value in zip(self.session.get_outputs(),self.session.run(None,{self.input_name:self.model_input(image)}))}
+                candidates=[]
+                for box,score,model_id in zip(outputs["boxes"][0],outputs["scores"][0],outputs["class_ids"][0]):
+                    score=float(score); model_id=int(model_id)
+                    if score<threshold or model_id not in self.model_class_ids: continue
+                    left,top,right,bottom=np.clip(np.asarray(box,dtype=float),0.0,1.0)
+                    x1=int(round(left*width)); y1=int(round(top*height)); x2=int(round(right*width)); y2=int(round(bottom*height))
+                    if x2<=x1 or y2<=y1: continue
+                    candidates.append(ROI((x1,y1,x2-x1,y2-y1),self.model_class_ids[model_id],score))
+                for candidate in sorted(candidates,key=lambda roi:roi.confidence or 0,reverse=True):
+                    if any(iou(candidate.rect,old.rect)>.5 for old in entry.rois): continue
+                    entry.rois.append(candidate); added+=1
+        except Exception as e: QMessageBox.critical(self,"Detection failed",str(e)); return
+        self.select(self.current); self.update(f"Auto-placed {added} detection ROI(s)")
     def export_detection(self):
         labeled_entries=[
             entry for entry in self.entries
