@@ -32,6 +32,40 @@ checkpoint can be supplied with `--checkpoint`. ONNXSlim optimization is
 enabled by default; use `--no-simplify` only when producing an unsimplified
 diagnostic reference graph.
 
+To evaluate a lower fixed inference resolution, pass a multiple of 16:
+
+```powershell
+uv run python python-scripts\rf-detr\export_rfdetr_detection.py `
+  --checkpoint C:\path\to\checkpoint.pth --resolution 320 `
+  --output artifacts\detector-r320.onnx
+```
+
+Changing the exported inference resolution does not retrain the checkpoint, so
+measure accuracy on the target dataset before deployment.
+
+For selective static INT8 quantization, calibrate on representative training
+images. Decoder attention `MatMul` nodes intentionally remain floating point;
+whole-graph MatMul quantization is not compatible with this RF-DETR graph in
+the tested ONNX Runtime:
+
+```powershell
+uv run python python-scripts\rf-detr\quantize_rfdetr_detection.py `
+  --input artifacts\detector-r320-c24.onnx `
+  --output artifacts\detector-r320-c24-int8.onnx `
+  --mode static `
+  --calibration-images images\v6\seal_pocket_v1-rfdetr\train `
+  --operators Conv Gemm
+```
+
+Compare COCO metrics and the production confidence/NMS operating point:
+
+```powershell
+uv run python python-scripts\rf-detr\evaluate_rfdetr_onnx.py `
+  --models artifacts\detector-r320-c24.onnx artifacts\detector-r320-c24-int8.onnx `
+  --dataset images\v6\seal_pocket_v1-rfdetr\test `
+  --confidence 0.5 --nms-iou 0.5
+```
+
 Run the native-versus-ONNX experiment on RF-DETR's documented dog image:
 
 ```powershell

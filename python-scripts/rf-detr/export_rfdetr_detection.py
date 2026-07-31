@@ -34,6 +34,11 @@ STD = (0.229, 0.224, 0.225)
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, help="Optional RF-DETR Nano checkpoint")
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        help="Override the square RF-DETR inference resolution (must be divisible by 16)",
+    )
     parser.add_argument("--output", type=Path, default=Path("artifacts/rfdetr-nano-detection.onnx"))
     parser.add_argument("--bw8-output", type=Path)
     parser.add_argument("--c24-output", type=Path)
@@ -237,7 +242,9 @@ def validate_model(path: Path, image_path: Path) -> None:
         elif input_metadata.type == "tensor(uint8)":
             value = np.asarray(image.convert("RGB"), dtype=np.uint8)[..., ::-1].copy()[None]
         else:
-            rgb = image.convert("RGB").resize((384, 384))
+            height = int(input_metadata.shape[2])
+            width = int(input_metadata.shape[3])
+            rgb = image.convert("RGB").resize((width, height))
             value = np.asarray(rgb, dtype=np.float32).transpose(2, 0, 1)[None] / 255.0
             value = (value - np.asarray(MEAN, dtype=np.float32)[None, :, None, None])
             value /= np.asarray(STD, dtype=np.float32)[None, :, None, None]
@@ -263,9 +270,15 @@ def main() -> None:
     args = parse_args()
     if args.max_detections <= 0:
         raise ValueError("--max-detections must be positive")
+    if args.resolution is not None and (
+        args.resolution < 32 or args.resolution % 16 != 0
+    ):
+        raise ValueError("--resolution must be at least 32 and divisible by 16")
     kwargs = {}
     if args.checkpoint:
         kwargs["pretrain_weights"] = str(args.checkpoint.expanduser().resolve())
+    if args.resolution is not None:
+        kwargs["resolution"] = args.resolution
     model = RFDETRNano(**kwargs)
     class_names = list(model.class_names)
     source_class_ids = list(COCO_CLASSES) if class_names == list(COCO_CLASSES.values()) else list(range(len(class_names)))
