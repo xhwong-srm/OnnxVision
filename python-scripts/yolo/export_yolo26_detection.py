@@ -32,6 +32,13 @@ def parse_args():
     parser.add_argument("--c24-output", type=Path)
     parser.add_argument("--opset", type=int, default=18)
     parser.add_argument(
+        "--quantize",
+        type=int,
+        choices=(16, 32),
+        default=32,
+        help="ONNX floating-point precision: 16 reduces model size; 32 maximizes compatibility (default: 32)",
+    )
+    parser.add_argument(
         "--export-confidence",
         type=float,
         default=0.001,
@@ -94,6 +101,36 @@ def set_metadata(model: onnx.ModelProto, values: dict[str, str]) -> None:
         entry.key, entry.value = key, value
 
 
+def topologically_sort_nodes(model: onnx.ModelProto) -> None:
+    """Stable-sort graph nodes after Ultralytics FP16 conversion moves input Casts."""
+    available = (
+        {item.name for item in model.graph.input}
+        | {item.name for item in model.graph.initializer}
+        | {item.name for item in model.graph.sparse_initializer}
+    )
+    pending = list(model.graph.node)
+    ordered: list[onnx.NodeProto] = []
+    while pending:
+        ready = [
+            node for node in pending
+            if all(not name or name in available for name in node.input)
+        ]
+        if not ready:
+            unresolved = sorted({
+                name
+                for node in pending
+                for name in node.input
+                if name and name not in available
+            })
+            raise ValueError(f"Cannot topologically sort ONNX graph; unresolved inputs: {unresolved}")
+        ready_ids = {id(node) for node in ready}
+        pending = [node for node in pending if id(node) not in ready_ids]
+        ordered.extend(ready)
+        available.update(name for node in ready for name in node.output if name)
+    del model.graph.node[:]
+    model.graph.node.extend(ordered)
+
+
 def canonicalize(official: Path, output: Path, resolution: int, names: dict[int, str]) -> None:
     model = onnx.load(official)
     if len(model.graph.output) != 1:
@@ -142,6 +179,7 @@ def canonicalize(official: Path, output: Path, resolution: int, names: dict[int,
             "resize_mode": "stretch",
         },
     )
+    topologically_sort_nodes(model)
     onnx.checker.check_model(model)
     output.parent.mkdir(parents=True, exist_ok=True)
     onnx.save(model, output)
@@ -173,6 +211,7 @@ def finish_wrapper(
     del core.graph.node[:]
     core.graph.node.extend(nodes + original)
     set_metadata(core, metadata)
+    topologically_sort_nodes(core)
     onnx.checker.check_model(core)
     output.parent.mkdir(parents=True, exist_ok=True)
     onnx.save(core, output)
@@ -779,6 +818,7 @@ def main() -> None:
         yolo.export(
             format="onnx", imgsz=args.resolution, batch=1, dynamic=False,
             simplify=args.simplify, opset=args.opset, conf=args.export_confidence,
+            quantize=args.quantize,
         )
     ).resolve()
     output = args.output.resolve()
