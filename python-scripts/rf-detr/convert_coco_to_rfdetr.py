@@ -19,8 +19,6 @@ from argparse import ArgumentParser
 from pathlib import Path
 from typing import Any
 
-from validate_coco_detection_dataset import validate_dataset
-
 
 def parse_args():
     parser = ArgumentParser(description=__doc__)
@@ -126,7 +124,6 @@ def main() -> None:
     output = args.output.resolve()
     if not dataset.is_dir():
         raise FileNotFoundError(f"Dataset root does not exist: {dataset}")
-    validate_dataset(dataset, require_rfdetr_splits=True)
     if output.exists():
         if any(output.iterdir()):
             raise FileExistsError(f"Output directory must be new or empty: {output}")
