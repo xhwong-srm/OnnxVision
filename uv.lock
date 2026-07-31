@@ -21,6 +21,7 @@ name = "0603-seal"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "libreyolo" },
     { name = "onnx" },
     { name = "onnxruntime" },
     { name = "onnxruntime-gpu" },
@@ -39,6 +40,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "libreyolo", specifier = ">=1.4.0" },
     { name = "onnx", specifier = ">=1.22.0" },
     { name = "onnxruntime", specifier = ">=1.27.0" },
     { name = "onnxruntime-gpu", specifier = "<1.27" },
@@ -1443,6 +1445,30 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/b1/62/f3855e36213a8815ae933238b68f67c7435d7f76d36a1f08da3b8a6517a3/kornia_rs-0.1.14-cp314-cp314t-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:4cb1a72ea7ce13a2971af16f28409c080560aa332431b3552c633197316e0869", size = 3377938, upload-time = "2026-05-19T07:45:19.273Z" },
     { url = "https://files.pythonhosted.org/packages/63/56/408f1fa7308c5ea8b3d7f5338d121580ef692f7e32858ee35f6969c158b6/kornia_rs-0.1.14-cp314-cp314t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:2dc1942acd2e6cbf28f1e056518db751264550f9aaa61760ce01ede266e42b61", size = 3687771, upload-time = "2026-05-19T07:45:37.952Z" },
     { url = "https://files.pythonhosted.org/packages/22/0b/bb6d1904f92a4f1d05edb4ac39513fd7a3babc48c889bd137f09d4fd5668/kornia_rs-0.1.14-cp314-cp314t-win_amd64.whl", hash = "sha256:26b13fbf0a22c133a1957defca8460faceeb22c7ce1ab37a6f4a658944682c58", size = 3360061, upload-time = "2026-05-19T07:46:23.27Z" },
+]
+
+[[package]]
+name = "libreyolo"
+version = "1.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+    { name = "numpy" },
+    { name = "opencv-python" },
+    { name = "pillow" },
+    { name = "pycocotools" },
+    { name = "pyyaml" },
+    { name = "requests" },
+    { name = "safetensors" },
+    { name = "scipy" },
+    { name = "torch" },
+    { name = "torchvision" },
+    { name = "tqdm" },
+    { name = "typer" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/be/4f/8cd20f3dde42400feb57242fe345705a72f9b3a78682dd1a5dca15c9856f/libreyolo-1.4.0.tar.gz", hash = "sha256:33732eb0b5e1e70501dca71bebb532bbcaba9fb8fea48024918df18f90073ace", size = 5778601, upload-time = "2026-07-24T13:38:12.047Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ef/02/4966bf4f23fec52cf52d66c540520278d4b7aa8fd9585e0ab415477a9dd1/libreyolo-1.4.0-py3-none-any.whl", hash = "sha256:65cdd653ef238bf0a13a3b3ad4d15640df29d36984893d817674d23eeffdd8d7", size = 6100805, upload-time = "2026-07-24T13:38:10.284Z" },
 ]
 
 [[package]]
