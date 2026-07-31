@@ -13,6 +13,7 @@
 
   <ItemGroup>
     <Compile Include="ImageClassifier.cs" />
+    <Compile Include="ObjectDetector.cs" />
     <PackageReference Include="Intel.ML.OnnxRuntime.OpenVino" Version="1.24.1" />
     <Reference Include="Open_eVision_NetApi_22_12">
       <HintPath>C:\VisionRef64\Open_eVision_NetApi_22_12.dll</HintPath>

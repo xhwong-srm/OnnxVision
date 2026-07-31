@@ -1,6 +1,67 @@
 # ONNX Vision for C# (.NET Framework 4.6.1)
 
-`OnnxVision` is a model-agnostic ONNX computer-vision runtime for .NET Framework. Its current `ImageClassifier` component runs classification models in-process with ONNX Runtime; the project name intentionally leaves room for future object-detection and segmentation components. Image ownership and ROI access use Euresys Open eVision 22.12.
+`OnnxVision` is a model-agnostic ONNX computer-vision runtime for .NET Framework. Its `ImageClassifier` and `ObjectDetector` components run models in-process with ONNX Runtime. Image ownership and ROI access use Euresys Open eVision 22.12.
+
+## Object detection
+
+`ObjectDetector` deliberately consumes an exporter-owned contract instead of
+model-specific RF-DETR or YOLO tensors. Detection models must contain:
+
+- metadata `vision_task=object_detection`
+- metadata `detection_contract=onnx-vision-detection-v1`
+- metadata `names` containing a contiguous zero-based class mapping
+- `boxes`: float32 `[1,N,4]`, normalized `xyxy`, clamped to `[0,1]`
+- `scores`: float32 `[1,N]` confidence probabilities, descending
+- `class_ids`: int64 `[1,N]`, zero-based indices into `names`
+- one raw BW8 `uint8 [1,1,H,W]` or C24 BGR `uint8 [1,H,W,3]` input
+
+The exporter owns model preprocessing, logits decoding, box conversion, and
+any model-specific class-ID remapping. C# owns the runtime confidence threshold,
+coordinate scaling, and optional class-aware NMS. A future model family only
+needs an exporter that produces this same contract.
+
+Export the pretrained RF-DETR Nano model:
+
+```powershell
+uv run python python-scripts\rf-detr\export_rfdetr_detection.py `
+  --output artifacts\rfdetr-nano-detection.onnx
+```
+
+This also creates `-bw8.onnx` and `-c24.onnx` raw-image variants. A fine-tuned
+checkpoint can be supplied with `--checkpoint`.
+
+Run the native-versus-ONNX experiment on RF-DETR's documented dog image:
+
+```powershell
+uv run python python-scripts\rf-detr\experiment_rfdetr_nano_onnx.py `
+  --model artifacts\rfdetr-nano-detection-c24.onnx
+```
+
+Run the same exported model in C#:
+
+```powershell
+& onnx-vision\bin\Release\net461\win7-x64\OnnxVision.exe detect `
+  artifacts\rfdetr-nano-detection-c24.onnx `
+  artifacts\rfdetr-nano-experiment\source.jpg 0.5 cpu
+```
+
+Library use:
+
+```csharp
+using (var detector = new ObjectDetector(modelPath))
+{
+    IReadOnlyList<Detection> detections = detector.Detect(
+        image, confidenceThreshold: 0.5f, nmsIouThreshold: 0.7f);
+}
+```
+
+Detection coordinates are in pixels relative to the image or ROI passed to
+`Detect`. Keep one detector alive and reuse it; instances are not thread-safe.
+
+The RF-DETR Nano detection path was validated with the standard CPU build.
+The current OpenVINO 1.24.1 provider can load and execute the graph, but its
+scores differed materially on the example image, so it is not a parity-validated
+deployment path for this model yet.
 
 Classification models must follow the documented wrapper contract: raw BW8 `uint8 [1,1,H,W]` NCHW or raw C24 BGR `uint8 [1,H,W,3]` NHWC input, preprocessing embedded in the ONNX graph, one float score per class as output, and ordered class names supplied explicitly or stored in ONNX metadata under `names`. The model architecture does not need to be YOLO.
 

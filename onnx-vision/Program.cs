@@ -16,6 +16,9 @@ namespace OnnxVision
 
         private static int Main(string[] args)
         {
+            if (args.Length > 0 && string.Equals(args[0], "detect", StringComparison.OrdinalIgnoreCase))
+                return RunDetection(args);
+
             if (args.Length != 2 && args.Length != 3 && args.Length != 6 && args.Length != 7)
             {
                 Console.Error.WriteLine("Usage: OnnxVision.exe <model.onnx> <test-directory> [cpu|directml|openvino-cpu|openvino-gpu] [roi-x roi-y roi-width roi-height]");
@@ -60,6 +63,62 @@ namespace OnnxVision
                 RunEvaluation(classifier, testDirectory, images);
             }
 
+            return 0;
+        }
+
+        private static int RunDetection(string[] args)
+        {
+            if (args.Length < 3 || args.Length > 5)
+            {
+                Console.Error.WriteLine(
+                    "Usage: OnnxVision.exe detect <model.onnx> <image-or-directory> [confidence] [cpu|directml|openvino-cpu|openvino-gpu]");
+                return 2;
+            }
+
+            var modelPath = Path.GetFullPath(args[1]);
+            var imageSource = Path.GetFullPath(args[2]);
+            var threshold = 0.5f;
+            if (args.Length >= 4 && !float.TryParse(
+                args[3], System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out threshold))
+            {
+                Console.Error.WriteLine("Confidence must be a number between zero and one.");
+                return 2;
+            }
+            var provider = ExecutionProvider.Cpu;
+            if (args.Length == 5 && !TryParseExecutionProviderName(args[4], out provider))
+            {
+                Console.Error.WriteLine("Execution provider must be 'cpu', 'directml', 'openvino-cpu', or 'openvino-gpu'.");
+                return 2;
+            }
+            if (!File.Exists(modelPath) || (!File.Exists(imageSource) && !Directory.Exists(imageSource)))
+            {
+                Console.Error.WriteLine("Model or image source does not exist.");
+                return 2;
+            }
+            var images = File.Exists(imageSource)
+                ? new[] { imageSource }
+                : Directory.EnumerateFiles(imageSource, "*", SearchOption.AllDirectories)
+                    .Where(path => Extensions.Contains(Path.GetExtension(path)))
+                    .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+
+            using (var detector = new ObjectDetector(modelPath, null, provider))
+            {
+                Console.WriteLine("Detection contract: onnx-vision-detection-v1");
+                Console.WriteLine("Input contract: " + detector.InputDescription);
+                foreach (var image in images)
+                {
+                    var detections = detector.Detect(image, threshold, 0.7f);
+                    Console.WriteLine("{0}: {1} detection(s)", image, detections.Count);
+                    foreach (var detection in detections)
+                        Console.WriteLine("  {0} {1:F4} [{2:F1}, {3:F1}, {4:F1}, {5:F1}]",
+                            detection.Name, detection.Confidence,
+                            detection.X1, detection.Y1, detection.X2, detection.Y2);
+                }
+                Console.WriteLine("Preprocess: {0:F3} ms/image", detector.PreprocessMilliseconds / Math.Max(1, images.Length));
+                Console.WriteLine("ONNX inference: {0:F3} ms/image", detector.InferenceMilliseconds / Math.Max(1, images.Length));
+            }
             return 0;
         }
 
@@ -271,6 +330,29 @@ namespace OnnxVision
                 return true;
             }
 
+            return false;
+        }
+
+        private static bool TryParseExecutionProviderName(string value, out ExecutionProvider executionProvider)
+        {
+            executionProvider = ExecutionProvider.Cpu;
+            if (string.Equals(value, "cpu", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (string.Equals(value, "directml", StringComparison.OrdinalIgnoreCase))
+            {
+                executionProvider = ExecutionProvider.DirectML;
+                return true;
+            }
+            if (string.Equals(value, "openvino-cpu", StringComparison.OrdinalIgnoreCase))
+            {
+                executionProvider = ExecutionProvider.OpenVinoCpu;
+                return true;
+            }
+            if (string.Equals(value, "openvino-gpu", StringComparison.OrdinalIgnoreCase))
+            {
+                executionProvider = ExecutionProvider.OpenVinoGpu;
+                return true;
+            }
             return false;
         }
 

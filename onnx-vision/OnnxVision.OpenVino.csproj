@@ -13,6 +13,7 @@
 
   <ItemGroup>
     <Compile Remove="ImageClassifier.cs" />
+    <Compile Remove="ObjectDetector.cs" />
     <ProjectReference Include="OnnxVision.OpenVino.Backend.csproj" />
     <Reference Include="Open_eVision_NetApi_22_12">
       <HintPath>C:\VisionRef64\Open_eVision_NetApi_22_12.dll</HintPath>
