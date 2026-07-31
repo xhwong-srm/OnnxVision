@@ -28,7 +28,9 @@ uv run python python-scripts\rf-detr\export_rfdetr_detection.py `
 ```
 
 This also creates `-bw8.onnx` and `-c24.onnx` raw-image variants. A fine-tuned
-checkpoint can be supplied with `--checkpoint`.
+checkpoint can be supplied with `--checkpoint`. ONNXSlim optimization is
+enabled by default; use `--no-simplify` only when producing an unsimplified
+diagnostic reference graph.
 
 Run the native-versus-ONNX experiment on RF-DETR's documented dog image:
 
@@ -45,6 +47,18 @@ Run the same exported model in C#:
   artifacts\rfdetr-nano-experiment\source.jpg 0.5 cpu
 ```
 
+Run a warmed multi-image benchmark without per-detection console overhead:
+
+```powershell
+& onnx-vision\bin\Release\net461\win7-x64\OnnxVision.exe benchmark-detect `
+  artifacts\seal-pocket-rfdetr-nano-c24.onnx `
+  images\v6\seal_pocket_v1-rfdetr\test 0.5 3 cpu
+```
+
+The benchmark performs up to ten warm-up images, resets detector timings, then
+reports session construction, wall time, preprocessing, ONNX inference,
+detection totals, confidence sum, and per-class counts.
+
 Library use:
 
 ```csharp
@@ -59,9 +73,11 @@ Detection coordinates are in pixels relative to the image or ROI passed to
 `Detect`. Keep one detector alive and reuse it; instances are not thread-safe.
 
 The RF-DETR Nano detection path was validated with the standard CPU build.
-The current OpenVINO 1.24.1 provider can load and execute the graph, but its
-scores differed materially on the example image, so it is not a parity-validated
-deployment path for this model yet.
+The `Intel.ML.OnnxRuntime.OpenVino` 1.24.1 provider can load and execute the
+graph, but its raw RF-DETR logits diverge before embedded preprocessing or
+detection decoding. Current native OpenVINO 2026.2.1 matches the raw CPU graph,
+which isolates the defect to the older ONNX Runtime OpenVINO EP path. Do not use
+the 1.24.1 provider for this detector.
 
 Classification models must follow the documented wrapper contract: raw BW8 `uint8 [1,1,H,W]` NCHW or raw C24 BGR `uint8 [1,H,W,3]` NHWC input, preprocessing embedded in the ONNX graph, one float score per class as output, and ordered class names supplied explicitly or stored in ONNX metadata under `names`. The model architecture does not need to be YOLO.
 

@@ -16,6 +16,8 @@ namespace OnnxVision
 
         private static int Main(string[] args)
         {
+            if (args.Length > 0 && string.Equals(args[0], "benchmark-detect", StringComparison.OrdinalIgnoreCase))
+                return RunDetectionBenchmark(args);
             if (args.Length > 0 && string.Equals(args[0], "detect", StringComparison.OrdinalIgnoreCase))
                 return RunDetection(args);
 
@@ -63,6 +65,98 @@ namespace OnnxVision
                 RunEvaluation(classifier, testDirectory, images);
             }
 
+            return 0;
+        }
+
+        private static int RunDetectionBenchmark(string[] args)
+        {
+            if (args.Length < 3 || args.Length > 6)
+            {
+                Console.Error.WriteLine(
+                    "Usage: OnnxVision.exe benchmark-detect <model.onnx> <image-directory> [confidence] [repeats] [cpu|directml|openvino-cpu|openvino-gpu]");
+                return 2;
+            }
+
+            var modelPath = Path.GetFullPath(args[1]);
+            var imageDirectory = Path.GetFullPath(args[2]);
+            var threshold = 0.5f;
+            var repeats = 3;
+            var provider = ExecutionProvider.Cpu;
+            if (args.Length >= 4 && !float.TryParse(
+                args[3], System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out threshold))
+            {
+                Console.Error.WriteLine("Confidence must be a number between zero and one.");
+                return 2;
+            }
+            if (args.Length >= 5 && (!int.TryParse(args[4], out repeats) || repeats < 1))
+            {
+                Console.Error.WriteLine("Repeats must be a positive integer.");
+                return 2;
+            }
+            if (args.Length == 6 && !TryParseExecutionProviderName(args[5], out provider))
+            {
+                Console.Error.WriteLine("Execution provider must be 'cpu', 'directml', 'openvino-cpu', or 'openvino-gpu'.");
+                return 2;
+            }
+            if (!File.Exists(modelPath) || !Directory.Exists(imageDirectory))
+            {
+                Console.Error.WriteLine("Model or image directory does not exist.");
+                return 2;
+            }
+
+            var images = Directory.EnumerateFiles(imageDirectory, "*", SearchOption.AllDirectories)
+                .Where(path => Extensions.Contains(Path.GetExtension(path)))
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            if (images.Length == 0)
+            {
+                Console.Error.WriteLine("No supported images were found.");
+                return 2;
+            }
+
+            var construction = Stopwatch.StartNew();
+            using (var detector = new ObjectDetector(modelPath, null, provider))
+            {
+                construction.Stop();
+                var warmupRuns = Math.Min(10, images.Length);
+                for (var index = 0; index < warmupRuns; index++)
+                    detector.Detect(images[index], threshold, 0.7f);
+                detector.ResetTimings();
+
+                var classCounts = detector.ClassNames.ToDictionary(name => name, name => 0);
+                var confidenceSum = 0.0;
+                var detectionCount = 0;
+                var elapsed = Stopwatch.StartNew();
+                for (var repeat = 0; repeat < repeats; repeat++)
+                {
+                    foreach (var image in images)
+                    {
+                        var detections = detector.Detect(image, threshold, 0.7f);
+                        detectionCount += detections.Count;
+                        foreach (var detection in detections)
+                        {
+                            classCounts[detection.Name]++;
+                            confidenceSum += detection.Confidence;
+                        }
+                    }
+                }
+                elapsed.Stop();
+
+                var executions = checked(images.Length * repeats);
+                Console.WriteLine("Provider: {0}", provider);
+                Console.WriteLine("Images: {0}; repeats: {1}; executions: {2}; warmups: {3}",
+                    images.Length, repeats, executions, warmupRuns);
+                Console.WriteLine("Session construction: {0:F3} ms", construction.Elapsed.TotalMilliseconds);
+                Console.WriteLine("Wall time: {0:F3} ms/image ({1:F2} images/s)",
+                    elapsed.Elapsed.TotalMilliseconds / executions,
+                    executions / elapsed.Elapsed.TotalSeconds);
+                Console.WriteLine("Preprocess: {0:F3} ms/image", detector.PreprocessMilliseconds / executions);
+                Console.WriteLine("ONNX inference: {0:F3} ms/image", detector.InferenceMilliseconds / executions);
+                Console.WriteLine("Detections: {0}; confidence sum: {1:F6}", detectionCount, confidenceSum);
+                Console.WriteLine("Class counts: " + string.Join(", ",
+                    classCounts.Select(item => item.Key + "=" + item.Value)));
+            }
             return 0;
         }
 

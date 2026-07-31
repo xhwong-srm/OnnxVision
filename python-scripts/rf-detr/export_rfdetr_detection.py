@@ -39,6 +39,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--c24-output", type=Path)
     parser.add_argument("--max-detections", type=int, default=300)
     parser.add_argument("--opset", type=int, default=18)
+    parser.add_argument(
+        "--simplify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Optimize final ONNX graphs with ONNXSlim (default: enabled)",
+    )
     parser.add_argument("--skip-embedded-preprocessing", action="store_true")
     parser.add_argument("--validate-image", type=Path)
     return parser.parse_args()
@@ -242,6 +248,17 @@ def validate_model(path: Path, image_path: Path) -> None:
     print(f"top_box={outputs['boxes'][0, 0].tolist()}")
 
 
+def simplify_model(path: Path) -> None:
+    try:
+        import onnxslim
+    except ImportError as error:
+        raise RuntimeError("ONNXSlim is required for --simplify; install onnxslim or use --no-simplify") from error
+    onnxslim.slim(str(path), str(path))
+    model = onnx.load(path)
+    onnx.checker.check_model(model)
+    print(f"simplified_onnx={path}")
+
+
 def main() -> None:
     args = parse_args()
     if args.max_detections <= 0:
@@ -266,6 +283,9 @@ def main() -> None:
         c24 = (args.c24_output or output.with_name(output.stem + "-c24.onnx")).resolve()
         wrap_bw8(output, bw8, resolution)
         wrap_c24(output, c24, resolution)
+        if args.simplify:
+            simplify_model(bw8)
+            simplify_model(c24)
         print(f"created_bw8={bw8}")
         print(f"created_c24={c24}")
         if args.validate_image:
@@ -273,6 +293,8 @@ def main() -> None:
             validate_model(c24, args.validate_image.resolve())
     elif args.validate_image:
         validate_model(output, args.validate_image.resolve())
+    if args.simplify:
+        simplify_model(output)
 
 
 if __name__ == "__main__":
