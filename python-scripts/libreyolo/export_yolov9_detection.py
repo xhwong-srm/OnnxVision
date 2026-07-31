@@ -92,6 +92,7 @@ def main() -> None:
         {
             "source_model": "libreyolo-yolov9",
             "nms": "true",
+            "nms_required": "false",
             "nms_conf": str(args.confidence),
             "nms_iou": str(args.iou),
             "max_det": str(args.max_det),

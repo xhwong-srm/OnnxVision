@@ -139,6 +139,7 @@ def canonicalize_outputs(
         "detection_contract": CONTRACT_VERSION,
         "box_format": "xyxy",
         "box_coordinates": "normalized",
+        "nms_required": "true",
         "names": json.dumps({index: name for index, name in enumerate(class_names)}),
         "source_model": "rfdetr-nano",
         "candidate_count": str(topk),

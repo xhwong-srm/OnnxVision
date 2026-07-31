@@ -9,6 +9,7 @@ model-specific RF-DETR or YOLO tensors. Detection models must contain:
 
 - metadata `vision_task=object_detection`
 - metadata `detection_contract=onnx-vision-detection-v1`
+- metadata `nms_required=true|false`
 - metadata `names` containing a contiguous zero-based class mapping
 - `boxes`: float32 `[1,N,4]`, normalized `xyxy`, clamped to `[0,1]`
 - `scores`: float32 `[1,N]` confidence probabilities, descending
@@ -17,8 +18,10 @@ model-specific RF-DETR or YOLO tensors. Detection models must contain:
 
 The exporter owns model preprocessing, logits decoding, box conversion, and
 any model-specific class-ID remapping. C# owns the runtime confidence threshold,
-coordinate scaling, and optional class-aware NMS. A future model family only
-needs an exporter that produces this same contract.
+coordinate scaling, and class-aware NMS when `nms_required=true`. Models with
+end-to-end or embedded NMS declare `nms_required=false`, preventing duplicate
+suppression. A future model family only needs an exporter that produces this
+same contract and explicitly declares its NMS requirement.
 
 Export the pretrained RF-DETR Nano model:
 

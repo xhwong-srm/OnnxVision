@@ -24,6 +24,7 @@ namespace OnnxVision
         private readonly InferenceSession session;
         private readonly string[] classNames;
         private readonly InputContract inputContract;
+        private readonly bool nmsRequired;
         private readonly EROIBW8 attachedBw8Roi;
         private readonly EROIC24 attachedC24Roi;
         private byte[] byteTensorBuffer;
@@ -49,6 +50,11 @@ namespace OnnxVision
             if (!metadata.TryGetValue("vision_task", out task) || task != "object_detection" ||
                 !metadata.TryGetValue("detection_contract", out contract) || contract != Contract)
                 throw new NotSupportedException("Expected the " + Contract + " object-detection metadata contract.");
+            string nmsRequiredValue;
+            if (!metadata.TryGetValue("nms_required", out nmsRequiredValue) ||
+                !bool.TryParse(nmsRequiredValue, out nmsRequired))
+                throw new NotSupportedException(
+                    "Expected boolean nms_required metadata in the object-detection model.");
             RequireOutput("boxes", typeof(float), 3);
             RequireOutput("scores", typeof(float), 2);
             RequireOutput("class_ids", typeof(long), 2);
@@ -82,6 +88,7 @@ namespace OnnxVision
 
         public string InputName { get; private set; }
         public ExecutionProvider ExecutionProvider { get; private set; }
+        public bool NmsRequired { get { return nmsRequired; } }
         public double PreprocessMilliseconds { get { return preprocessTicks * 1000.0 / Stopwatch.Frequency; } }
         public double InferenceMilliseconds { get { return inferenceTicks * 1000.0 / Stopwatch.Frequency; } }
         public IReadOnlyList<string> ClassNames { get { return classNames; } }
@@ -248,7 +255,9 @@ namespace OnnxVision
             var inferred = Stopwatch.GetTimestamp();
             preprocessTicks += preprocessed - started;
             inferenceTicks += inferred - preprocessed;
-            return nmsIouThreshold >= 1.0f ? candidates : ApplyClassAwareNms(candidates, nmsIouThreshold);
+            return !nmsRequired || nmsIouThreshold >= 1.0f
+                ? candidates
+                : ApplyClassAwareNms(candidates, nmsIouThreshold);
         }
 
         private static IReadOnlyList<Detection> ApplyClassAwareNms(List<Detection> candidates, float threshold)
