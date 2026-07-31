@@ -18,6 +18,7 @@ dependencies = [
     "torch>=2.11.0",
     "torchvision>=0.26.0",
     "triton-windows>=3.7.1.post27",
+    "ultralytics>=8.4.113",
 ]
 
 [tool.uv.sources]
