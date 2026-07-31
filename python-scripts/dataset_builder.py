@@ -367,6 +367,39 @@ def load_coco_detection_dataset(dataset_root):
     return list(entries_by_path.values()), classes
 
 
+def load_coco_detection_datasets(dataset_roots):
+    """Load and merge multiple COCO dataset roots into one editable dataset."""
+    roots = []
+    seen_roots = set()
+    for dataset_root in dataset_roots:
+        resolved_root = Path(dataset_root).resolve()
+        if resolved_root not in seen_roots:
+            seen_roots.add(resolved_root)
+            roots.append(resolved_root)
+    if not roots:
+        raise ValueError("No COCO dataset folders were selected.")
+
+    merged_entries = []
+    merged_classes = []
+    merged_class_lookup = {}
+    for dataset_root in roots:
+        entries, classes = load_coco_detection_dataset(dataset_root)
+        class_id_map = {}
+        for class_id, name in enumerate(classes):
+            key = name.casefold()
+            if key not in merged_class_lookup:
+                merged_class_lookup[key] = len(merged_classes)
+                merged_classes.append(name)
+            class_id_map[class_id] = merged_class_lookup[key]
+        for entry in entries:
+            for roi in entry.rois:
+                if roi.class_id in class_id_map:
+                    roi.class_id = class_id_map[roi.class_id]
+            merged_entries.append(entry)
+
+    return merged_entries, merged_classes
+
+
 @dataclass
 class ROI:
     rect: tuple[int, int, int, int]
@@ -571,7 +604,7 @@ class MainWindow(QMainWindow):
         super().__init__(); self.setWindowTitle("Classification ROI Dataset Builder"); self.resize(1450, 850); self.entries=[]; self.classes=[]; self.patterns=[]; self.current=-1; self.items=[]; self.pattern_items=[]; self.roi_clipboard=[]; self.learning_pattern=False; self.pattern_roi_indices=[]; self.model_path=Path(initial_model).resolve() if initial_model else None; self.session=None; self.input_name=None; self.kind=None; self.names={}
         root=QWidget(); self.setCentralWidget(root); layout=QHBoxLayout(root)
         left=QVBoxLayout(); left.addWidget(QLabel("Images")); self.images=QListWidget(); self.images.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection); self.images.currentRowChanged.connect(self.select); left.addWidget(self.images,1)
-        for text, fn in (("Add images...",self.add_images),("Add folder...",self.add_folder),("Load COCO detection dataset...",self.load_detection),("Locate image by 12-char hash...",self.locate_image_by_hash),("Remove selected image(s)",self.remove_selected_images),("Remove repeated images",self.remove_repeated_images),("Delete ROIs on current",self.clear_current),("Delete ROIs on all",self.clear_all),("Clear images",self.clear_images)):
+        for text, fn in (("Add images...",self.add_images),("Add folder...",self.add_folder),("Load COCO detection dataset(s)...",self.load_detection),("Locate image by 12-char hash...",self.locate_image_by_hash),("Remove selected image(s)",self.remove_selected_images),("Remove repeated images",self.remove_repeated_images),("Delete ROIs on current",self.clear_current),("Delete ROIs on all",self.clear_all),("Clear images",self.clear_images)):
             b=QPushButton(text); b.clicked.connect(fn); left.addWidget(b)
         layout.addLayout(left,1)
         center=QVBoxLayout(); self.scene=QGraphicsScene(); self.pixmap=QGraphicsPixmapItem(); self.scene.addItem(self.pixmap); self.view=ImageView(self.created,self.sort_current_rois); self.view.setScene(self.scene); center.addWidget(self.view,1)
@@ -669,10 +702,25 @@ class MainWindow(QMainWindow):
     def add_folder(self):
         folder=QFileDialog.getExistingDirectory(self,"Add image folder"); self.add_paths(sorted(Path(folder).iterdir())) if folder else None
     def load_detection(self):
-        folder=QFileDialog.getExistingDirectory(self,"Choose COCO detection dataset")
-        if not folder: return
+        folders=[]
+        while True:
+            title="Choose COCO detection dataset" if not folders else "Choose another COCO detection dataset"
+            folder=QFileDialog.getExistingDirectory(self,title)
+            if not folder:
+                break
+            resolved=str(Path(folder).resolve())
+            if resolved not in folders:
+                folders.append(resolved)
+            if QMessageBox.question(
+                self,"Load multiple COCO datasets",
+                "Add another COCO dataset?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
+                break
+        if not folders: return
         try:
-            loaded_entries,loaded_classes=load_coco_detection_dataset(folder)
+            loaded_entries,loaded_classes=load_coco_detection_datasets(folders)
         except Exception as e:
             QMessageBox.critical(self,"COCO load failed",str(e)); return
         if self.entries and QMessageBox.question(
@@ -690,7 +738,7 @@ class MainWindow(QMainWindow):
         self.images.addItems([f"{len(entry.rois)} ROI | {entry.path.name}" for entry in self.entries])
         self.current=-1
         if self.entries: self.images.setCurrentRow(0)
-        self.update(f"Loaded {len(self.entries)} image(s) and {sum(len(entry.rois) for entry in self.entries)} box(es)")
+        self.update(f"Loaded {len(folders)} COCO dataset(s), {len(self.entries)} image(s), and {sum(len(entry.rois) for entry in self.entries)} box(es)")
     def add_paths(self, paths):
         for path in paths:
             if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES and not any(e.path.resolve()==path.resolve() for e in self.entries):
