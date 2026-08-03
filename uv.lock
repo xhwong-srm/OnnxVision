@@ -35,6 +35,7 @@ dependencies = [
     { name = "timm" },
     { name = "torch" },
     { name = "torchvision" },
+    { name = "tqdm" },
     { name = "triton-windows" },
     { name = "ultralytics" },
 ]
@@ -55,6 +56,7 @@ requires-dist = [
     { name = "timm", specifier = ">=1.0.19" },
     { name = "torch", specifier = ">=2.11.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchvision", specifier = ">=0.26.0", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "tqdm", specifier = ">=4.66.0" },
     { name = "triton-windows", specifier = ">=3.7.1.post27" },
     { name = "ultralytics", specifier = ">=8.4.113" },
 ]

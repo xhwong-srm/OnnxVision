@@ -37,13 +37,14 @@ import numpy as np
 import timm
 import torch
 from PIL import Image, ImageOps
+from tqdm import tqdm
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision.ops import FeaturePyramidNetwork, generalized_box_iou, box_iou
 from torchvision.transforms.functional import pil_to_tensor
 
 
-MODEL_NAME = "mobilenetv4_conv_small"
+MODEL_NAME = "mobilenetv4_conv_small.e3600_r256_in1k"
 OUT_INDICES = (2, 3, 4)
 DEFAULT_FPN_CHANNELS = 128
 DEFAULT_NUM_QUERIES = 100
@@ -55,6 +56,7 @@ DEFAULT_ATTENTION_HEADS = 4
 DEFAULT_BBOX_LOSS_WEIGHT = 5.0
 DEFAULT_GIOU_LOSS_WEIGHT = 2.0
 DEFAULT_NO_OBJECT_WEIGHT = 0.1
+PROGRESS_BAR_FORMAT = "{desc}: {percentage:3.0f}% {bar} {n_fmt}/{total_fmt} {rate_fmt} {elapsed}"
 
 
 def set_seed(seed: int, deterministic: bool) -> None:
@@ -573,7 +575,7 @@ def average_precision(scores_and_matches: list[tuple[float, bool]], ground_truth
     return float(np.sum((recall_points[1:] - recall_points[:-1]) * precision_points[1:]))
 
 
-def detection_metrics(
+def detection_metrics_at_iou(
     predictions: list[dict[str, torch.Tensor]],
     targets: list[dict[str, torch.Tensor]],
     class_names: list[str],
@@ -639,12 +641,85 @@ def detection_metrics(
     }
 
 
+def detection_metrics(
+    predictions: list[dict[str, torch.Tensor]],
+    targets: list[dict[str, torch.Tensor]],
+    class_names: list[str],
+    score_threshold: float,
+    iou_threshold: float = 0.5,
+) -> dict[str, Any]:
+    """Calculate AP50, COCO-style mAP50-95, and the threshold-50 counts."""
+    thresholds = tuple(round(0.50 + 0.05 * index, 2) for index in range(10))
+    threshold_metrics = [
+        detection_metrics_at_iou(predictions, targets, class_names, score_threshold, threshold)
+        for threshold in thresholds
+    ]
+    metrics = (
+        dict(threshold_metrics[0])
+        if math.isclose(iou_threshold, thresholds[0])
+        else detection_metrics_at_iou(
+            predictions,
+            targets,
+            class_names,
+            score_threshold,
+            iou_threshold,
+        )
+    )
+    metrics["map50_95"] = float(np.mean([item["map50"] for item in threshold_metrics]))
+    return metrics
+
+
 def move_targets(targets: list[dict[str, torch.Tensor]], device: torch.device):
     return [{key: value.to(device) for key, value in target.items()} for target in targets]
 
 
 def amp_context(device: torch.device, enabled: bool, dtype: torch.dtype):
     return torch.autocast(device_type=device.type, dtype=dtype, enabled=enabled)
+
+
+def peak_gpu_memory(device: torch.device) -> str:
+    if device.type != "cuda":
+        return "0G"
+    return f"{torch.cuda.max_memory_reserved(device) / (1024 ** 3):.2f}G"
+
+
+def train_progress_description(
+    epoch: int,
+    total_epochs: int,
+    losses: dict[str, float],
+    instances: int,
+    imgsz: int,
+    gpu_memory: str,
+) -> str:
+    return (
+        f"{epoch:7d}/{total_epochs:<3d} {gpu_memory:>9} "
+        f"{losses['loss_bbox']:10.4f} {losses['loss_class']:10.4f} "
+        f"{losses['loss_giou']:10.4f} {instances:10d} {imgsz:10d}"
+    )
+
+
+def format_metric(value: Any) -> str:
+    if value is None or not math.isfinite(float(value)):
+        return "nan"
+    return f"{float(value):.4f}".rstrip("0").rstrip(".")
+
+
+def print_validation_summary(metrics: dict[str, Any], image_count: int) -> None:
+    print(
+        f"{'all':>23} {image_count:>10} {int(metrics['ground_truth_boxes']):>11} "
+        f"{format_metric(metrics['precision50']):>10} {format_metric(metrics['recall50']):>10} "
+        f"{format_metric(metrics['map50']):>10} {format_metric(metrics['map50_95']):>12}"
+    )
+
+
+def make_progress(total: int, description: str):
+    return tqdm(
+        total=total,
+        desc=description,
+        unit="it",
+        dynamic_ncols=True,
+        bar_format=PROGRESS_BAR_FORMAT,
+    )
 
 
 def train_epoch(
@@ -655,6 +730,10 @@ def train_epoch(
     device: torch.device,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
+    progress: Any | None = None,
+    epoch: int = 0,
+    total_epochs: int = 0,
+    imgsz: int = 0,
 ) -> dict[str, float]:
     model.train()
     totals: defaultdict[str, float] = defaultdict(float)
@@ -677,6 +756,19 @@ def train_epoch(
         for name, value in losses.items():
             totals[name] += float(value.detach().cpu())
         batches += 1
+        if progress is not None:
+            averages = {name: value / batches for name, value in totals.items()}
+            progress.set_description(
+                train_progress_description(
+                    epoch,
+                    total_epochs,
+                    averages,
+                    sum(int(target["boxes"].shape[0]) for target in targets),
+                    imgsz,
+                    peak_gpu_memory(device),
+                )
+            )
+            progress.update(1)
     return {name: value / max(1, batches) for name, value in totals.items()}
 
 
@@ -687,6 +779,7 @@ def evaluate(
     class_names: list[str],
     device: torch.device,
     score_threshold: float,
+    progress: Any | None = None,
 ) -> dict[str, Any]:
     model.eval()
     predictions = []
@@ -696,6 +789,8 @@ def evaluate(
         class_logits, boxes = model(device_images)
         predictions.extend(decode_predictions(class_logits, boxes, class_names, score_threshold))
         targets.extend(batch_targets)
+        if progress is not None:
+            progress.update(1)
     return detection_metrics(predictions, targets, class_names, score_threshold)
 
 
@@ -785,7 +880,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Query slots; when omitted, auto-select from the largest loaded annotation set "
-            f"with {DEFAULT_AUTO_QUERY_HEADROOM:.0%} headroom, rounded to {DEFAULT_AUTO_QUERY_ROUND_TO}"
+            f"with {DEFAULT_AUTO_QUERY_HEADROOM:.0f}%% headroom, rounded to {DEFAULT_AUTO_QUERY_ROUND_TO}"
         ),
     )
     parser.add_argument("--decoder-layers", type=int, default=DEFAULT_DECODER_LAYERS)
@@ -939,8 +1034,43 @@ def main() -> None:
         "nms_required=false"
     )
     for epoch in range(1, args.epochs + 1):
-        train_losses = train_epoch(model, train_loader, optimizer, scaler, device, amp_enabled, amp_dtype)
-        metrics = evaluate(model, val_loader, train_set.class_names, device, args.score_threshold)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        print("\n      Epoch    GPU_mem   box_loss   cls_loss  giou_loss  Instances       Size")
+        train_progress = make_progress(len(train_loader), f"{epoch:7d}/{args.epochs:<3d}")
+        try:
+            train_losses = train_epoch(
+                model,
+                train_loader,
+                optimizer,
+                scaler,
+                device,
+                amp_enabled,
+                amp_dtype,
+                progress=train_progress,
+                epoch=epoch,
+                total_epochs=args.epochs,
+                imgsz=args.imgsz,
+            )
+        finally:
+            train_progress.close()
+
+        validation_description = (
+            "                 Class     Images  Instances      Box(P          R      mAP50  mAP50-95"
+        )
+        val_progress = make_progress(len(val_loader), validation_description)
+        try:
+            metrics = evaluate(
+                model,
+                val_loader,
+                train_set.class_names,
+                device,
+                args.score_threshold,
+                progress=val_progress,
+            )
+        finally:
+            val_progress.close()
+        print_validation_summary(metrics, len(val_set))
         scheduler.step()
         row = {"epoch": epoch, **train_losses, **metrics, "lr": optimizer.param_groups[0]["lr"]}
         history.append(row)
@@ -948,7 +1078,8 @@ def main() -> None:
             f"epoch={epoch:03d} loss={train_losses['loss_total']:.5f} "
             f"class={train_losses['loss_class']:.5f} bbox={train_losses['loss_bbox']:.5f} "
             f"giou={train_losses['loss_giou']:.5f} map50={metrics['map50']:.5f} "
-            f"precision50={metrics['precision50']:.5f} recall50={metrics['recall50']:.5f}"
+            f"map50_95={metrics['map50_95']:.5f} precision50={metrics['precision50']:.5f} "
+            f"recall50={metrics['recall50']:.5f}"
         )
         score = float(metrics["map50"])
         if score > best_score + 1e-8:
@@ -972,13 +1103,16 @@ def main() -> None:
     best = torch.load(output / "best.pt", map_location=device, weights_only=False)
     model.load_state_dict(best["model_state_dict"])
     best_metrics = evaluate(model, val_loader, train_set.class_names, device, args.score_threshold)
-    print(f"best_epoch={best['epoch']} best_map50={best_metrics['map50']:.5f}")
+    print(
+        f"best_epoch={best['epoch']} best_map50={best_metrics['map50']:.5f} "
+        f"best_map50_95={best_metrics['map50_95']:.5f}"
+    )
     if test_set is not None:
         test_loader = make_loader(test_set, args.batch, 0, pin_memory, args.seed + 2, False)
         test_metrics = evaluate(model, test_loader, train_set.class_names, device, args.score_threshold)
         print(
             f"test_map50={test_metrics['map50']:.5f} test_precision50={test_metrics['precision50']:.5f} "
-            f"test_recall50={test_metrics['recall50']:.5f}"
+            f"test_recall50={test_metrics['recall50']:.5f} test_map50_95={test_metrics['map50_95']:.5f}"
         )
         (output / "test_metrics.json").write_text(json.dumps(test_metrics, indent=2), encoding="utf-8")
 
