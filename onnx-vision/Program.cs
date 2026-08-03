@@ -127,17 +127,26 @@ namespace OnnxVision
                 var classCounts = detector.ClassNames.ToDictionary(name => name, name => 0);
                 var confidenceSum = 0.0;
                 var detectionCount = 0;
+                long aggregationTicks = 0;
                 var elapsed = Stopwatch.StartNew();
                 for (var repeat = 0; repeat < repeats; repeat++)
                 {
                     foreach (var image in images)
                     {
                         var detections = detector.Detect(image, threshold, 0.7f);
-                        detectionCount += detections.Count;
-                        foreach (var detection in detections)
+                        var aggregationStarted = Stopwatch.GetTimestamp();
+                        try
                         {
-                            classCounts[detection.Name]++;
-                            confidenceSum += detection.Confidence;
+                            detectionCount += detections.Count;
+                            foreach (var detection in detections)
+                            {
+                                classCounts[detection.Name]++;
+                                confidenceSum += detection.Confidence;
+                            }
+                        }
+                        finally
+                        {
+                            aggregationTicks += Stopwatch.GetTimestamp() - aggregationStarted;
                         }
                     }
                 }
@@ -151,8 +160,14 @@ namespace OnnxVision
                 Console.WriteLine("Wall time: {0:F3} ms/image ({1:F2} images/s)",
                     elapsed.Elapsed.TotalMilliseconds / executions,
                     executions / elapsed.Elapsed.TotalSeconds);
+                Console.WriteLine("Image create/load + ROI: {0:F3} ms/image",
+                    detector.ImageCreateLoadAndRoiMilliseconds / executions);
                 Console.WriteLine("Preprocess: {0:F3} ms/image", detector.PreprocessMilliseconds / executions);
                 Console.WriteLine("ONNX inference: {0:F3} ms/image", detector.InferenceMilliseconds / executions);
+                Console.WriteLine("NMS: {0:F3} ms/image (required={1})",
+                    detector.NmsMilliseconds / executions, detector.NmsRequired);
+                Console.WriteLine("Result aggregation: {0:F3} ms/image",
+                    aggregationTicks * 1000.0 / Stopwatch.Frequency / executions);
                 Console.WriteLine("Detections: {0}; confidence sum: {1:F6}", detectionCount, confidenceSum);
                 Console.WriteLine("Class counts: " + string.Join(", ",
                     classCounts.Select(item => item.Key + "=" + item.Value)));

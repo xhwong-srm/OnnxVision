@@ -31,8 +31,11 @@ namespace OnnxVision
         private int byteTensorWidth;
         private int byteTensorHeight;
         private IReadOnlyCollection<NamedOnnxValue> inputs;
+        private long imageCreateLoadTicks;
+        private long roiTicks;
         private long preprocessTicks;
         private long inferenceTicks;
+        private long nmsTicks;
         private bool disposed;
 
         public ObjectDetector(string modelPath, IEnumerable<string> classNames = null,
@@ -89,8 +92,13 @@ namespace OnnxVision
         public string InputName { get; private set; }
         public ExecutionProvider ExecutionProvider { get; private set; }
         public bool NmsRequired { get { return nmsRequired; } }
+        public double ImageCreateLoadAndRoiMilliseconds
+        {
+            get { return (imageCreateLoadTicks + roiTicks) * 1000.0 / Stopwatch.Frequency; }
+        }
         public double PreprocessMilliseconds { get { return preprocessTicks * 1000.0 / Stopwatch.Frequency; } }
         public double InferenceMilliseconds { get { return inferenceTicks * 1000.0 / Stopwatch.Frequency; } }
+        public double NmsMilliseconds { get { return nmsTicks * 1000.0 / Stopwatch.Frequency; } }
         public IReadOnlyList<string> ClassNames { get { return classNames; } }
 
         public string InputDescription
@@ -111,15 +119,19 @@ namespace OnnxVision
                 throw new ArgumentException("An image path is required.", "imagePath");
             if (inputContract == InputContract.C24Nhwc)
             {
+                var started = Stopwatch.GetTimestamp();
                 using (var image = new EImageC24())
                 {
                     image.Load(imagePath);
+                    imageCreateLoadTicks += Stopwatch.GetTimestamp() - started;
                     return Detect(image, confidenceThreshold, nmsIouThreshold);
                 }
             }
+            var bw8Started = Stopwatch.GetTimestamp();
             using (var image = new EImageBW8())
             {
                 image.Load(imagePath);
+                imageCreateLoadTicks += Stopwatch.GetTimestamp() - bw8Started;
                 return Detect(image, confidenceThreshold, nmsIouThreshold);
             }
         }
@@ -139,16 +151,32 @@ namespace OnnxVision
             if (image == null) throw new ArgumentNullException("image");
             EnsureBw8Model();
             ValidatePlacement(placement, image.Width, image.Height);
-            attachedBw8Roi.Detach();
-            attachedBw8Roi.Attach(image);
-            attachedBw8Roi.SetPlacement(placement.X, placement.Y, placement.Width, placement.Height);
+            var roiStarted = Stopwatch.GetTimestamp();
+            try
+            {
+                attachedBw8Roi.Detach();
+                attachedBw8Roi.Attach(image);
+                attachedBw8Roi.SetPlacement(placement.X, placement.Y, placement.Width, placement.Height);
+            }
+            finally
+            {
+                roiTicks += Stopwatch.GetTimestamp() - roiStarted;
+            }
             try
             {
                 return Detect(attachedBw8Roi, confidenceThreshold, nmsIouThreshold);
             }
             finally
             {
-                attachedBw8Roi.Detach();
+                var detachStarted = Stopwatch.GetTimestamp();
+                try
+                {
+                    attachedBw8Roi.Detach();
+                }
+                finally
+                {
+                    roiTicks += Stopwatch.GetTimestamp() - detachStarted;
+                }
             }
         }
 
@@ -167,16 +195,32 @@ namespace OnnxVision
             if (image == null) throw new ArgumentNullException("image");
             EnsureC24Model();
             ValidatePlacement(placement, image.Width, image.Height);
-            attachedC24Roi.Detach();
-            attachedC24Roi.Attach(image);
-            attachedC24Roi.SetPlacement(placement.X, placement.Y, placement.Width, placement.Height);
+            var roiStarted = Stopwatch.GetTimestamp();
+            try
+            {
+                attachedC24Roi.Detach();
+                attachedC24Roi.Attach(image);
+                attachedC24Roi.SetPlacement(placement.X, placement.Y, placement.Width, placement.Height);
+            }
+            finally
+            {
+                roiTicks += Stopwatch.GetTimestamp() - roiStarted;
+            }
             try
             {
                 return Detect(attachedC24Roi, confidenceThreshold, nmsIouThreshold);
             }
             finally
             {
-                attachedC24Roi.Detach();
+                var detachStarted = Stopwatch.GetTimestamp();
+                try
+                {
+                    attachedC24Roi.Detach();
+                }
+                finally
+                {
+                    roiTicks += Stopwatch.GetTimestamp() - detachStarted;
+                }
             }
         }
 
@@ -212,8 +256,11 @@ namespace OnnxVision
         public void ResetTimings()
         {
             ThrowIfDisposed();
+            imageCreateLoadTicks = 0;
+            roiTicks = 0;
             preprocessTicks = 0;
             inferenceTicks = 0;
+            nmsTicks = 0;
         }
 
         public void Dispose()
@@ -255,9 +302,18 @@ namespace OnnxVision
             var inferred = Stopwatch.GetTimestamp();
             preprocessTicks += preprocessed - started;
             inferenceTicks += inferred - preprocessed;
-            return !nmsRequired || nmsIouThreshold >= 1.0f
-                ? candidates
-                : ApplyClassAwareNms(candidates, nmsIouThreshold);
+            if (!nmsRequired || nmsIouThreshold >= 1.0f)
+                return candidates;
+
+            var nmsStarted = Stopwatch.GetTimestamp();
+            try
+            {
+                return ApplyClassAwareNms(candidates, nmsIouThreshold);
+            }
+            finally
+            {
+                nmsTicks += Stopwatch.GetTimestamp() - nmsStarted;
+            }
         }
 
         private static IReadOnlyList<Detection> ApplyClassAwareNms(List<Detection> candidates, float threshold)
