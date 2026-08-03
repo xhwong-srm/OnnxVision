@@ -1,4 +1,4 @@
-"""Convert object-detection datasets between COCO, YOLO, and RF-DETR layouts.
+"""Convert object-detection datasets between COCO, YOLO, and RF-DETR layouts, or from Neurocle.
 
 The converter uses a small canonical representation internally:
 
@@ -18,6 +18,13 @@ RF-DETR
     ``train/``, ``valid/``, and optional ``test/`` directories, each with
     ``_annotations.coco.json`` and its images.
 
+Neurocle
+    A directory containing one Neurocle labeling JSON and its images. Input
+    may use a ZIP archive of images or loose image files; output writes
+    ``neurocle_labeling.json`` and loose image files under ``images/`` with no
+    ZIP. The JSON contains ``data[]`` records with ``fileName``, ``set``, image
+    dimensions, and rectangular ``regionLabel`` entries.
+
 Examples::
 
     uv run python python-scripts/convert_detection_dataset.py \
@@ -28,6 +35,14 @@ Examples::
         --input-format yolo --output-format rfdetr \
         --data artifacts/seal-yolo --output artifacts/seal-rfdetr
 
+    uv run python python-scripts/convert_detection_dataset.py \
+        --input-format neurocle --output-format coco \
+        --data images/neurocle-dataset --output artifacts/neurocle-coco
+
+    uv run python python-scripts/convert_detection_dataset.py \
+        --input-format coco --output-format neurocle \
+        --data images/seal_dataset --output artifacts/neurocle-labelset
+
 The converter handles bounding-box object detection only. Segmentation
 polygons, keypoints, and other format-specific fields are not carried through
 the canonical representation.
@@ -36,18 +51,31 @@ the canonical representation.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import math
 import os
 import shutil
+import tempfile
+import zipfile
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
 FORMATS = ("coco", "yolo", "rfdetr")
+INPUT_FORMATS = (*FORMATS, "neurocle")
+OUTPUT_FORMATS = (*FORMATS, "neurocle")
 REQUIRED_SPLITS = ("train", "val")
 OPTIONAL_SPLITS = ("test",)
+NEUROCLE_VERSION = "4.4.1.6"
+NEUROCLE_CLASS_COLORS = (
+    "rgba(86, 204, 242, 1)",
+    "rgba(242, 153, 74, 1)",
+    "rgba(111, 207, 151, 1)",
+    "rgba(235, 87, 87, 1)",
+    "rgba(155, 81, 224, 1)",
+)
 IMAGE_EXTENSIONS = {
     ".bmp",
     ".jpeg",
@@ -84,6 +112,12 @@ class DetectionDataset:
     classes: list[str]
     splits: dict[str, list[ImageRecord]]
     source: str | None = None
+    temporary_directory: Any = field(default=None, repr=False, compare=False)
+
+    def cleanup(self) -> None:
+        if self.temporary_directory is not None:
+            self.temporary_directory.cleanup()
+            self.temporary_directory = None
 
 
 def canonical_split(name: str) -> str:
@@ -325,6 +359,221 @@ def load_rfdetr(root: Path) -> DetectionDataset:
         splits[split] = images
     assert classes is not None
     return DetectionDataset(classes, splits, str(root))
+
+
+def find_neurocle_file(root: Path, suffix: str, description: str) -> Path:
+    candidates = sorted(
+        (path for path in root.glob(f"*{suffix}") if path.is_file()),
+        key=lambda path: path.name.casefold(),
+    )
+    if not candidates:
+        raise FileNotFoundError(f"Neurocle dataset is missing its {description} in {root}")
+    if len(candidates) > 1:
+        names = ", ".join(path.name for path in candidates)
+        raise ValueError(f"Neurocle dataset must contain exactly one {description}; found: {names}")
+    return candidates[0]
+
+
+def find_neurocle_archive(root: Path) -> Path | None:
+    candidates = sorted(
+        (path for path in root.glob("*.zip") if path.is_file()),
+        key=lambda path: path.name.casefold(),
+    )
+    if len(candidates) > 1:
+        names = ", ".join(path.name for path in candidates)
+        raise ValueError(f"Neurocle dataset must contain at most one image ZIP archive; found: {names}")
+    return candidates[0] if candidates else None
+
+
+def find_neurocle_folder_image(root: Path, file_name: str, annotation_path: Path) -> Path:
+    normalized = normalized_archive_name(file_name)
+    basename = PurePosixPath(normalized).name.casefold()
+    candidates: list[Path] = []
+    for candidate in (root / Path(normalized), root / basename):
+        if candidate.is_file():
+            candidates.append(candidate.resolve())
+    if not candidates:
+        candidates.extend(
+            candidate.resolve()
+            for candidate in root.rglob("*")
+            if candidate.is_file()
+            and candidate.suffix.casefold() in IMAGE_EXTENSIONS
+            and candidate.name.casefold() == basename
+        )
+    unique_candidates = list(dict.fromkeys(candidates))
+    if not unique_candidates:
+        raise FileNotFoundError(
+            f"Neurocle image folder is missing the image referenced by {annotation_path}: {file_name!r}"
+        )
+    if len(unique_candidates) > 1:
+        names = ", ".join(str(candidate) for candidate in unique_candidates)
+        raise ValueError(f"Neurocle image name is ambiguous in the folder: {file_name!r} ({names})")
+    return unique_candidates[0]
+
+
+def parse_neurocle_classes(document: dict[str, Any], path: Path) -> list[str]:
+    raw_classes = document.get("classes")
+    if isinstance(raw_classes, dict):
+        raw_classes = [raw_classes]
+    if not isinstance(raw_classes, list):
+        raise ValueError(f"Neurocle labeling JSON must contain classes as an object or list: {path}")
+
+    classes: list[str] = []
+    seen: set[str] = set()
+    for item in raw_classes:
+        raw_name = item.get("name") if isinstance(item, dict) else item
+        name = str(raw_name).strip() if raw_name is not None else ""
+        if not name or name.casefold() in seen:
+            raise ValueError(f"Neurocle labeling JSON contains an empty or duplicate class: {item!r}")
+        seen.add(name.casefold())
+        classes.append(name)
+    if not classes:
+        raise ValueError(f"Neurocle labeling JSON contains no classes: {path}")
+    return classes
+
+
+def normalized_archive_name(value: str) -> str:
+    return value.replace("\\", "/").lstrip("/")
+
+
+def neurocle_archive_entry(
+    file_name: str,
+    entries_by_name: dict[str, list[zipfile.ZipInfo]],
+    entries_by_basename: dict[str, list[zipfile.ZipInfo]],
+    annotation_path: Path,
+) -> zipfile.ZipInfo:
+    normalized = normalized_archive_name(file_name)
+    matches = entries_by_name.get(normalized.casefold(), [])
+    if not matches:
+        basename = PurePosixPath(normalized).name.casefold()
+        matches = entries_by_basename.get(basename, [])
+    if not matches:
+        raise FileNotFoundError(
+            f"Neurocle ZIP is missing the image referenced by {annotation_path}: {file_name!r}"
+        )
+    if len(matches) > 1:
+        names = ", ".join(entry.filename for entry in matches)
+        raise ValueError(f"Neurocle image name is ambiguous in the ZIP: {file_name!r} ({names})")
+    return matches[0]
+
+
+def load_neurocle(root: Path) -> DetectionDataset:
+    annotation_path = find_neurocle_file(root, ".json", "labeling JSON")
+    archive_path = find_neurocle_archive(root)
+    document = read_json(annotation_path)
+    classes = parse_neurocle_classes(document, annotation_path)
+    class_to_id = {name.casefold(): class_id for class_id, name in enumerate(classes)}
+    raw_records = document.get("data")
+    if not isinstance(raw_records, list):
+        raise ValueError(f"Neurocle labeling JSON must contain data as a list: {annotation_path}")
+
+    records_by_split: dict[str, list[tuple[str, int, int, list[Detection]]]] = {}
+    seen_file_names: set[str] = set()
+    for index, item in enumerate(raw_records):
+        context = f"{annotation_path} data[{index}]"
+        if not isinstance(item, dict):
+            raise ValueError(f"Neurocle record must be an object in {context}")
+        try:
+            file_name = str(item["fileName"]).strip()
+            split = canonical_split(str(item["set"]))
+            width = int(item["width"])
+            height = int(item["height"])
+            raw_regions = item.get("regionLabel", [])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"Invalid Neurocle record in {context}") from error
+        if not file_name or width <= 0 or height <= 0:
+            raise ValueError(f"Neurocle record has an empty filename or invalid dimensions in {context}")
+        file_key = normalized_archive_name(file_name).casefold()
+        if file_key in seen_file_names:
+            raise ValueError(f"Neurocle labeling JSON contains a duplicate filename in {context}: {file_name!r}")
+        seen_file_names.add(file_key)
+        if not isinstance(raw_regions, list):
+            raise ValueError(f"Neurocle regionLabel must be a list in {context}")
+
+        detections: list[Detection] = []
+        for region_index, region in enumerate(raw_regions):
+            region_context = f"{context} regionLabel[{region_index}]"
+            if not isinstance(region, dict):
+                raise ValueError(f"Neurocle region must be an object in {region_context}")
+            region_type = str(region.get("type", "Rect")).strip().casefold()
+            if region_type != "rect":
+                raise ValueError(f"Only Neurocle Rect regions are supported in {region_context}")
+            class_name = str(region.get("className", "")).strip()
+            if class_name.casefold() not in class_to_id:
+                raise ValueError(f"Unknown Neurocle region class in {region_context}: {class_name!r}")
+            try:
+                x = finite_float(region["x"], "region x", region_context)
+                y = finite_float(region["y"], "region y", region_context)
+                region_width = finite_float(region["width"], "region width", region_context)
+                region_height = finite_float(region["height"], "region height", region_context)
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(f"Invalid Neurocle region in {region_context}") from error
+            x1, y1, x2, y2 = clipped_box(
+                x, y, region_width, region_height, width, height, region_context
+            )
+            detections.append(Detection(class_to_id[class_name.casefold()], x1, y1, x2, y2))
+        records_by_split.setdefault(split, []).append((file_name, width, height, detections))
+
+    if "train" not in records_by_split:
+        raise ValueError(f"Neurocle labeling JSON must contain at least one train record: {annotation_path}")
+
+    temporary_directory = (
+        tempfile.TemporaryDirectory(prefix="convert-neurocle-")
+        if archive_path is not None
+        else None
+    )
+    archive: zipfile.ZipFile | None = None
+    try:
+        entries_by_name: dict[str, list[zipfile.ZipInfo]] = {}
+        entries_by_basename: dict[str, list[zipfile.ZipInfo]] = {}
+        if archive_path is not None:
+            archive = zipfile.ZipFile(archive_path)
+            for entry in archive.infolist():
+                if entry.is_dir():
+                    continue
+                normalized = normalized_archive_name(entry.filename)
+                entries_by_name.setdefault(normalized.casefold(), []).append(entry)
+                entries_by_basename.setdefault(PurePosixPath(normalized).name.casefold(), []).append(entry)
+
+        splits: dict[str, list[ImageRecord]] = {}
+        for split in (*REQUIRED_SPLITS, *OPTIONAL_SPLITS):
+            records = records_by_split.get(split)
+            if records is None:
+                continue
+            split_records: list[ImageRecord] = []
+            for file_name, width, height, detections in records:
+                if archive is not None:
+                    entry = neurocle_archive_entry(
+                        file_name, entries_by_name, entries_by_basename, annotation_path
+                    )
+                    output_name = PurePosixPath(normalized_archive_name(file_name)).name
+                    assert temporary_directory is not None
+                    image_path = Path(temporary_directory.name) / split / output_name
+                    image_path.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(entry) as source, image_path.open("wb") as target:
+                        shutil.copyfileobj(source, target)
+                else:
+                    image_path = find_neurocle_folder_image(root, file_name, annotation_path)
+                split_records.append(ImageRecord(image_path, width, height, detections))
+            splits[split] = split_records
+    except FileNotFoundError:
+        if temporary_directory is not None:
+            temporary_directory.cleanup()
+        raise
+    except (OSError, zipfile.BadZipFile) as error:
+        if temporary_directory is not None:
+            temporary_directory.cleanup()
+        source_description = f"image ZIP {archive_path}" if archive_path else f"image folder {root}"
+        raise ValueError(f"Cannot read Neurocle {source_description}: {error}") from error
+    except Exception:
+        if temporary_directory is not None:
+            temporary_directory.cleanup()
+        raise
+    finally:
+        if archive is not None:
+            archive.close()
+
+    return DetectionDataset(classes, splits, str(root), temporary_directory)
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -710,6 +959,63 @@ def write_yolo(dataset: DetectionDataset, output: Path, image_mode: str) -> None
     write_metadata(dataset, output, image_mode, counts)
 
 
+def neurocle_number(value: float) -> int | float:
+    return int(value) if value.is_integer() else value
+
+
+def write_neurocle(dataset: DetectionDataset, output: Path, image_mode: str) -> None:
+    classes = [
+        {
+            "name": name,
+            "color": NEUROCLE_CLASS_COLORS[class_id % len(NEUROCLE_CLASS_COLORS)],
+        }
+        for class_id, name in enumerate(dataset.classes)
+    ]
+    records: list[dict[str, Any]] = []
+    names: set[str] = set()
+    stems: set[str] = set()
+    for split, images in dataset.splits.items():
+        neurocle_split = "train" if split == "val" else split
+        for image in images:
+            image_name = output_image_name(image, names, stems)
+            place_image(image.source, output / "images" / image_name, image_mode)
+            regions = [
+                {
+                    "className": dataset.classes[detection.class_id],
+                    "type": "Rect",
+                    "x": neurocle_number(detection.x1),
+                    "y": neurocle_number(detection.y1),
+                    "width": neurocle_number(detection.x2 - detection.x1),
+                    "height": neurocle_number(detection.y2 - detection.y1),
+                }
+                for detection in image.detections
+            ]
+            records.append(
+                {
+                    "fileName": image_name,
+                    "set": neurocle_split,
+                    "classLabel": "",
+                    "regionLabel": regions,
+                    "retestset": 0,
+                    "rotation_angle": 0,
+                    "width": image.width,
+                    "height": image.height,
+                }
+            )
+
+    document = {
+        "label_type": "obd",
+        "source": "labelset",
+        "time": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "version": NEUROCLE_VERSION,
+        "classes": classes,
+        "data": records,
+    }
+    (output / "neurocle_labeling.json").write_text(
+        json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
+
 def write_metadata(
     dataset: DetectionDataset, output: Path, image_mode: str, counts: dict[str, dict[str, int]]
 ) -> None:
@@ -736,14 +1042,14 @@ def build_parser(
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--input-format",
-        choices=FORMATS,
+        choices=INPUT_FORMATS,
         default=default_input_format,
         required=default_input_format is None,
         help="Input dataset layout",
     )
     parser.add_argument(
         "--output-format",
-        choices=FORMATS,
+        choices=OUTPUT_FORMATS,
         default=default_output_format,
         required=default_output_format is None,
         help="Output dataset layout",
@@ -775,6 +1081,10 @@ def load_dataset(input_format: str, data: Path) -> DetectionDataset:
         if not data.is_dir():
             raise ValueError("RF-DETR input must be a dataset directory")
         return load_rfdetr(data)
+    if input_format == "neurocle":
+        if not data.is_dir():
+            raise ValueError("Neurocle input must be a dataset directory")
+        return load_neurocle(data)
     return load_yolo(data)
 
 
@@ -789,18 +1099,23 @@ def main(
     output = args.output.expanduser().resolve()
     input_root = data.parent if args.input_format == "yolo" and data.is_file() else data
     dataset = load_dataset(args.input_format, data)
-    prepare_output(output, input_root)
-    if args.output_format == "coco":
-        write_coco(dataset, output, args.image_mode)
-    elif args.output_format == "rfdetr":
-        write_rfdetr(dataset, output, args.image_mode)
-    else:
-        write_yolo(dataset, output, args.image_mode)
-    counts = {split: len(records) for split, records in dataset.splits.items()}
-    print(
-        f"Converted {args.input_format} dataset to {args.output_format}; "
-        f"classes={dataset.classes}; split images={counts}; output={output}"
-    )
+    try:
+        prepare_output(output, input_root)
+        if args.output_format == "coco":
+            write_coco(dataset, output, args.image_mode)
+        elif args.output_format == "rfdetr":
+            write_rfdetr(dataset, output, args.image_mode)
+        elif args.output_format == "neurocle":
+            write_neurocle(dataset, output, args.image_mode)
+        else:
+            write_yolo(dataset, output, args.image_mode)
+        counts = {split: len(records) for split, records in dataset.splits.items()}
+        print(
+            f"Converted {args.input_format} dataset to {args.output_format}; "
+            f"classes={dataset.classes}; split images={counts}; output={output}"
+        )
+    finally:
+        dataset.cleanup()
 
 
 if __name__ == "__main__":

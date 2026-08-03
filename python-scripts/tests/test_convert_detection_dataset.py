@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from PIL import Image
@@ -12,9 +13,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from convert_detection_dataset import (  # noqa: E402
     load_coco,
+    load_neurocle,
     load_rfdetr,
     load_yolo,
     write_coco,
+    write_neurocle,
     write_rfdetr,
     write_yolo,
 )
@@ -30,6 +33,17 @@ class DetectionDatasetConverterTests(unittest.TestCase):
             loaded_coco = load_coco(coco)
             self.assertEqual(loaded_coco.classes, ["seal", "defect"])
             self.assertEqual([len(loaded_coco.splits[split]) for split in ("train", "val", "test")], [1, 1, 1])
+
+            neurocle = root / "neurocle"
+            neurocle.mkdir()
+            write_neurocle(loaded_coco, neurocle, "copy")
+            neurocle_document = json.loads(
+                (neurocle / "neurocle_labeling.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [record["set"] for record in neurocle_document["data"]],
+                ["train", "train", "test"],
+            )
 
             yolo = root / "yolo"
             yolo.mkdir()
@@ -57,6 +71,88 @@ class DetectionDatasetConverterTests(unittest.TestCase):
             self.assertAlmostEqual(train_detection.y1, 20.0)
             self.assertAlmostEqual(train_detection.x2, 50.0)
             self.assertAlmostEqual(train_detection.y2, 60.0)
+
+    def test_neurocle_json_and_zip_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            neurocle = root / "neurocle"
+            neurocle.mkdir()
+            source_images = root / "source-images"
+            source_images.mkdir()
+            records = []
+            for split, image_name, x in (
+                ("train", "train-image.png", 10),
+                ("test", "test-image.png", 20),
+            ):
+                image_path = source_images / image_name
+                Image.new("RGB", (100, 80), color=(20, 30, 40)).save(image_path)
+                records.append(
+                    {
+                        "fileName": image_name,
+                        "set": split,
+                        "classLabel": "",
+                        "regionLabel": [
+                            {
+                                "className": "Core",
+                                "type": "Rect",
+                                "x": x,
+                                "y": 20,
+                                "width": 40,
+                                "height": 30,
+                            }
+                        ],
+                        "width": 100,
+                        "height": 80,
+                    }
+                )
+
+            (neurocle / "labels.json").write_text(
+                json.dumps({"classes": {"name": "Core"}, "data": records}),
+                encoding="utf-8",
+            )
+            with zipfile.ZipFile(neurocle / "images.zip", "w") as archive:
+                for record in records:
+                    archive.write(source_images / record["fileName"], arcname=record["fileName"])
+
+            dataset = load_neurocle(neurocle)
+            try:
+                self.assertEqual(dataset.classes, ["Core"])
+                self.assertEqual(
+                    {split: len(images) for split, images in dataset.splits.items()},
+                    {"train": 1, "test": 1},
+                )
+                detection = dataset.splits["train"][0].detections[0]
+                self.assertEqual((detection.x1, detection.y1, detection.x2, detection.y2), (10, 20, 50, 50))
+                neurocle_output = root / "neurocle-output"
+                neurocle_output.mkdir()
+                write_neurocle(dataset, neurocle_output, "copy")
+                output = root / "coco"
+                output.mkdir()
+                write_coco(dataset, output, "copy")
+            finally:
+                dataset.cleanup()
+
+            train_document = json.loads(
+                (output / "annotations" / "instances_train.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(train_document["categories"], [{"id": 1, "name": "Core", "supercategory": ""}])
+            self.assertEqual(train_document["annotations"][0]["bbox"], [10, 20, 40, 30])
+            self.assertTrue((output / "images" / "train" / "train-image.png").is_file())
+
+            written_document = json.loads(
+                (neurocle_output / "neurocle_labeling.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(written_document["label_type"], "obd")
+            self.assertEqual(written_document["classes"][0]["name"], "Core")
+            self.assertEqual(written_document["data"][0]["regionLabel"][0]["width"], 40)
+            self.assertFalse(any(neurocle_output.glob("*.zip")))
+            self.assertTrue((neurocle_output / "images" / "train-image.png").is_file())
+            unzipped = load_neurocle(neurocle_output)
+            self.assertEqual(
+                {split: len(images) for split, images in unzipped.splits.items()},
+                {"train": 1, "test": 1},
+            )
+            unzipped.cleanup()
 
     @staticmethod
     def _write_coco_source(root: Path) -> None:
