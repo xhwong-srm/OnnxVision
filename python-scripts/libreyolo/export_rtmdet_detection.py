@@ -18,7 +18,7 @@ import numpy as np
 import onnx
 import torch
 import torch.nn as nn
-from onnx import TensorProto, helper
+from onnx import TensorProto, compose, helper
 from PIL import Image
 
 
@@ -36,7 +36,6 @@ from export_yolo26_detection import (  # noqa: E402
     load_dataset_yaml,
     match_detections,
     parity_metrics,
-    prepare_core,
     print_quality,
     quality_metrics,
     read_ground_truth,
@@ -157,7 +156,10 @@ def parse_args():
     )
     parser.add_argument("--skip-embedded-preprocessing", action="store_true")
     parser.add_argument("--device", default="cpu", help='Export device, for example "cpu" or "0"')
-    parser.add_argument("--data", type=Path, help="YOLO data.yaml used for post-export agreement evaluation")
+    parser.add_argument(
+        "--data", type=Path,
+        help="YOLO data.yaml or dataset directory used for post-export agreement evaluation",
+    )
     parser.add_argument("--validation-split", default="test", help="Dataset split to evaluate (default: test)")
     parser.add_argument(
         "--validation-limit",
@@ -192,6 +194,15 @@ def _rename_tensor(model: onnx.ModelProto, old: str, new: str) -> None:
     for output in model.graph.output:
         if output.name == old:
             output.name = new
+
+
+def resolve_dataset_yaml(path: Path) -> Path:
+    resolved = path.expanduser().resolve()
+    if resolved.is_dir():
+        resolved = resolved / "data.yaml"
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Dataset YAML does not exist: {resolved}")
+    return resolved
 
 
 def _rtmdet_preprocess_nodes(
@@ -323,10 +334,16 @@ def _add_rtmdet_box_remap(
     source: str,
     resolution: int,
     max_det: int,
+    source_hw_indices: tuple[int, int],
     ratio_name: str = "preprocess/ratio",
 ) -> None:
     """Map padded-canvas boxes to normalized coordinates of the raw image."""
-    _rename_tensor(core, "boxes", "core_boxes")
+    # ``prepare_rtmdet_core`` prefixes graph edges and graph outputs. Restore
+    # the public output names while keeping the box tensor private until the
+    # raw-image coordinate remap has been applied.
+    _rename_tensor(core, "core/boxes", "core_boxes")
+    _rename_tensor(core, "core/scores", "scores")
+    _rename_tensor(core, "core/class_ids", "class_ids")
     prefix = "postprocess/"
     shape = f"{prefix}source_shape"
     hw = f"{prefix}hw"
@@ -337,7 +354,7 @@ def _add_rtmdet_box_remap(
     box_normalized = f"{prefix}box_normalized"
     boxes = "boxes"
     shape_indices = add_initializer(
-        core, f"{prefix}shape_indices", np.asarray([1, 0], dtype=np.int64)
+        core, f"{prefix}shape_indices", np.asarray(source_hw_indices, dtype=np.int64)
     )
     canvas = add_initializer(
         core, f"{prefix}canvas", np.asarray(float(resolution), dtype=np.float32)
@@ -349,9 +366,10 @@ def _add_rtmdet_box_remap(
             helper.make_node("Shape", [source], [shape]),
             helper.make_node("Gather", [shape, shape_indices], [hw], axis=0),
             helper.make_node("Cast", [hw], [hw_float], to=TensorProto.FLOAT),
-            helper.make_node(
-                "Gather", [hw_float, shape_indices], [width_height], axis=0
-            ),
+            # ``hw`` is already [width, height] because shape_indices is
+            # [1, 0]. Gathering with the same indices again reverses it back
+            # to [height, width] and corrupts every raw-image wrapper box.
+            helper.make_node("Identity", [hw_float], [width_height]),
             helper.make_node(
                 "Mul", [width_height, ratio_name], [f"{prefix}scaled_width_height"]
             ),
@@ -378,6 +396,16 @@ def _add_rtmdet_box_remap(
     core.graph.output.extend(outputs)
 
 
+def prepare_rtmdet_core(path: Path) -> tuple[onnx.ModelProto, str, dict[str, str]]:
+    """Prefix the core graph while preserving connected graph outputs."""
+    model = onnx.load(path)
+    metadata = {item.key: item.value for item in model.metadata_props}
+    core = compose.add_prefix(model, "core/")
+    input_name = core.graph.input[0].name
+    del core.graph.input[:]
+    return core, input_name, metadata
+
+
 def _wrap_rtmdet_input(
     core_path: Path,
     output: Path,
@@ -386,7 +414,7 @@ def _wrap_rtmdet_input(
     *,
     bw8: bool,
 ) -> None:
-    core, core_input, metadata = prepare_core(core_path)
+    core, core_input, metadata = prepare_rtmdet_core(core_path)
     input_name = "images_bw8_uint8_nchw" if bw8 else "images_c24_uint8_nhwc_bgr"
     input_shape = [1, 1, "height", "width"] if bw8 else [1, "height", "width", 3]
     core.graph.input.append(
@@ -395,7 +423,12 @@ def _wrap_rtmdet_input(
     nodes, normalized = _rtmdet_preprocess_nodes(
         core, input_name, resolution, bw8=bw8
     )
-    _add_rtmdet_box_remap(core, input_name, resolution, max_det)
+    # The two raw-image wrappers expose different layouts. The remap needs
+    # [width, height], not merely the first two non-batch dimensions.
+    source_hw_indices = (3, 2) if bw8 else (2, 1)
+    _add_rtmdet_box_remap(
+        core, input_name, resolution, max_det, source_hw_indices
+    )
     metadata.update(
         {
             "vision_task": "object_detection",
@@ -657,15 +690,33 @@ def evaluate(
 def simplify_onnx(path: Path) -> None:
     try:
         from onnxslim import slim
-    except ImportError:
-        print("warning: onnxslim is unavailable; skipping simplification")
-        return
-    simplified = slim(onnx.load(path))
-    onnx.checker.check_model(simplified)
-    onnx.save(simplified, path)
+    except ImportError as error:
+        raise RuntimeError("onnxslim is required for --simplify") from error
+    original = onnx.load(path)
+    metadata = {item.key: item.value for item in original.metadata_props}
+    try:
+        simplified = slim(original)
+        if not isinstance(simplified, onnx.ModelProto):
+            raise TypeError(f"onnxslim returned {type(simplified).__name__}, expected ModelProto")
+        existing_metadata = {item.key: item.value for item in simplified.metadata_props}
+        existing_metadata.update(metadata)
+        del simplified.metadata_props[:]
+        for key, value in existing_metadata.items():
+            item = simplified.metadata_props.add()
+            item.key, item.value = key, value
+        onnx.checker.check_model(simplified)
+        temporary = path.with_name(path.name + ".slim.tmp")
+        onnx.save(simplified, temporary)
+        temporary.replace(path)
+    except Exception as error:
+        temporary = path.with_name(path.name + ".slim.tmp")
+        if temporary.exists():
+            temporary.unlink()
+        raise RuntimeError(f"Failed to simplify ONNX model {path}: {error}") from error
+    print(f"simplified_onnx={path}")
 
 
-def validate_core_onnx(path: Path, resolution: int, max_det: int) -> None:
+def validate_onnx(path: Path, resolution: int, max_det: int) -> None:
     """Run a deterministic CPU smoke test without provider auto-selection."""
     try:
         import onnxruntime as ort
@@ -674,9 +725,14 @@ def validate_core_onnx(path: Path, resolution: int, max_det: int) -> None:
         return
     session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
     input_info = session.get_inputs()[0]
-    if input_info.type != "tensor(float)":
-        raise ValueError(f"Expected float RTMDet core input, received {input_info.type}")
-    value = np.zeros((1, 3, resolution, resolution), dtype=np.float32)
+    if input_info.type == "tensor(float)":
+        value = np.zeros((1, 3, resolution, resolution), dtype=np.float32)
+    elif input_info.type == "tensor(uint8)" and input_info.shape[-1] == 3:
+        value = np.zeros((1, resolution, resolution, 3), dtype=np.uint8)
+    elif input_info.type == "tensor(uint8)":
+        value = np.zeros((1, 1, resolution, resolution), dtype=np.uint8)
+    else:
+        raise ValueError(f"Unsupported RTMDet ONNX input {input_info.type} {input_info.shape}")
     results = session.run(None, {input_info.name: value})
     output_names = [item.name for item in session.get_outputs()]
     expected = ["boxes", "scores", "class_ids"]
@@ -814,7 +870,9 @@ def main() -> None:
         item.key, item.value = key, value
     onnx.checker.check_model(graph)
     onnx.save(graph, output)
-    validate_core_onnx(output, args.resolution, args.max_det)
+    if args.simplify:
+        simplify_onnx(output)
+    validate_onnx(output, args.resolution, args.max_det)
     print(f"created_onnx={output}")
 
     generated = [output]
@@ -823,14 +881,17 @@ def main() -> None:
         c24 = (args.c24_output or output.with_name(output.stem + "-c24.onnx")).resolve()
         wrap_rtmdet_bw8(output, bw8, args.resolution, args.max_det)
         wrap_rtmdet_c24(output, c24, args.resolution, args.max_det)
+        if args.simplify:
+            simplify_onnx(bw8)
+            simplify_onnx(c24)
+        validate_onnx(bw8, args.resolution, args.max_det)
+        validate_onnx(c24, args.resolution, args.max_det)
         generated.extend((bw8, c24))
         print(f"created_bw8={bw8}")
         print(f"created_c24={c24}")
 
     if args.data:
-        data = args.data.expanduser().resolve()
-        if not data.is_file():
-            raise FileNotFoundError(f"Dataset YAML does not exist: {data}")
+        data = resolve_dataset_yaml(args.data)
         # Export mode changes RTMDetHead.forward() from native tuple outputs to
         # decoded flat outputs. Restore native mode before agreement testing.
         model.model.head.export = False
