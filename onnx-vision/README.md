@@ -23,6 +23,11 @@ end-to-end or embedded NMS declare `nms_required=false`, preventing duplicate
 suppression. A future model family only needs an exporter that produces this
 same contract and explicitly declares its NMS requirement.
 
+RF-DETR is NMS-free: its exporter performs sigmoid, top-k query/class selection,
+and box conversion, while the native RF-DETR postprocess applies only the
+runtime confidence threshold. Its exported models therefore declare
+`nms_required=false` and must not receive an additional C# NMS pass.
+
 Export the pretrained RF-DETR Nano model:
 
 ```powershell

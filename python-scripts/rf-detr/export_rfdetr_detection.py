@@ -8,7 +8,9 @@ model-neutral candidate interface:
 * ``class_ids``: int64 ``[1,N]`` zero-based indices into ``names`` metadata
 
 RF-DETR-specific preprocessing, sparse COCO IDs, sigmoid, top-k selection,
-and CXCYWH-to-XYXY conversion are contained in the ONNX graph.
+and CXCYWH-to-XYXY conversion are contained in the ONNX graph. RF-DETR is
+NMS-free; its native postprocess selects top-scoring query/class pairs and
+applies the runtime confidence threshold without non-maximum suppression.
 """
 
 from __future__ import annotations
@@ -139,7 +141,10 @@ def canonicalize_outputs(
         "detection_contract": CONTRACT_VERSION,
         "box_format": "xyxy",
         "box_coordinates": "normalized",
-        "nms_required": "true",
+        # RF-DETR is a set-prediction detector. Its native postprocess does
+        # not apply NMS, so C# must preserve the candidate set rather than
+        # applying a second, model-external suppression step.
+        "nms_required": "false",
         "names": json.dumps({index: name for index, name in enumerate(class_names)}),
         "source_model": "rfdetr-nano",
         "candidate_count": str(topk),
