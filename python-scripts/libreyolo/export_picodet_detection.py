@@ -282,44 +282,27 @@ def _picodet_preprocess_nodes(
     return nodes, normalized
 
 
-def _add_picodet_box_remap(
+def _add_picodet_box_contract_output(
     core: onnx.ModelProto,
-    source: str,
-    resolution: int,
     max_det: int,
-    source_hw_indices: tuple[int, int],
 ) -> None:
-    """Map stretch-resized canvas boxes to normalized raw-image coordinates."""
+    """Expose stretch-canvas boxes in the normalized original-image frame.
+
+    PicoDet stretches each source dimension independently to the square
+    canvas.  Therefore a coordinate normalized by the canvas dimension is
+    already the same coordinate normalized by the corresponding source
+    dimension.  Applying a second canvas-to-source pixel conversion would
+    incorrectly scale x and y by ``resolution / source_dimension``.
+    """
     _rename_tensor(core, "core/boxes", "core_boxes")
     _rename_tensor(core, "core/scores", "scores")
     _rename_tensor(core, "core/class_ids", "class_ids")
     prefix = "postprocess/"
-    shape = f"{prefix}source_shape"
-    dimensions = f"{prefix}dimensions"
-    box_pixels = f"{prefix}box_pixels"
-    box_normalized = f"{prefix}box_normalized"
-    shape_indices = add_initializer(
-        core, f"{prefix}shape_indices", np.asarray(source_hw_indices, dtype=np.int64)
-    )
-    canvas = add_initializer(
-        core, f"{prefix}canvas", np.asarray(float(resolution), dtype=np.float32)
-    )
     zero = add_initializer(core, f"{prefix}zero", np.asarray(0.0, dtype=np.float32))
     one = add_initializer(core, f"{prefix}one", np.asarray(1.0, dtype=np.float32))
     core.graph.node.extend(
         [
-            helper.make_node("Shape", [source], [shape]),
-            helper.make_node("Gather", [shape, shape_indices], [dimensions], axis=0),
-            helper.make_node("Cast", [dimensions], [dimensions + "/float"], to=TensorProto.FLOAT),
-            helper.make_node(
-                "Concat",
-                [dimensions + "/float", dimensions + "/float"],
-                [dimensions + "/xyxy"],
-                axis=0,
-            ),
-            helper.make_node("Mul", ["core_boxes", canvas], [box_pixels]),
-            helper.make_node("Div", [box_pixels, dimensions + "/xyxy"], [box_normalized]),
-            helper.make_node("Clip", [box_normalized, zero, one], ["boxes"]),
+            helper.make_node("Clip", ["core_boxes", zero, one], ["boxes"]),
         ]
     )
     outputs = []
@@ -361,8 +344,7 @@ def _wrap_picodet_input(
     nodes, normalized = _picodet_preprocess_nodes(
         core, input_name, resolution, bw8=bw8
     )
-    source_hw_indices = (3, 2) if bw8 else (2, 1)
-    _add_picodet_box_remap(core, input_name, resolution, max_det, source_hw_indices)
+    _add_picodet_box_contract_output(core, max_det)
     metadata.update(
         {
             "vision_task": "object_detection",
@@ -447,7 +429,6 @@ def run_onnx(
     input_info = session.get_inputs()[0]
     with Image.open(image_path) as image:
         rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
-        width, height = image.size
     if input_info.type == "tensor(float)":
         chw, _ = preprocess_numpy(rgb, input_size=resolution)
         value = chw[None]
@@ -462,14 +443,9 @@ def run_onnx(
         for item, result in zip(session.get_outputs(), session.run(None, {input_info.name: value}))
     }
     boxes = np.asarray(outputs["boxes"])[0].astype(np.float32)
-    if input_info.type == "tensor(float)":
-        # The float core consumes the stretched square tensor. Convert its
-        # normalized canvas coordinates back to the original image frame.
-        denominator = np.asarray(
-            [width, height, width, height],
-            dtype=np.float32,
-        )
-        boxes = boxes * float(resolution) / denominator
+    # PicoDet uses an independent stretch on each image dimension. Therefore
+    # normalized canvas coordinates are already normalized original-image
+    # coordinates; no letterbox-style pixel remap is needed here.
     boxes = np.clip(boxes, 0.0, 1.0)
     scores = np.asarray(outputs["scores"])[0]
     classes = np.asarray(outputs["class_ids"])[0]
