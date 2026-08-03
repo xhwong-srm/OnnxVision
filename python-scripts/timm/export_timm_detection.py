@@ -338,10 +338,16 @@ def wrap_c24(model_path: Path, output_path: Path, imgsz: int, config: dict, clas
 
 
 def validate_onnx(model_path: Path, export_model: nn.Module, input_tensor: torch.Tensor) -> None:
+    # Compare like-for-like CPU execution.  Comparing a CUDA PyTorch reference
+    # against a CPU ORT session can produce harmless box-coordinate drift from
+    # different convolution/reduction kernels, especially after RetinaNet's
+    # exponential box decoding.
     session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
     input_name = session.get_inputs()[0].name
-    reference = [value.detach().cpu().numpy() for value in export_model(input_tensor)]
-    actual = session.run(None, {input_name: input_tensor.detach().cpu().numpy()})
+    validation_model = export_model.to("cpu").eval()
+    validation_input = input_tensor.detach().to("cpu")
+    reference = [value.detach().numpy() for value in validation_model(validation_input)]
+    actual = session.run(None, {input_name: validation_input.numpy()})
     if len(actual) != 3:
         raise ValueError(f"Expected three ONNX outputs, received {len(actual)}")
     for name, expected, received in zip(("boxes", "scores", "class_ids"), reference, actual):
@@ -366,7 +372,7 @@ def main() -> None:
     print(f"device={device}")
     output, imgsz, config, classes, export_model, input_tensor = export_onnx(args, device)
     if not args.skip_validation:
-        validate_onnx(output, export_model.float().eval(), input_tensor.float())
+        validate_onnx(output, export_model.eval(), input_tensor)
     if not args.embedded_preprocessing:
         return
     model_config = json.loads(next(item.value for item in onnx.load(output).metadata_props if item.key == "model_config"))

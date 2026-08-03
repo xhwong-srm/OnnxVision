@@ -16,3 +16,4 @@ images/
 runs/
 *pt
 artifacts/
+tmp/
