@@ -46,6 +46,7 @@ class ProbabilityModel(torch.nn.Module):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", type=Path, help="Checkpoint (.pt) produced by the training script")
+    parser.add_argument("--output", type=Path, help="Float ONNX output path; defaults beside the checkpoint")
     parser.add_argument("--model-name", help="Override the model_name stored in the checkpoint")
     parser.add_argument("--imgsz", type=int, help="Override the square training input size")
     parser.add_argument("--opset", type=int, default=18, help="ONNX opset (default: 18)")
@@ -114,7 +115,7 @@ def export_onnx(args: argparse.Namespace, device: torch.device):
     checkpoint_path = args.model.expanduser().resolve()
     model, classes, config = load_training_checkpoint(checkpoint_path, args.model_name, device)
     imgsz = model_input_size(config, args.imgsz)
-    output = checkpoint_path.with_suffix(".onnx")
+    output = (args.output or checkpoint_path.with_suffix(".onnx")).expanduser().resolve()
     input_tensor = torch.zeros(1, 3, imgsz, imgsz, device=device)
     if args.half:
         model = model.half()

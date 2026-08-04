@@ -28,7 +28,7 @@ from PIL import Image
 from torch import nn
 
 from export_timm_classification import add_preprocess_initializers, resize_node
-from train_timm_detection_v2 import (
+from train_timm_detection import (
     DEFAULT_BBOX_LOSS_WEIGHT,
     DEFAULT_DECODER_LAYERS,
     DEFAULT_FPN_CHANNELS,

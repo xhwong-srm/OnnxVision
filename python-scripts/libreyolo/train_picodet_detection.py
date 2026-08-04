@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 from argparse import ArgumentParser, BooleanOptionalAction
 from pathlib import Path
-from typing import Any
+
+from vision_pipeline.datasets.yolo import class_names, configure_determinism, load_yolo_yaml, resolve_workers
 
 
 MODELS = ("s", "m", "l")
@@ -47,46 +47,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_yaml(path: Path) -> dict[str, Any]:
-    try:
-        import yaml
-    except ImportError as error:
-        raise RuntimeError("PyYAML is required and is installed with LibreYOLO") from error
-    try:
-        document = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as error:
-        raise ValueError(f"Cannot read dataset YAML {path}: {error}") from error
-    if not isinstance(document, dict) or "train" not in document or "val" not in document:
-        raise ValueError(f"Dataset YAML must define train and val: {path}")
-    return document
-
-
-def class_names(document: dict[str, Any]) -> list[str]:
-    names = document.get("names")
-    if isinstance(names, list):
-        return [str(name) for name in names]
-    if isinstance(names, dict):
-        try:
-            ordered = sorted((int(key), str(value)) for key, value in names.items())
-        except (TypeError, ValueError) as error:
-            raise ValueError("Dataset names mapping must use integer class IDs") from error
-        if [key for key, _ in ordered] != list(range(len(ordered))):
-            raise ValueError("Dataset class IDs must be contiguous and zero-based")
-        return [value for _, value in ordered]
-    raise ValueError("Dataset YAML must define names as a list or mapping")
-
-
-def configure_determinism(enabled: bool) -> None:
-    if not enabled:
-        return
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    import torch
-
-    torch.use_deterministic_algorithms(True)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-
-
 def main() -> None:
     args = parse_args()
     if args.epochs < 1 or args.batch < 1:
@@ -101,9 +61,9 @@ def main() -> None:
     data = args.data.resolve()
     if not data.is_file():
         raise FileNotFoundError(f"Dataset YAML does not exist: {data}")
-    dataset = load_yaml(data)
+    dataset = load_yolo_yaml(data)
     classes = class_names(dataset)
-    workers = args.workers if args.workers >= 0 else max(0, min(8, (os.cpu_count() or 1) // 2))
+    workers = resolve_workers(args.workers)
     configure_determinism(args.deterministic)
 
     try:

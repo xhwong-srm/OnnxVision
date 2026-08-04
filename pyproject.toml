@@ -24,6 +24,16 @@ dependencies = [
     "ultralytics>=8.4.113",
 ]
 
+[project.scripts]
+seal-vision = "vision_pipeline.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }

@@ -19,7 +19,7 @@ resolution-markers = [
 [[package]]
 name = "0603-seal"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "calflops" },
     { name = "libreyolo" },
