@@ -55,7 +55,9 @@
     <Compile Include="Detection\OnnxObjectDetectionModel.cs" />
     <Compile Include="Imaging\OnnxImageBuffer.cs" />
     <Compile Include="Runtime\OnnxExecutionProvider.cs" />
+    <Compile Include="Runtime\OnnxModelTaskDetector.cs" />
     <Compile Include="Runtime\OnnxRuntimeEnvironment.cs" />
+    <Compile Include="Runtime\OnnxVisionContract.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
   <ItemGroup>

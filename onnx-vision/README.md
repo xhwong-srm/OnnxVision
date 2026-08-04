@@ -77,6 +77,8 @@ Show usage:
 .\onnx-vision\bin\Release\net461\win7-x64\OnnxVisionCLI.exe --help
 ```
 
+The CLI identifies classification versus object detection from the required ONNX metadata contract. Classification models use `onnx-vision-classification`; object-detection models use `onnx-vision-object-detection`. Each model must provide `vision_task`, `contract_name`, `contract_version` (`major.minor.micro`, currently `1.0.0`), and `names`; detection models also provide `nms_required`. Tensor and input validation is then performed by the selected model implementation. The CLI preloads images, runs ten warmup calls, repeats the measured pass as requested, and reports session construction, image loading, warmup calls, shared model calls, measured wall time, end-to-end time, and throughput. `repeats` defaults to `1`.
+
 Classification expects a directory grouped by class name:
 
 ```text
@@ -90,18 +92,20 @@ test-directory/
 ```powershell
 OnnxVisionCLI.exe model.onnx test-directory cpu
 OnnxVisionCLI.exe model.onnx test-directory openvino-cpu --json
+OnnxVisionCLI.exe model.onnx test-directory cpu 5 --json
+OnnxVisionCLI.exe model.onnx test-directory cpu 1 10 20 224 224 --json
 ```
 
-Detection and benchmarking:
+Detection uses the same general command and accepts an optional confidence threshold and repeat count:
 
 ```powershell
-OnnxVisionCLI.exe detect model.onnx image-or-directory 0.5 cpu
-OnnxVisionCLI.exe benchmark-detect model.onnx image-directory 0.5 10 cpu --json
+OnnxVisionCLI.exe model.onnx image-or-directory 0.5 1 cpu
+OnnxVisionCLI.exe model.onnx image-directory 0.5 10 cpu --json
 ```
 
 Supported providers are `cpu`, `openvino-cpu`, and `openvino-gpu`. The report includes both the requested and actual provider because provider initialization may fall back to CPU.
 
-The benchmark preloads Euresys images, measures the shared model call separately, and also reports measured-loop and total end-to-end timings.
+The former `benchmark-detect` command is no longer required. It remains accepted as a compatibility alias and routes through the same detection path with a default of three repeats.
 
 ## Shared API example
 

@@ -18,6 +18,9 @@ namespace OnnxVision
 {
     internal static class Program
     {
+        private const int DefaultWarmups = 10;
+        private const float DetectionNmsIouThreshold = 0.7f;
+
         private static readonly HashSet<string> Extensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             ".bmp", ".jpg", ".jpeg", ".png", ".tif", ".tiff"
@@ -38,12 +41,40 @@ namespace OnnxVision
                     return commandArgs.Length == 0 ? 2 : 0;
                 }
 
-                if (string.Equals(commandArgs[0], "benchmark-detect", StringComparison.OrdinalIgnoreCase))
-                    return RunDetectionBenchmark(commandArgs, json);
-                if (string.Equals(commandArgs[0], "detect", StringComparison.OrdinalIgnoreCase))
-                    return RunDetection(commandArgs, json);
+                int argumentOffset = 0;
+                string command = null;
+                if (string.Equals(commandArgs[0], "detect", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(commandArgs[0], "benchmark-detect", StringComparison.OrdinalIgnoreCase))
+                {
+                    command = commandArgs[0];
+                    argumentOffset = 1;
+                }
 
-                return RunClassification(commandArgs, json);
+                if (commandArgs.Length < argumentOffset + 2)
+                    return UsageError(json, "A model path and image source are required.");
+
+                string modelPath = Path.GetFullPath(commandArgs[argumentOffset]);
+                if (!File.Exists(modelPath))
+                    return UsageError(json, "Model does not exist.");
+
+                var endToEnd = Stopwatch.StartNew();
+                var taskDetection = Stopwatch.StartNew();
+                OnnxVisionTask task = OnnxModelTaskDetector.Detect(modelPath);
+                taskDetection.Stop();
+
+                if (command != null && task != OnnxVisionTask.ObjectDetection)
+                    return UsageError(json, "The model does not match the object-detection metadata contract.");
+
+                int defaultRepeats = string.Equals(command, "benchmark-detect",
+                    StringComparison.OrdinalIgnoreCase) ? 3 : 1;
+                if (task == OnnxVisionTask.ObjectDetection)
+                {
+                    return RunDetection(commandArgs, json, argumentOffset, defaultRepeats,
+                        taskDetection.Elapsed.TotalMilliseconds, endToEnd);
+                }
+
+                return RunClassification(commandArgs, json, argumentOffset, defaultRepeats,
+                    taskDetection.Elapsed.TotalMilliseconds, endToEnd);
             }
             catch (Exception error)
             {
@@ -52,28 +83,23 @@ namespace OnnxVision
             }
         }
 
-        private static int RunClassification(string[] args, bool json)
+        private static int RunClassification(string[] args, bool json, int offset,
+            int defaultRepeats, double taskDetectionMilliseconds, Stopwatch endToEnd)
         {
-            if (args.Length != 2 && args.Length != 3 && args.Length != 6 && args.Length != 7)
-            {
-                return UsageError(json,
-                    "Usage: OnnxVisionCLI.exe <model.onnx> <test-directory> [cpu|openvino-cpu|openvino-gpu] [roi-x roi-y roi-width roi-height]");
-            }
-
-            string modelPath = Path.GetFullPath(args[0]);
-            string testDirectory = Path.GetFullPath(args[1]);
-            if (!File.Exists(modelPath) || !Directory.Exists(testDirectory))
-                return UsageError(json, "Model or test directory does not exist.");
+            string modelPath = Path.GetFullPath(args[offset]);
+            string testDirectory = Path.GetFullPath(args[offset + 1]);
+            if (!Directory.Exists(testDirectory))
+                return UsageError(json, "Test directory does not exist.");
 
             RoiPlacement roi;
-            if (!TryParseRoi(args, out roi))
-                return UsageError(json, "ROI values must be integers; width and height must be positive.");
-
             OnnxExecutionProvider[] providers;
-            if (!TryParseClassificationProvider(args, out providers))
+            int repeats;
+            if (!TryParseClassificationArguments(args, offset, defaultRepeats,
+                out providers, out repeats, out roi))
             {
                 return UsageError(json,
-                    "Execution provider must be 'cpu', 'openvino-cpu', or 'openvino-gpu'.");
+                    "Usage: OnnxVisionCLI.exe <model.onnx> <test-directory> " +
+                    "[provider] [repeats] [roi-x roi-y roi-width roi-height]");
             }
 
             string[] imagePaths = EnumerateImages(testDirectory);
@@ -91,10 +117,16 @@ namespace OnnxVision
 
                 try
                 {
-                    int warmups = Math.Min(20, images.Count);
+                    int warmups = Math.Min(DefaultWarmups, images.Count);
+                    long warmupModelCallTicks = 0;
                     for (int index = 0; index < warmups; index++)
+                    {
+                        long callStarted = Stopwatch.GetTimestamp();
                         images[index].Classify(classifier, roi);
+                        warmupModelCallTicks += Stopwatch.GetTimestamp() - callStarted;
+                    }
 
+                    int executions = checked(images.Count * repeats);
                     var predictions = new List<Dictionary<string, object>>();
                     var rocScores = new List<RocPoint>();
                     var errors = new List<string>();
@@ -112,74 +144,84 @@ namespace OnnxVision
                     int trueNegatives = 0;
                     int flippedIndex = FindClassIndex(classifier.ClassNames, "flipped");
 
-                    foreach (LoadedImage image in images)
+                    for (int repeat = 0; repeat < repeats; repeat++)
                     {
-                        string expected = new DirectoryInfo(Path.GetDirectoryName(image.Path)).Name;
-                        long callStarted = Stopwatch.GetTimestamp();
-                        OnnxClassification prediction = image.Classify(classifier, roi);
-                        modelCallTicks += Stopwatch.GetTimestamp() - callStarted;
-                        onnxInferenceMilliseconds += prediction.InferenceMilliseconds;
-
-                        bool isCorrect = string.Equals(expected, prediction.ClassName,
-                            StringComparison.OrdinalIgnoreCase);
-                        if (isCorrect)
-                            correct++;
-                        else
-                            errors.Add(string.Format(CultureInfo.InvariantCulture,
-                                "{0} -> {1} ({2:P2})",
-                                MakeRelative(testDirectory, image.Path), prediction.ClassName,
-                                prediction.Confidence));
-
-                        if (string.Equals(expected, "flipped", StringComparison.OrdinalIgnoreCase))
+                        foreach (LoadedImage image in images)
                         {
-                            flippedTotal++;
+                            string expected = new DirectoryInfo(Path.GetDirectoryName(image.Path)).Name;
+                            long callStarted = Stopwatch.GetTimestamp();
+                            OnnxClassification prediction = image.Classify(classifier, roi);
+                            modelCallTicks += Stopwatch.GetTimestamp() - callStarted;
+                            onnxInferenceMilliseconds += prediction.InferenceMilliseconds;
+
+                            if (repeat != 0)
+                                continue;
+
+                            bool isCorrect = string.Equals(expected, prediction.ClassName,
+                                StringComparison.OrdinalIgnoreCase);
                             if (isCorrect)
-                                flippedCorrect++;
-                        }
-                        else if (string.Equals(expected, "normal", StringComparison.OrdinalIgnoreCase))
-                        {
-                            normalTotal++;
-                            if (isCorrect)
-                                normalCorrect++;
-                        }
+                                correct++;
+                            else
+                                errors.Add(string.Format(CultureInfo.InvariantCulture,
+                                    "{0} -> {1} ({2:P2})",
+                                    MakeRelative(testDirectory, image.Path), prediction.ClassName,
+                                    prediction.Confidence));
 
-                        bool actualPositive = string.Equals(expected, "flipped", StringComparison.OrdinalIgnoreCase);
-                        bool predictedPositive = string.Equals(prediction.ClassName, "flipped", StringComparison.OrdinalIgnoreCase);
-                        if (actualPositive && predictedPositive)
-                            truePositives++;
-                        else if (!actualPositive && predictedPositive)
-                            falsePositives++;
-                        else if (actualPositive)
-                            falseNegatives++;
-                        else
-                            trueNegatives++;
+                            if (string.Equals(expected, "flipped", StringComparison.OrdinalIgnoreCase))
+                            {
+                                flippedTotal++;
+                                if (isCorrect)
+                                    flippedCorrect++;
+                            }
+                            else if (string.Equals(expected, "normal", StringComparison.OrdinalIgnoreCase))
+                            {
+                                normalTotal++;
+                                if (isCorrect)
+                                    normalCorrect++;
+                            }
 
-                        if (flippedIndex >= 0 && prediction.Probabilities != null &&
-                            prediction.Probabilities.Count > flippedIndex)
-                        {
-                            rocScores.Add(new RocPoint(actualPositive, prediction.Probabilities[flippedIndex]));
+                            bool actualPositive = string.Equals(expected, "flipped", StringComparison.OrdinalIgnoreCase);
+                            bool predictedPositive = string.Equals(prediction.ClassName, "flipped", StringComparison.OrdinalIgnoreCase);
+                            if (actualPositive && predictedPositive)
+                                truePositives++;
+                            else if (!actualPositive && predictedPositive)
+                                falsePositives++;
+                            else if (actualPositive)
+                                falseNegatives++;
+                            else
+                                trueNegatives++;
+
+                            if (flippedIndex >= 0 && prediction.Probabilities != null &&
+                                prediction.Probabilities.Count > flippedIndex)
+                            {
+                                rocScores.Add(new RocPoint(actualPositive, prediction.Probabilities[flippedIndex]));
+                            }
+
+                            predictions.Add(new Dictionary<string, object>
+                            {
+                                { "path", MakeRelative(testDirectory, image.Path) },
+                                { "expected", expected },
+                                { "class_name", prediction.ClassName },
+                                { "class_index", prediction.ClassIndex },
+                                { "confidence", prediction.Confidence },
+                                { "probabilities", prediction.Probabilities }
+                            });
                         }
-
-                        predictions.Add(new Dictionary<string, object>
-                        {
-                            { "path", MakeRelative(testDirectory, image.Path) },
-                            { "expected", expected },
-                            { "class_name", prediction.ClassName },
-                            { "class_index", prediction.ClassIndex },
-                            { "confidence", prediction.Confidence },
-                            { "probabilities", prediction.Probabilities }
-                        });
                     }
                     measuredWall.Stop();
+                    endToEnd.Stop();
 
                     if (json)
                     {
                         PrintJson(BuildClassificationReport(modelPath, classifier, providers,
-                            imagePaths.Length, warmups, construction.Elapsed.TotalMilliseconds,
-                            loadTimer.Elapsed.TotalMilliseconds, measuredWall.Elapsed.TotalMilliseconds,
-                            modelCallTicks, onnxInferenceMilliseconds, correct, flippedCorrect,
-                            flippedTotal, normalCorrect, normalTotal, truePositives, falsePositives,
-                            falseNegatives, trueNegatives, rocScores, predictions, errors));
+                            imagePaths.Length, warmups, repeats, executions,
+                            taskDetectionMilliseconds, construction.Elapsed.TotalMilliseconds,
+                            loadTimer.Elapsed.TotalMilliseconds, warmupModelCallTicks,
+                            measuredWall.Elapsed.TotalMilliseconds, modelCallTicks,
+                            onnxInferenceMilliseconds, endToEnd.Elapsed.TotalMilliseconds,
+                            correct, flippedCorrect, flippedTotal, normalCorrect, normalTotal,
+                            truePositives, falsePositives, falseNegatives, trueNegatives,
+                            rocScores, predictions, errors));
                     }
                     else
                     {
@@ -187,16 +229,13 @@ namespace OnnxVision
                         PrintClassificationMetrics(correct, imagePaths.Length, flippedCorrect, flippedTotal,
                             normalCorrect, normalTotal, truePositives, falsePositives, falseNegatives,
                             trueNegatives, rocScores);
-                        Console.WriteLine("Session construction: {0:F3} ms", construction.Elapsed.TotalMilliseconds);
-                        Console.WriteLine("Image load: {0:F3} ms", loadTimer.Elapsed.TotalMilliseconds);
-                        Console.WriteLine("End-to-end: {0:F3} ms/image ({1:F1} images/s)",
-                            measuredWall.Elapsed.TotalMilliseconds / imagePaths.Length,
-                            imagePaths.Length / measuredWall.Elapsed.TotalSeconds);
-                        Console.WriteLine("Shared model call: {0:F3} ms/image ({1:F1} images/s)",
-                            TicksToMilliseconds(modelCallTicks) / imagePaths.Length,
-                            imagePaths.Length / Math.Max(0.000001, TicksToMilliseconds(modelCallTicks) / 1000.0));
+                        PrintTimingInformation(taskDetectionMilliseconds,
+                            imagePaths.Length, repeats, warmups,
+                            construction.Elapsed.TotalMilliseconds, loadTimer.Elapsed.TotalMilliseconds,
+                            warmupModelCallTicks, modelCallTicks, measuredWall.Elapsed.TotalMilliseconds,
+                            endToEnd.Elapsed.TotalMilliseconds, executions);
                         Console.WriteLine("ONNX inference: {0:F3} ms/image",
-                            onnxInferenceMilliseconds / imagePaths.Length);
+                            onnxInferenceMilliseconds / executions);
                         foreach (string error in errors)
                             Console.WriteLine("Mismatch: " + error);
                     }
@@ -210,129 +249,31 @@ namespace OnnxVision
             return 0;
         }
 
-        private static int RunDetection(string[] args, bool json)
+        private static int RunDetection(string[] args, bool json, int offset,
+            int defaultRepeats, double taskDetectionMilliseconds, Stopwatch endToEnd)
         {
-            if (args.Length < 3 || args.Length > 5)
-            {
-                return UsageError(json,
-                    "Usage: OnnxVisionCLI.exe detect <model.onnx> <image-or-directory> [confidence] [cpu|openvino-cpu|openvino-gpu]");
-            }
-
-            string modelPath = Path.GetFullPath(args[1]);
-            string imageSource = Path.GetFullPath(args[2]);
+            string modelPath = Path.GetFullPath(args[offset]);
+            string imageSource = Path.GetFullPath(args[offset + 1]);
             float threshold;
-            if (!TryParseThreshold(args.Length >= 4 ? args[3] : null, out threshold))
-                return UsageError(json, "Confidence must be a number between zero and one.");
-
             OnnxExecutionProvider[] providers;
-            if (!TryParseProvider(args.Length == 5 ? args[4] : null, out providers))
+            int repeats;
+            if (!TryParseDetectionArguments(args, offset, defaultRepeats,
+                out threshold, out repeats, out providers))
             {
                 return UsageError(json,
-                    "Execution provider must be 'cpu', 'openvino-cpu', or 'openvino-gpu'.");
+                    "Usage: OnnxVisionCLI.exe <model.onnx> <image-or-directory> " +
+                    "[confidence] [repeats] [provider]");
             }
 
-            if (!File.Exists(modelPath) || (!File.Exists(imageSource) && !Directory.Exists(imageSource)))
-                return UsageError(json, "Model or image source does not exist.");
+            if (!File.Exists(imageSource) && !Directory.Exists(imageSource))
+                return UsageError(json, "Image or image directory does not exist.");
 
-            string[] images = File.Exists(imageSource)
+            string[] imagePaths = File.Exists(imageSource)
                 ? new[] { imageSource }
                 : EnumerateImages(imageSource);
-            if (images.Length == 0)
-                return UsageError(json, "No supported images were found.");
-
-            var construction = Stopwatch.StartNew();
-            using (var detector = new OnnxObjectDetectionModel(modelPath, null, providers))
-            {
-                construction.Stop();
-                    var results = new List<Dictionary<string, object>>();
-                    long modelCallTicks = 0;
-                    var loadTimer = Stopwatch.StartNew();
-                    List<LoadedImage> loadedImages = LoadImages(images, detector.RequiresColorInput);
-                    loadTimer.Stop();
-
-                    try
-                    {
-                        foreach (LoadedImage image in loadedImages)
-                        {
-                            long callStarted = Stopwatch.GetTimestamp();
-                            IReadOnlyList<OnnxDetection> detections = image.Detect(detector, threshold, 0.7f);
-                            modelCallTicks += Stopwatch.GetTimestamp() - callStarted;
-                            results.Add(BuildDetectionImageResult(image.Path, detections));
-
-                            if (!json)
-                            {
-                                Console.WriteLine("{0}: {1} detection(s)", image.Path, detections.Count);
-                                foreach (OnnxDetection detection in detections)
-                                {
-                                    Console.WriteLine("  {0} {1:F4} [{2:F1}, {3:F1}, {4:F1}, {5:F1}]",
-                                        detection.ClassName, detection.Confidence,
-                                        detection.X1, detection.Y1, detection.X2, detection.Y2);
-                                }
-                            }
-                        }
-
-                        if (json)
-                        {
-                            var report = BuildBaseReport("detect", modelPath, detector, providers);
-                            report["confidence_threshold"] = threshold;
-                            report["nms_iou_threshold"] = 0.7f;
-                            report["images"] = results;
-                            report["timing"] = BuildTimingReport(construction.Elapsed.TotalMilliseconds,
-                                loadTimer.Elapsed.TotalMilliseconds, modelCallTicks,
-                                TicksToMilliseconds(modelCallTicks), images.Length);
-                            PrintJson(report);
-                        }
-                        else
-                        {
-                            PrintDetectionInformation(detector, providers, construction.Elapsed.TotalMilliseconds);
-                            Console.WriteLine("Image load: {0:F3} ms", loadTimer.Elapsed.TotalMilliseconds);
-                            Console.WriteLine("Shared model call: {0:F3} ms/image ({1:F1} images/s)",
-                                TicksToMilliseconds(modelCallTicks) / images.Length,
-                                images.Length / Math.Max(0.000001, TicksToMilliseconds(modelCallTicks) / 1000.0));
-                        }
-                    }
-                    finally
-                    {
-                        DisposeImages(loadedImages);
-                    }
-            }
-
-            return 0;
-        }
-
-        private static int RunDetectionBenchmark(string[] args, bool json)
-        {
-            if (args.Length < 3 || args.Length > 6)
-            {
-                return UsageError(json,
-                    "Usage: OnnxVisionCLI.exe benchmark-detect <model.onnx> <image-directory> [confidence] [repeats] [cpu|openvino-cpu|openvino-gpu]");
-            }
-
-            string modelPath = Path.GetFullPath(args[1]);
-            string imageDirectory = Path.GetFullPath(args[2]);
-            float threshold;
-            if (!TryParseThreshold(args.Length >= 4 ? args[3] : null, out threshold))
-                return UsageError(json, "Confidence must be a number between zero and one.");
-
-            int repeats = 3;
-            if (args.Length >= 5 && (!int.TryParse(args[4], out repeats) || repeats < 1))
-                return UsageError(json, "Repeats must be a positive integer.");
-
-            OnnxExecutionProvider[] providers;
-            if (!TryParseProvider(args.Length == 6 ? args[5] : null, out providers))
-            {
-                return UsageError(json,
-                    "Execution provider must be 'cpu', 'openvino-cpu', or 'openvino-gpu'.");
-            }
-
-            if (!File.Exists(modelPath) || !Directory.Exists(imageDirectory))
-                return UsageError(json, "Model or image directory does not exist.");
-
-            string[] imagePaths = EnumerateImages(imageDirectory);
             if (imagePaths.Length == 0)
                 return UsageError(json, "No supported images were found.");
 
-            var endToEnd = Stopwatch.StartNew();
             var construction = Stopwatch.StartNew();
             using (var detector = new OnnxObjectDetectionModel(modelPath, null, providers))
             {
@@ -343,11 +284,17 @@ namespace OnnxVision
 
                 try
                 {
-                    int warmups = Math.Min(10, images.Count);
+                    int warmups = Math.Min(DefaultWarmups, images.Count);
+                    long warmupModelCallTicks = 0;
                     for (int index = 0; index < warmups; index++)
-                        images[index].Detect(detector, threshold, 0.7f);
+                    {
+                        long callStarted = Stopwatch.GetTimestamp();
+                        images[index].Detect(detector, threshold, DetectionNmsIouThreshold);
+                        warmupModelCallTicks += Stopwatch.GetTimestamp() - callStarted;
+                    }
 
                     int executions = checked(images.Count * repeats);
+                    var results = new List<Dictionary<string, object>>();
                     long modelCallTicks = 0;
                     int detectionCount = 0;
                     double confidenceSum = 0;
@@ -358,7 +305,8 @@ namespace OnnxVision
                         foreach (LoadedImage image in images)
                         {
                             long callStarted = Stopwatch.GetTimestamp();
-                            IReadOnlyList<OnnxDetection> detections = image.Detect(detector, threshold, 0.7f);
+                            IReadOnlyList<OnnxDetection> detections = image.Detect(
+                                detector, threshold, DetectionNmsIouThreshold);
                             modelCallTicks += Stopwatch.GetTimestamp() - callStarted;
                             detectionCount += detections.Count;
                             foreach (OnnxDetection detection in detections)
@@ -366,53 +314,52 @@ namespace OnnxVision
                                 classCounts[detection.ClassName]++;
                                 confidenceSum += detection.Confidence;
                             }
+
+                            if (repeat == 0)
+                            {
+                                results.Add(BuildDetectionImageResult(image.Path, detections));
+                                if (!json)
+                                {
+                                    Console.WriteLine("{0}: {1} detection(s)", image.Path, detections.Count);
+                                    foreach (OnnxDetection detection in detections)
+                                    {
+                                        Console.WriteLine("  {0} {1:F4} [{2:F1}, {3:F1}, {4:F1}, {5:F1}]",
+                                            detection.ClassName, detection.Confidence,
+                                            detection.X1, detection.Y1, detection.X2, detection.Y2);
+                                    }
+                                }
+                            }
                         }
                     }
                     measuredWall.Stop();
                     endToEnd.Stop();
 
-                    double totalWallMilliseconds = endToEnd.Elapsed.TotalMilliseconds;
-                    double modelCallMilliseconds = TicksToMilliseconds(modelCallTicks);
-                    var timing = BuildTimingReport(construction.Elapsed.TotalMilliseconds,
-                        loadTimer.Elapsed.TotalMilliseconds, modelCallTicks,
-                        measuredWall.Elapsed.TotalMilliseconds, executions);
-                    timing["end_to_end_milliseconds"] = totalWallMilliseconds;
-                    timing["end_to_end_milliseconds_per_image"] = totalWallMilliseconds / executions;
-                    timing["end_to_end_images_per_second"] = executions /
-                        Math.Max(0.000001, totalWallMilliseconds / 1000.0);
-
                     if (json)
                     {
-                        var report = BuildBaseReport("benchmark-detect", modelPath, detector, providers);
+                        var report = BuildBaseReport("detect", modelPath, detector, providers);
                         report["confidence_threshold"] = threshold;
-                        report["nms_iou_threshold"] = 0.7f;
-                        report["images"] = images.Count;
+                        report["nms_iou_threshold"] = DetectionNmsIouThreshold;
+                        report["images"] = results;
                         report["repeats"] = repeats;
                         report["executions"] = executions;
                         report["warmups"] = warmups;
-                        report["timing"] = timing;
                         report["detections"] = detectionCount;
                         report["confidence_sum"] = confidenceSum;
                         report["class_counts"] = classCounts;
+                        report["timing"] = BuildTimingReport(taskDetectionMilliseconds,
+                            construction.Elapsed.TotalMilliseconds, loadTimer.Elapsed.TotalMilliseconds,
+                            warmupModelCallTicks, modelCallTicks, measuredWall.Elapsed.TotalMilliseconds,
+                            endToEnd.Elapsed.TotalMilliseconds, executions);
                         PrintJson(report);
                     }
                     else
                     {
-                        Console.WriteLine("Provider: {0}", detector.ActualProvider);
-                        Console.WriteLine("Requested providers: {0}", FormatProviders(providers));
-                        Console.WriteLine("Images: {0}; repeats: {1}; executions: {2}; warmups: {3}",
-                            images.Count, repeats, executions, warmups);
-                        Console.WriteLine("Session construction: {0:F3} ms", construction.Elapsed.TotalMilliseconds);
-                        Console.WriteLine("Image load: {0:F3} ms", loadTimer.Elapsed.TotalMilliseconds);
-                        Console.WriteLine("Measured wall: {0:F3} ms/image ({1:F2} images/s)",
-                            measuredWall.Elapsed.TotalMilliseconds / executions,
-                            executions / measuredWall.Elapsed.TotalSeconds);
-                        Console.WriteLine("Shared model call: {0:F3} ms/image ({1:F2} images/s)",
-                            modelCallMilliseconds / executions,
-                            executions / Math.Max(0.000001, modelCallMilliseconds / 1000.0));
-                        Console.WriteLine("End-to-end: {0:F3} ms/image ({1:F2} images/s)",
-                            totalWallMilliseconds / executions,
-                            executions / Math.Max(0.000001, totalWallMilliseconds / 1000.0));
+                        PrintDetectionInformation(detector, providers);
+                        PrintTimingInformation(taskDetectionMilliseconds,
+                            images.Count, repeats, warmups,
+                            construction.Elapsed.TotalMilliseconds, loadTimer.Elapsed.TotalMilliseconds,
+                            warmupModelCallTicks, modelCallTicks, measuredWall.Elapsed.TotalMilliseconds,
+                            endToEnd.Elapsed.TotalMilliseconds, executions);
                         Console.WriteLine("NMS required: {0}", detector.NmsRequired);
                         Console.WriteLine("Detections: {0}; confidence sum: {1:F6}", detectionCount, confidenceSum);
                         Console.WriteLine("Class counts: " + string.Join(", ",
@@ -430,10 +377,12 @@ namespace OnnxVision
 
         private static Dictionary<string, object> BuildClassificationReport(
             string modelPath, OnnxClassificationModel classifier,
-            OnnxExecutionProvider[] providers, int imageCount, int warmups,
+            OnnxExecutionProvider[] providers, int imageCount, int warmups, int repeats,
+            int executions, double taskDetectionMilliseconds,
             double constructionMilliseconds, double loadMilliseconds,
-            double measuredWallMilliseconds, long modelCallTicks,
-            double onnxInferenceMilliseconds, int correct, int flippedCorrect,
+            long warmupModelCallTicks, double measuredWallMilliseconds,
+            long modelCallTicks, double onnxInferenceMilliseconds,
+            double endToEndMilliseconds, int correct, int flippedCorrect,
             int flippedTotal, int normalCorrect, int normalTotal, int truePositives,
             int falsePositives, int falseNegatives, int trueNegatives,
             List<RocPoint> rocScores, List<Dictionary<string, object>> predictions,
@@ -442,6 +391,8 @@ namespace OnnxVision
             var report = BuildBaseReport("classify", modelPath, classifier, providers);
             report["images"] = predictions;
             report["warmups"] = warmups;
+            report["repeats"] = repeats;
+            report["executions"] = executions;
             report["summary"] = new Dictionary<string, object>
             {
                 { "correct", correct },
@@ -460,11 +411,12 @@ namespace OnnxVision
                 { "roc_auc_flipped_positive", CalculateAuc(rocScores) },
                 { "errors", errors }
             };
-            report["timing"] = BuildTimingReport(constructionMilliseconds,
-                loadMilliseconds, modelCallTicks, measuredWallMilliseconds, imageCount);
+            report["timing"] = BuildTimingReport(taskDetectionMilliseconds,
+                constructionMilliseconds, loadMilliseconds, warmupModelCallTicks,
+                modelCallTicks, measuredWallMilliseconds, endToEndMilliseconds, executions);
             ((Dictionary<string, object>)report["timing"])["onnx_inference_milliseconds"] = onnxInferenceMilliseconds;
             ((Dictionary<string, object>)report["timing"])["onnx_inference_milliseconds_per_image"] =
-                onnxInferenceMilliseconds / imageCount;
+                onnxInferenceMilliseconds / executions;
             return report;
         }
 
@@ -474,7 +426,10 @@ namespace OnnxVision
         {
             var report = new Dictionary<string, object>();
             report["command"] = command;
+            report["task"] = "classification";
             report["model"] = modelPath;
+            report["contract"] = OnnxVisionContract.ClassificationName;
+            report["contract_version"] = OnnxVisionContract.Version;
             report["requested_providers"] = providers.Select(item => item.ToString()).ToArray();
             report["actual_provider"] = model.ActualProvider.ToString();
             report["input"] = new Dictionary<string, object>
@@ -493,10 +448,12 @@ namespace OnnxVision
         {
             var report = new Dictionary<string, object>();
             report["command"] = command;
+            report["task"] = "object_detection";
             report["model"] = modelPath;
+            report["contract"] = OnnxVisionContract.ObjectDetectionName;
+            report["contract_version"] = OnnxVisionContract.Version;
             report["requested_providers"] = providers.Select(item => item.ToString()).ToArray();
             report["actual_provider"] = model.ActualProvider.ToString();
-            report["contract"] = "onnx-vision-detection-v1";
             report["nms_required"] = model.NmsRequired;
             report["input"] = new Dictionary<string, object>
             {
@@ -510,20 +467,27 @@ namespace OnnxVision
         }
 
         private static Dictionary<string, object> BuildTimingReport(
-            double constructionMilliseconds, double loadMilliseconds,
-            long modelCallTicks, double measuredWallMilliseconds, int executions)
+            double taskDetectionMilliseconds, double constructionMilliseconds,
+            double loadMilliseconds, long warmupModelCallTicks, long modelCallTicks,
+            double measuredWallMilliseconds, double endToEndMilliseconds, int executions)
         {
+            double warmupModelCallMilliseconds = TicksToMilliseconds(warmupModelCallTicks);
             double modelCallMilliseconds = TicksToMilliseconds(modelCallTicks);
             return new Dictionary<string, object>
             {
+                { "task_detection_milliseconds", taskDetectionMilliseconds },
                 { "session_construction_milliseconds", constructionMilliseconds },
                 { "image_load_milliseconds", loadMilliseconds },
+                { "warmup_model_call_milliseconds", warmupModelCallMilliseconds },
                 { "model_call_milliseconds", modelCallMilliseconds },
                 { "model_call_milliseconds_per_image", modelCallMilliseconds / executions },
                 { "model_call_images_per_second", executions / Math.Max(0.000001, modelCallMilliseconds / 1000.0) },
                 { "measured_wall_milliseconds", measuredWallMilliseconds },
                 { "measured_wall_milliseconds_per_image", measuredWallMilliseconds / executions },
-                { "measured_images_per_second", executions / Math.Max(0.000001, measuredWallMilliseconds / 1000.0) }
+                { "measured_images_per_second", executions / Math.Max(0.000001, measuredWallMilliseconds / 1000.0) },
+                { "end_to_end_milliseconds", endToEndMilliseconds },
+                { "end_to_end_milliseconds_per_image", endToEndMilliseconds / executions },
+                { "end_to_end_images_per_second", executions / Math.Max(0.000001, endToEndMilliseconds / 1000.0) }
             };
         }
 
@@ -565,15 +529,39 @@ namespace OnnxVision
         }
 
         private static void PrintDetectionInformation(
-            OnnxObjectDetectionModel detector, OnnxExecutionProvider[] providers,
-            double constructionMilliseconds)
+            OnnxObjectDetectionModel detector, OnnxExecutionProvider[] providers)
         {
-            Console.WriteLine("Detection contract: onnx-vision-detection-v1");
+            Console.WriteLine("Detection contract: {0} {1}",
+                OnnxVisionContract.ObjectDetectionName, OnnxVisionContract.Version);
             Console.WriteLine("Provider: {0}", detector.ActualProvider);
             Console.WriteLine("Requested providers: {0}", FormatProviders(providers));
             Console.WriteLine("Input contract: " + detector.InputDescription);
-            Console.WriteLine("Session construction: {0:F3} ms", constructionMilliseconds);
             Console.WriteLine("NMS required: {0}", detector.NmsRequired);
+        }
+
+        private static void PrintTimingInformation(
+            double taskDetectionMilliseconds, int imageCount, int repeats, int warmups,
+            double constructionMilliseconds, double loadMilliseconds,
+            long warmupModelCallTicks, long modelCallTicks,
+            double measuredWallMilliseconds, double endToEndMilliseconds, int executions)
+        {
+            double warmupModelCallMilliseconds = TicksToMilliseconds(warmupModelCallTicks);
+            double modelCallMilliseconds = TicksToMilliseconds(modelCallTicks);
+            Console.WriteLine("Images: {0}; repeats: {1}; executions: {2}; warmups: {3}",
+                imageCount, repeats, executions, warmups);
+            Console.WriteLine("Task detection: {0:F3} ms", taskDetectionMilliseconds);
+            Console.WriteLine("Session construction: {0:F3} ms", constructionMilliseconds);
+            Console.WriteLine("Image load: {0:F3} ms", loadMilliseconds);
+            Console.WriteLine("Warmup model call: {0:F3} ms", warmupModelCallMilliseconds);
+            Console.WriteLine("Measured wall: {0:F3} ms/image ({1:F2} images/s)",
+                measuredWallMilliseconds / executions,
+                executions / Math.Max(0.000001, measuredWallMilliseconds / 1000.0));
+            Console.WriteLine("Shared model call: {0:F3} ms/image ({1:F2} images/s)",
+                modelCallMilliseconds / executions,
+                executions / Math.Max(0.000001, modelCallMilliseconds / 1000.0));
+            Console.WriteLine("End-to-end: {0:F3} ms/image ({1:F2} images/s)",
+                endToEndMilliseconds / executions,
+                executions / Math.Max(0.000001, endToEndMilliseconds / 1000.0));
         }
 
         private static void PrintClassificationMetrics(
@@ -617,11 +605,95 @@ namespace OnnxVision
             Console.WriteLine("ROC AUC (flipped positive): {0:F4}", CalculateAuc(rocScores));
         }
 
-        private static bool TryParseClassificationProvider(
-            string[] args, out OnnxExecutionProvider[] providers)
+        private static bool TryParseClassificationArguments(string[] args, int offset,
+            int defaultRepeats, out OnnxExecutionProvider[] providers, out int repeats,
+            out RoiPlacement roi)
         {
-            string value = args.Length == 3 || args.Length == 7 ? args[2] : null;
-            return TryParseProvider(value, out providers);
+            providers = new[] { OnnxExecutionProvider.Cpu };
+            repeats = defaultRepeats;
+            roi = null;
+
+            int index = offset + 2;
+            int repeatArguments = 0;
+            int providerArguments = 0;
+            while (index < args.Length)
+            {
+                if (args.Length - index == 4 && TryParseRoi(args, index, out roi))
+                {
+                    index += 4;
+                    continue;
+                }
+
+                OnnxExecutionProvider[] parsedProviders;
+                if (TryParseProvider(args[index], out parsedProviders))
+                {
+                    if (++providerArguments > 1)
+                        return false;
+                    providers = parsedProviders;
+                    index++;
+                    continue;
+                }
+
+                int parsedRepeats;
+                if (!TryParsePositiveInteger(args[index], out parsedRepeats) || ++repeatArguments > 1)
+                    return false;
+                repeats = parsedRepeats;
+                index++;
+            }
+
+            return repeatArguments <= 1 && providerArguments <= 1;
+        }
+
+        private static bool TryParseDetectionArguments(string[] args, int offset,
+            int defaultRepeats, out float threshold, out int repeats,
+            out OnnxExecutionProvider[] providers)
+        {
+            threshold = 0.5f;
+            repeats = defaultRepeats;
+            providers = new[] { OnnxExecutionProvider.Cpu };
+            bool thresholdSpecified = false;
+            bool repeatsSpecified = false;
+            bool providerSpecified = false;
+
+            int index = offset + 2;
+            if (args.Length - index > 3)
+                return false;
+
+            while (index < args.Length)
+            {
+                OnnxExecutionProvider[] parsedProviders;
+                if (TryParseProvider(args[index], out parsedProviders))
+                {
+                    if (providerSpecified)
+                        return false;
+                    providers = parsedProviders;
+                    providerSpecified = true;
+                    index++;
+                    continue;
+                }
+
+                float parsedThreshold;
+                if (!thresholdSpecified && TryParseThreshold(args[index], out parsedThreshold))
+                {
+                    threshold = parsedThreshold;
+                    thresholdSpecified = true;
+                    index++;
+                    continue;
+                }
+
+                int parsedRepeats;
+                if (!repeatsSpecified && TryParsePositiveInteger(args[index], out parsedRepeats))
+                {
+                    repeats = parsedRepeats;
+                    repeatsSpecified = true;
+                    index++;
+                    continue;
+                }
+
+                return false;
+            }
+
+            return true;
         }
 
         private static bool TryParseProvider(
@@ -659,13 +731,15 @@ namespace OnnxVision
                 threshold >= 0 && threshold <= 1;
         }
 
-        private static bool TryParseRoi(string[] args, out RoiPlacement placement)
+        private static bool TryParsePositiveInteger(string value, out int result)
+        {
+            return int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out result) &&
+                result > 0;
+        }
+
+        private static bool TryParseRoi(string[] args, int offset, out RoiPlacement placement)
         {
             placement = null;
-            if (args.Length == 2 || args.Length == 3)
-                return true;
-
-            int offset = args.Length == 7 ? 3 : 2;
             int x;
             int y;
             int width;
@@ -746,10 +820,12 @@ namespace OnnxVision
         private static void PrintUsage()
         {
             Console.WriteLine("Usage:");
-            Console.WriteLine("  OnnxVisionCLI.exe <model.onnx> <test-directory> [provider] [roi-x roi-y roi-width roi-height] [--json]");
-            Console.WriteLine("  OnnxVisionCLI.exe detect <model.onnx> <image-or-directory> [confidence] [provider] [--json]");
-            Console.WriteLine("  OnnxVisionCLI.exe benchmark-detect <model.onnx> <image-directory> [confidence] [repeats] [provider] [--json]");
+            Console.WriteLine("  OnnxVisionCLI.exe <model.onnx> <image-or-directory> [task options] [--json]");
+            Console.WriteLine("  Classification options: [provider] [repeats] [roi-x roi-y roi-width roi-height]");
+            Console.WriteLine("  Detection options: [confidence] [repeats] [provider]");
+            Console.WriteLine("  'detect' remains an optional object-detection command alias.");
             Console.WriteLine("Providers: cpu, openvino-cpu, openvino-gpu");
+            Console.WriteLine("Models are classified automatically from their ONNX metadata contract.");
         }
 
         private static bool IsHelp(string[] args)

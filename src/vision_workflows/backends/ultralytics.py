@@ -10,7 +10,7 @@ from ..workflows.context import WorkflowContext, optional_import
 from ..workflows.requests import ExportRequest, TestRequest, TrainRequest, ValidateRequest
 from ..workflows.runs import artifact
 from .base import BackendExecution, ModelBackend
-from .common import artifacts_for, detection_contract, require_file, set_onnx_metadata, validate_onnx
+from .common import artifacts_for, class_names_from_model, detection_contract, metadata_for_contract, require_file, set_onnx_metadata, validate_onnx
 
 
 @dataclass(frozen=True)
@@ -68,8 +68,11 @@ class UltralyticsBackend(ModelBackend):
         output.parent.mkdir(parents=True, exist_ok=True)
         if exported.resolve() != output:
             exported.replace(output)
-        contract = detection_contract([], nms_required=bool(request.options.get("nms_required", False)))
-        set_onnx_metadata(output, {"contract_version": contract["version"], "nms_required": contract["nms_required"], "names": contract["names"]})
+        names = class_names_from_model(model)
+        if not names:
+            raise ValueError("the exported detection model does not expose class names")
+        contract = detection_contract(names, nms_required=bool(request.options.get("nms_required", False)))
+        set_onnx_metadata(output, metadata_for_contract(contract))
         checks = validate_onnx(output, contract)
         return Execution((artifact(output, "onnx"),), {}, contract, checks)
 

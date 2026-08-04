@@ -44,6 +44,8 @@ namespace OnnxVision.Classification
             session = CreateSession(modelPath, providers, out OnnxExecutionProvider actualProvider);
             ActualProvider = actualProvider;
 
+            ValidateContract(session.ModelMetadata.CustomMetadataMap);
+
             var input = session.InputMetadata.Single();
             inputName = input.Key;
             var dimensions = input.Value.Dimensions;
@@ -152,6 +154,27 @@ namespace OnnxVision.Classification
                     workspace.Dispose();
                 else
                     workspaces.Add(workspace);
+            }
+        }
+
+        private static void ValidateContract(IReadOnlyDictionary<string, string> metadata)
+        {
+            string task;
+            string contractName;
+            string contractVersion;
+            string names;
+            if (!metadata.TryGetValue("vision_task", out task) ||
+                task != OnnxVisionContract.ClassificationTask ||
+                !metadata.TryGetValue("contract_name", out contractName) ||
+                contractName != OnnxVisionContract.ClassificationName ||
+                !metadata.TryGetValue("contract_version", out contractVersion) ||
+                contractVersion != OnnxVisionContract.Version ||
+                !metadata.TryGetValue("names", out names) ||
+                string.IsNullOrWhiteSpace(names))
+            {
+                throw new NotSupportedException(
+                    "Expected the " + OnnxVisionContract.ClassificationName +
+                    " 1.0.0 classification metadata contract.");
             }
         }
 

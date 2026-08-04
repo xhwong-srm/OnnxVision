@@ -13,7 +13,7 @@ from ..workflows.context import WorkflowContext, optional_import
 from ..workflows.requests import ExportRequest, TestRequest, TrainRequest, ValidateRequest
 from ..workflows.runs import artifact
 from .base import BackendExecution, ModelBackend
-from .common import classification_contract, require_file, set_onnx_metadata, validate_onnx
+from .common import classification_contract, metadata_for_contract, require_file, set_onnx_metadata, validate_onnx
 
 
 @dataclass(frozen=True)
@@ -129,7 +129,7 @@ class TimmClassificationBackend(ModelBackend):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             torch.onnx.export(model, tensor, output, input_names=["images"], output_names=["probabilities"], opset_version=request.opset, dynamo=True)
         contract = classification_contract(classes)
-        set_onnx_metadata(output, {"contract_version": contract["version"], "names": contract["names"]})
+        set_onnx_metadata(output, metadata_for_contract(contract))
         checks = validate_onnx(output, contract)
         return Execution((artifact(output, "onnx"),), {}, contract, checks)
 

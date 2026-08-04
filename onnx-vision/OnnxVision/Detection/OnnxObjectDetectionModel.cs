@@ -16,12 +16,12 @@ using OnnxVision.Runtime;
 namespace OnnxVision.Detection
 {
     /// <summary>
-    /// Model-neutral object detector for the onnx-vision-detection-v1 contract.
+    /// Model-neutral object detector for the onnx-vision-object-detection 1.0.0 contract.
     /// A model instance can be reused and supports concurrent predictions.
     /// </summary>
     public sealed class OnnxObjectDetectionModel : IDisposable
     {
-        private const string Contract = "onnx-vision-detection-v1";
+        private const string Contract = OnnxVisionContract.ObjectDetectionName;
         private const string BoxesOutputName = "boxes";
         private const string ScoresOutputName = "scores";
         private const string ClassIdsOutputName = "class_ids";
@@ -216,12 +216,17 @@ namespace OnnxVision.Detection
         {
             var metadata = session.ModelMetadata.CustomMetadataMap;
             string task;
-            string contract;
-            if (!metadata.TryGetValue("vision_task", out task) || task != "object_detection" ||
-                !metadata.TryGetValue("detection_contract", out contract) || contract != Contract)
+            string contractName;
+            string contractVersion;
+            if (!metadata.TryGetValue("vision_task", out task) ||
+                task != OnnxVisionContract.ObjectDetectionTask ||
+                !metadata.TryGetValue("contract_name", out contractName) ||
+                contractName != Contract ||
+                !metadata.TryGetValue("contract_version", out contractVersion) ||
+                contractVersion != OnnxVisionContract.Version)
             {
                 throw new NotSupportedException(
-                    "Expected the " + Contract + " object-detection metadata contract.");
+                    "Expected the " + Contract + " 1.0.0 object-detection metadata contract.");
             }
 
             string nmsRequiredValue;

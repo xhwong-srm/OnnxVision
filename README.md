@@ -32,3 +32,10 @@ print(result.output)
 
 Model backends are imported lazily. Install only the backend extras needed by
 the host, for example `uv sync --extra test --extra timm`.
+
+ONNX exports are self-describing. Classification artifacts use the
+`onnx-vision-classification` contract, while object-detection artifacts use
+`onnx-vision-object-detection`. Each artifact embeds `vision_task`,
+`contract_name`, `contract_version`, and `names`; detection artifacts also
+embed `nms_required`. Contract versions use `major.minor.micro` format, for
+example `1.0.0`.

@@ -14,7 +14,7 @@ from ..workflows.context import WorkflowContext, optional_import
 from ..workflows.requests import ExportRequest, TestRequest, TrainRequest, ValidateRequest
 from ..workflows.runs import artifact
 from .base import BackendExecution, ModelBackend
-from .common import detection_contract, require_file, set_onnx_metadata, validate_onnx
+from .common import detection_contract, metadata_for_contract, require_file, set_onnx_metadata, validate_onnx
 
 
 @dataclass(frozen=True)
@@ -202,7 +202,7 @@ class TimmDetectionBackend(ModelBackend):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             torch.onnx.export(wrapper, torch.zeros(1, 3, request.image_size, request.image_size), output, input_names=["images"], output_names=["boxes", "scores", "class_ids"], opset_version=request.opset, dynamo=True)
         contract = detection_contract(classes, nms_required=False)
-        set_onnx_metadata(output, {"contract_version": contract["version"], "nms_required": False, "names": contract["names"]})
+        set_onnx_metadata(output, metadata_for_contract(contract))
         return Execution((artifact(output, "onnx"),), {}, contract, validate_onnx(output, contract))
 
     def validate(self, request: ValidateRequest, context: WorkflowContext) -> BackendExecution:
