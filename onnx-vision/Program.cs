@@ -6,6 +6,8 @@ using System.Drawing;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Runtime.Serialization;
+using System.Runtime.Serialization.Json;
 using System.Text;
 using Euresys.Open_eVision_22_12;
 using OnnxVision.Classification;
@@ -28,9 +30,9 @@ namespace OnnxVision
 
         private static int Main(string[] args)
         {
-            bool json = args.Any(item => string.Equals(item, "--json", StringComparison.OrdinalIgnoreCase));
+            bool json = args.Any(IsJsonFlag);
             string[] commandArgs = args
-                .Where(item => !string.Equals(item, "--json", StringComparison.OrdinalIgnoreCase))
+                .Where(item => !IsJsonFlag(item))
                 .ToArray();
 
             try
@@ -87,22 +89,35 @@ namespace OnnxVision
             int defaultRepeats, double taskDetectionMilliseconds, Stopwatch endToEnd)
         {
             string modelPath = Path.GetFullPath(args[offset]);
-            string testDirectory = Path.GetFullPath(args[offset + 1]);
-            if (!Directory.Exists(testDirectory))
-                return UsageError(json, "Test directory does not exist.");
+            string imageSource = Path.GetFullPath(args[offset + 1]);
 
             RoiPlacement roi;
             OnnxExecutionProvider[] providers;
             int repeats;
+            InputOptions inputOptions;
             if (!TryParseClassificationArguments(args, offset, defaultRepeats,
-                out providers, out repeats, out roi))
+                out providers, out repeats, out roi, out inputOptions))
             {
                 return UsageError(json,
-                    "Usage: OnnxVisionCLI.exe <model.onnx> <test-directory> " +
-                    "[provider] [repeats] [roi-x roi-y roi-width roi-height]");
+                    "Usage: OnnxVisionCLI.exe <model.onnx> <image-file|image-directory|dataset> " +
+                    "[provider] [repeats] [roi-x roi-y roi-width roi-height] " +
+                    "[-dataset] [-validate] [-set train|val|test]");
             }
 
-            string[] imagePaths = EnumerateImages(testDirectory);
+            ClassificationInput input;
+            try
+            {
+                input = LoadClassificationInput(imageSource, inputOptions);
+            }
+            catch (Exception error)
+            {
+                return UsageError(json, error.Message);
+            }
+
+            if ((inputOptions.Validate || inputOptions.Set != null) && !input.IsDataset)
+                return UsageError(json, "-validate and -set require an ImageNet-style classification dataset.");
+
+            string[] imagePaths = input.Samples.Select(item => item.Path).ToArray();
             if (imagePaths.Length == 0)
                 return UsageError(json, "No supported images were found.");
 
@@ -117,6 +132,13 @@ namespace OnnxVision
 
                 try
                 {
+                    ClassificationValidationMetrics validation = inputOptions.Validate
+                        ? new ClassificationValidationMetrics(classifier.ClassNames,
+                            input.DatasetFormat, input.DatasetSplit)
+                        : null;
+                    var samplesByPath = input.Samples.ToDictionary(item => item.Path,
+                        StringComparer.OrdinalIgnoreCase);
+                    int labeledImageCount = input.Samples.Count(item => item.ExpectedClassName != null);
                     int warmups = Math.Min(DefaultWarmups, images.Count);
                     long warmupModelCallTicks = 0;
                     for (int index = 0; index < warmups; index++)
@@ -148,7 +170,8 @@ namespace OnnxVision
                     {
                         foreach (LoadedImage image in images)
                         {
-                            string expected = new DirectoryInfo(Path.GetDirectoryName(image.Path)).Name;
+                            ClassificationSample sample = samplesByPath[image.Path];
+                            string expected = sample.ExpectedClassName;
                             long callStarted = Stopwatch.GetTimestamp();
                             OnnxClassification prediction = image.Classify(classifier, roi);
                             modelCallTicks += Stopwatch.GetTimestamp() - callStarted;
@@ -157,49 +180,55 @@ namespace OnnxVision
                             if (repeat != 0)
                                 continue;
 
-                            bool isCorrect = string.Equals(expected, prediction.ClassName,
+                            bool hasExpected = !string.IsNullOrWhiteSpace(expected);
+                            bool isCorrect = hasExpected && string.Equals(expected, prediction.ClassName,
                                 StringComparison.OrdinalIgnoreCase);
-                            if (isCorrect)
-                                correct++;
-                            else
-                                errors.Add(string.Format(CultureInfo.InvariantCulture,
-                                    "{0} -> {1} ({2:P2})",
-                                    MakeRelative(testDirectory, image.Path), prediction.ClassName,
-                                    prediction.Confidence));
-
-                            if (string.Equals(expected, "flipped", StringComparison.OrdinalIgnoreCase))
+                            if (hasExpected)
                             {
-                                flippedTotal++;
                                 if (isCorrect)
-                                    flippedCorrect++;
-                            }
-                            else if (string.Equals(expected, "normal", StringComparison.OrdinalIgnoreCase))
-                            {
-                                normalTotal++;
-                                if (isCorrect)
-                                    normalCorrect++;
-                            }
+                                    correct++;
+                                else
+                                    errors.Add(string.Format(CultureInfo.InvariantCulture,
+                                        "{0} -> {1} ({2:P2})",
+                                        image.Path, prediction.ClassName, prediction.Confidence));
 
-                            bool actualPositive = string.Equals(expected, "flipped", StringComparison.OrdinalIgnoreCase);
-                            bool predictedPositive = string.Equals(prediction.ClassName, "flipped", StringComparison.OrdinalIgnoreCase);
-                            if (actualPositive && predictedPositive)
-                                truePositives++;
-                            else if (!actualPositive && predictedPositive)
-                                falsePositives++;
-                            else if (actualPositive)
-                                falseNegatives++;
-                            else
-                                trueNegatives++;
+                                if (string.Equals(expected, "flipped", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    flippedTotal++;
+                                    if (isCorrect)
+                                        flippedCorrect++;
+                                }
+                                else if (string.Equals(expected, "normal", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    normalTotal++;
+                                    if (isCorrect)
+                                        normalCorrect++;
+                                }
 
-                            if (flippedIndex >= 0 && prediction.Probabilities != null &&
-                                prediction.Probabilities.Count > flippedIndex)
-                            {
-                                rocScores.Add(new RocPoint(actualPositive, prediction.Probabilities[flippedIndex]));
+                                bool actualPositive = string.Equals(expected, "flipped", StringComparison.OrdinalIgnoreCase);
+                                bool predictedPositive = string.Equals(prediction.ClassName, "flipped", StringComparison.OrdinalIgnoreCase);
+                                if (actualPositive && predictedPositive)
+                                    truePositives++;
+                                else if (!actualPositive && predictedPositive)
+                                    falsePositives++;
+                                else if (actualPositive)
+                                    falseNegatives++;
+                                else
+                                    trueNegatives++;
+
+                                if (flippedIndex >= 0 && prediction.Probabilities != null &&
+                                    prediction.Probabilities.Count > flippedIndex)
+                                {
+                                    rocScores.Add(new RocPoint(actualPositive, prediction.Probabilities[flippedIndex]));
+                                }
+
+                                if (validation != null)
+                                    validation.Add(expected, prediction);
                             }
 
                             predictions.Add(new Dictionary<string, object>
                             {
-                                { "path", MakeRelative(testDirectory, image.Path) },
+                                { "path", image.Path },
                                 { "expected", expected },
                                 { "class_name", prediction.ClassName },
                                 { "class_index", prediction.ClassIndex },
@@ -213,22 +242,29 @@ namespace OnnxVision
 
                     if (json)
                     {
-                        PrintJson(BuildClassificationReport(modelPath, classifier, providers,
-                            imagePaths.Length, warmups, repeats, executions,
+                        var report = BuildClassificationReport(modelPath, classifier, providers,
+                            imagePaths.Length, labeledImageCount, warmups, repeats, executions,
                             taskDetectionMilliseconds, construction.Elapsed.TotalMilliseconds,
                             loadTimer.Elapsed.TotalMilliseconds, warmupModelCallTicks,
                             measuredWall.Elapsed.TotalMilliseconds, modelCallTicks,
                             onnxInferenceMilliseconds, endToEnd.Elapsed.TotalMilliseconds,
                             correct, flippedCorrect, flippedTotal, normalCorrect, normalTotal,
                             truePositives, falsePositives, falseNegatives, trueNegatives,
-                            rocScores, predictions, errors));
+                            rocScores, predictions, errors);
+                        if (validation != null)
+                            report["validation"] = validation.ToReport();
+                        PrintJson(report);
                     }
                     else
                     {
-                        PrintClassificationInformation(classifier, imagePaths.Length, roi, providers);
-                        PrintClassificationMetrics(correct, imagePaths.Length, flippedCorrect, flippedTotal,
-                            normalCorrect, normalTotal, truePositives, falsePositives, falseNegatives,
-                            trueNegatives, rocScores);
+                        PrintClassificationInformation(classifier, imagePaths.Length, roi, providers,
+                            input.IsDataset, input.DatasetFormat, input.DatasetSplit);
+                        if (validation != null)
+                            PrintClassificationValidation(validation);
+                        else if (labeledImageCount > 0)
+                            PrintClassificationMetrics(correct, labeledImageCount, flippedCorrect, flippedTotal,
+                                normalCorrect, normalTotal, truePositives, falsePositives, falseNegatives,
+                                trueNegatives, rocScores);
                         PrintTimingInformation(taskDetectionMilliseconds,
                             imagePaths.Length, repeats, warmups,
                             construction.Elapsed.TotalMilliseconds, loadTimer.Elapsed.TotalMilliseconds,
@@ -257,20 +293,30 @@ namespace OnnxVision
             float threshold;
             OnnxExecutionProvider[] providers;
             int repeats;
+            InputOptions inputOptions;
             if (!TryParseDetectionArguments(args, offset, defaultRepeats,
-                out threshold, out repeats, out providers))
+                out threshold, out repeats, out providers, out inputOptions))
             {
                 return UsageError(json,
-                    "Usage: OnnxVisionCLI.exe <model.onnx> <image-or-directory> " +
-                    "[confidence] [repeats] [provider]");
+                    "Usage: OnnxVisionCLI.exe <model.onnx> <image-file|image-directory|COCO-dataset> " +
+                    "[confidence] [repeats] [provider] [-dataset] [-validate] " +
+                    "[-set train|val|test]");
             }
 
-            if (!File.Exists(imageSource) && !Directory.Exists(imageSource))
-                return UsageError(json, "Image or image directory does not exist.");
+            DetectionInput input;
+            try
+            {
+                input = LoadDetectionInput(imageSource, inputOptions);
+            }
+            catch (Exception error)
+            {
+                return UsageError(json, error.Message);
+            }
 
-            string[] imagePaths = File.Exists(imageSource)
-                ? new[] { imageSource }
-                : EnumerateImages(imageSource);
+            if ((inputOptions.Validate || inputOptions.Set != null) && !input.IsDataset)
+                return UsageError(json, "-validate and -set require a COCO detection dataset.");
+
+            string[] imagePaths = input.Samples.Select(item => item.Path).ToArray();
             if (imagePaths.Length == 0)
                 return UsageError(json, "No supported images were found.");
 
@@ -284,6 +330,12 @@ namespace OnnxVision
 
                 try
                 {
+                    DetectionValidationMetrics validation = inputOptions.Validate
+                        ? new DetectionValidationMetrics(detector.ClassNames,
+                            input.DatasetFormat, input.DatasetSplit)
+                        : null;
+                    var samplesByPath = input.Samples.ToDictionary(item => item.Path,
+                        StringComparer.OrdinalIgnoreCase);
                     int warmups = Math.Min(DefaultWarmups, images.Count);
                     long warmupModelCallTicks = 0;
                     for (int index = 0; index < warmups; index++)
@@ -318,6 +370,8 @@ namespace OnnxVision
                             if (repeat == 0)
                             {
                                 results.Add(BuildDetectionImageResult(image.Path, detections));
+                                if (validation != null)
+                                    validation.Add(image.Path, samplesByPath[image.Path].GroundTruths, detections);
                                 if (!json)
                                 {
                                     Console.WriteLine("{0}: {1} detection(s)", image.Path, detections.Count);
@@ -346,6 +400,8 @@ namespace OnnxVision
                         report["detections"] = detectionCount;
                         report["confidence_sum"] = confidenceSum;
                         report["class_counts"] = classCounts;
+                        if (validation != null)
+                            report["validation"] = validation.ToReport();
                         report["timing"] = BuildTimingReport(taskDetectionMilliseconds,
                             construction.Elapsed.TotalMilliseconds, loadTimer.Elapsed.TotalMilliseconds,
                             warmupModelCallTicks, modelCallTicks, measuredWall.Elapsed.TotalMilliseconds,
@@ -354,7 +410,10 @@ namespace OnnxVision
                     }
                     else
                     {
-                        PrintDetectionInformation(detector, providers);
+                        PrintDetectionInformation(detector, providers, input.IsDataset,
+                            input.DatasetFormat, input.DatasetSplit);
+                        if (validation != null)
+                            PrintDetectionValidation(validation);
                         PrintTimingInformation(taskDetectionMilliseconds,
                             images.Count, repeats, warmups,
                             construction.Elapsed.TotalMilliseconds, loadTimer.Elapsed.TotalMilliseconds,
@@ -377,7 +436,8 @@ namespace OnnxVision
 
         private static Dictionary<string, object> BuildClassificationReport(
             string modelPath, OnnxClassificationModel classifier,
-            OnnxExecutionProvider[] providers, int imageCount, int warmups, int repeats,
+            OnnxExecutionProvider[] providers, int imageCount, int labeledImageCount,
+            int warmups, int repeats,
             int executions, double taskDetectionMilliseconds,
             double constructionMilliseconds, double loadMilliseconds,
             long warmupModelCallTicks, double measuredWallMilliseconds,
@@ -396,8 +456,8 @@ namespace OnnxVision
             report["summary"] = new Dictionary<string, object>
             {
                 { "correct", correct },
-                { "total", imageCount },
-                { "accuracy", Divide(correct, imageCount) },
+                { "total", labeledImageCount },
+                { "accuracy", Divide(correct, labeledImageCount) },
                 { "flipped_correct", flippedCorrect },
                 { "flipped_total", flippedTotal },
                 { "flipped_recall", Divide(flippedCorrect, flippedTotal) },
@@ -517,19 +577,23 @@ namespace OnnxVision
 
         private static void PrintClassificationInformation(
             OnnxClassificationModel classifier, int imageCount,
-            RoiPlacement roi, OnnxExecutionProvider[] providers)
+            RoiPlacement roi, OnnxExecutionProvider[] providers,
+            bool isDataset, string datasetFormat, string datasetSplit)
         {
             Console.WriteLine("Provider: {0}", classifier.ActualProvider);
             Console.WriteLine("Requested providers: {0}", FormatProviders(providers));
-            Console.WriteLine("Model input: {0}x{1} {2}; test images: {3}",
+            Console.WriteLine("Model input: {0}x{1} {2}; images: {3}",
                 classifier.InputWidth, classifier.InputHeight,
                 classifier.RequiredPixelFormat, imageCount);
+            if (isDataset)
+                Console.WriteLine("Dataset: {0}; set: {1}", datasetFormat, datasetSplit);
             Console.WriteLine("Class names: " + string.Join(", ", classifier.ClassNames));
             Console.WriteLine("Input region: " + (roi == null ? "full image" : roi.ToString()));
         }
 
         private static void PrintDetectionInformation(
-            OnnxObjectDetectionModel detector, OnnxExecutionProvider[] providers)
+            OnnxObjectDetectionModel detector, OnnxExecutionProvider[] providers,
+            bool isDataset, string datasetFormat, string datasetSplit)
         {
             Console.WriteLine("Detection contract: {0} {1}",
                 OnnxVisionContract.ObjectDetectionName, OnnxVisionContract.Version);
@@ -537,6 +601,8 @@ namespace OnnxVision
             Console.WriteLine("Requested providers: {0}", FormatProviders(providers));
             Console.WriteLine("Input contract: " + detector.InputDescription);
             Console.WriteLine("NMS required: {0}", detector.NmsRequired);
+            if (isDataset)
+                Console.WriteLine("Dataset: {0}; set: {1}", datasetFormat, datasetSplit);
         }
 
         private static void PrintTimingInformation(
@@ -605,19 +671,76 @@ namespace OnnxVision
             Console.WriteLine("ROC AUC (flipped positive): {0:F4}", CalculateAuc(rocScores));
         }
 
+        private static void PrintClassificationValidation(ClassificationValidationMetrics metrics)
+        {
+            Dictionary<string, object> report = metrics.ToReport();
+            Console.WriteLine("Validation ({0}, {1}): {2}/{3} top-1 accuracy ({4:P2})",
+                report["format"], report["set"], report["correct"], report["images"],
+                Convert.ToDouble(report["top1_accuracy"], CultureInfo.InvariantCulture));
+            Console.WriteLine("Macro precision: {0:P2}; macro recall: {1:P2}; macro F1: {2:P2}",
+                Convert.ToDouble(report["macro_precision"], CultureInfo.InvariantCulture),
+                Convert.ToDouble(report["macro_recall"], CultureInfo.InvariantCulture),
+                Convert.ToDouble(report["macro_f1"], CultureInfo.InvariantCulture));
+            foreach (Dictionary<string, object> item in (IEnumerable<Dictionary<string, object>>)report["per_class"])
+            {
+                Console.WriteLine("  {0}: support={1}; precision={2:P2}; recall={3:P2}; F1={4:P2}",
+                    item["class_name"], item["support"],
+                    Convert.ToDouble(item["precision"], CultureInfo.InvariantCulture),
+                    Convert.ToDouble(item["recall"], CultureInfo.InvariantCulture),
+                    Convert.ToDouble(item["f1"], CultureInfo.InvariantCulture));
+            }
+        }
+
+        private static void PrintDetectionValidation(DetectionValidationMetrics metrics)
+        {
+            Dictionary<string, object> report = metrics.ToReport();
+            Console.WriteLine("Validation ({0}, {1}): {2} image(s), {3} ground-truth box(es)",
+                report["format"], report["set"], report["images"], report["ground_truth_boxes"]);
+            Console.WriteLine("IoU 0.50 precision: {0:P2}; recall: {1:P2}; F1: {2:P2}",
+                Convert.ToDouble(report["precision"], CultureInfo.InvariantCulture),
+                Convert.ToDouble(report["recall"], CultureInfo.InvariantCulture),
+                Convert.ToDouble(report["f1"], CultureInfo.InvariantCulture));
+            Console.WriteLine("mAP50: {0:P2}; mAP50-95: {1:P2}",
+                Convert.ToDouble(report["map50"], CultureInfo.InvariantCulture),
+                Convert.ToDouble(report["map50_95"], CultureInfo.InvariantCulture));
+            foreach (Dictionary<string, object> item in (IEnumerable<Dictionary<string, object>>)report["per_class"])
+            {
+                Console.WriteLine("  {0}: GT={1}; TP={2}; FP={3}; FN={4}; AP50={5:P2}; AP50-95={6:P2}",
+                    item["class_name"], item["ground_truth"], item["true_positives"],
+                    item["false_positives"], item["false_negatives"],
+                    Convert.ToDouble(item["ap50"], CultureInfo.InvariantCulture),
+                    Convert.ToDouble(item["ap50_95"], CultureInfo.InvariantCulture));
+            }
+        }
+
         private static bool TryParseClassificationArguments(string[] args, int offset,
             int defaultRepeats, out OnnxExecutionProvider[] providers, out int repeats,
-            out RoiPlacement roi)
+            out RoiPlacement roi, out InputOptions inputOptions)
         {
             providers = new[] { OnnxExecutionProvider.Cpu };
             repeats = defaultRepeats;
             roi = null;
+            inputOptions = new InputOptions();
 
             int index = offset + 2;
             int repeatArguments = 0;
             int providerArguments = 0;
             while (index < args.Length)
             {
+                if (TryParseInputOption(args, ref index, inputOptions))
+                    continue;
+
+                if (IsFlag(args[index], "roi"))
+                {
+                    if (roi != null || index + 4 >= args.Length ||
+                        !TryParseRoi(args, index + 1, out roi))
+                    {
+                        return false;
+                    }
+                    index += 5;
+                    continue;
+                }
+
                 if (args.Length - index == 4 && TryParseRoi(args, index, out roi))
                 {
                     index += 4;
@@ -646,21 +769,22 @@ namespace OnnxVision
 
         private static bool TryParseDetectionArguments(string[] args, int offset,
             int defaultRepeats, out float threshold, out int repeats,
-            out OnnxExecutionProvider[] providers)
+            out OnnxExecutionProvider[] providers, out InputOptions inputOptions)
         {
             threshold = 0.5f;
             repeats = defaultRepeats;
             providers = new[] { OnnxExecutionProvider.Cpu };
+            inputOptions = new InputOptions();
             bool thresholdSpecified = false;
             bool repeatsSpecified = false;
             bool providerSpecified = false;
 
             int index = offset + 2;
-            if (args.Length - index > 3)
-                return false;
-
             while (index < args.Length)
             {
+                if (TryParseInputOption(args, ref index, inputOptions))
+                    continue;
+
                 OnnxExecutionProvider[] parsedProviders;
                 if (TryParseProvider(args[index], out parsedProviders))
                 {
@@ -694,6 +818,87 @@ namespace OnnxVision
             }
 
             return true;
+        }
+
+        private static bool TryParseInputOption(string[] args, ref int index,
+            InputOptions inputOptions)
+        {
+            string value = args[index];
+            if (IsFlag(value, "validate"))
+            {
+                inputOptions.Validate = true;
+                index++;
+                return true;
+            }
+
+            if (IsFlag(value, "dataset"))
+            {
+                inputOptions.ForceDataset = true;
+                index++;
+                return true;
+            }
+
+            string set;
+            if (TryParseInlineOption(value, "set", out set))
+            {
+                if (!TrySetDatasetSplit(inputOptions, set))
+                    return false;
+                index++;
+                return true;
+            }
+
+            if (IsFlag(value, "set"))
+            {
+                if (index + 1 >= args.Length ||
+                    !TrySetDatasetSplit(inputOptions, args[index + 1]))
+                {
+                    return false;
+                }
+                index += 2;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TrySetDatasetSplit(InputOptions inputOptions, string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+            string split = value.Trim().ToLowerInvariant();
+            if (split == "valid" || split == "validation")
+                split = "val";
+            if (split != "train" && split != "val" && split != "test")
+                return false;
+            if (inputOptions.Set != null)
+                return false;
+            inputOptions.Set = split;
+            return true;
+        }
+
+        private static bool TryParseInlineOption(string value, string name, out string optionValue)
+        {
+            optionValue = null;
+            string prefix = "-" + name + "=";
+            string longPrefix = "--" + name + "=";
+            if (value.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                optionValue = value.Substring(prefix.Length);
+            else if (value.StartsWith(longPrefix, StringComparison.OrdinalIgnoreCase))
+                optionValue = value.Substring(longPrefix.Length);
+            else
+                return false;
+            return true;
+        }
+
+        private static bool IsFlag(string value, string name)
+        {
+            return string.Equals(value, "-" + name, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(value, "--" + name, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsJsonFlag(string value)
+        {
+            return IsFlag(value, "json");
         }
 
         private static bool TryParseProvider(
@@ -765,6 +970,877 @@ namespace OnnxVision
                 .ToArray();
         }
 
+        private static ClassificationInput LoadClassificationInput(string source,
+            InputOptions options)
+        {
+            if (File.Exists(source))
+            {
+                if (options.ForceDataset || options.Validate || options.Set != null)
+                    throw new InvalidOperationException(
+                        "A classification dataset must be a directory; a single image cannot be validated.");
+                if (!Extensions.Contains(Path.GetExtension(source)))
+                    throw new InvalidOperationException("The input file is not a supported image.");
+                return new ClassificationInput(
+                    new List<ClassificationSample> { new ClassificationSample(source, null) },
+                    false, null, null);
+            }
+
+            if (!Directory.Exists(source))
+                throw new DirectoryNotFoundException("Image or classification dataset does not exist: " + source);
+
+            bool isDataset = options.ForceDataset || IsClassificationDatasetRoot(source);
+            if (!isDataset)
+            {
+                return new ClassificationInput(
+                    EnumerateImages(source).Select(path => new ClassificationSample(path, null)).ToList(),
+                    false, null, null);
+            }
+
+            string split;
+            string splitDirectory = ResolveClassificationSplitDirectory(source, options.Set, out split);
+            List<ClassificationSample> samples = LoadClassificationSamples(splitDirectory);
+            return new ClassificationInput(samples, true, "imagenet", split);
+        }
+
+        private static bool IsClassificationDatasetRoot(string root)
+        {
+            if (FindCocoAnnotation(root, null) != null)
+                return false;
+            return HasClassDirectoriesWithImages(root) ||
+                new[] { "train", "val", "valid", "test" }
+                    .Select(split => Path.Combine(root, split))
+                    .Any(path => Directory.Exists(path) && HasClassDirectoriesWithImages(path));
+        }
+
+        private static bool HasClassDirectoriesWithImages(string root)
+        {
+            if (!Directory.Exists(root))
+                return false;
+            foreach (string directory in Directory.EnumerateDirectories(root))
+            {
+                if (Directory.EnumerateFiles(directory, "*", SearchOption.TopDirectoryOnly)
+                    .Any(path => Extensions.Contains(Path.GetExtension(path))))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static string ResolveClassificationSplitDirectory(string root,
+            string requestedSplit, out string selectedSplit)
+        {
+            selectedSplit = requestedSplit;
+            if (requestedSplit == null)
+            {
+                foreach (string candidate in new[] { "val", "valid", "train", "test" })
+                {
+                    string candidatePath = Path.Combine(root, candidate);
+                    if (Directory.Exists(candidatePath) && HasClassDirectoriesWithImages(candidatePath))
+                    {
+                        selectedSplit = candidate == "valid" ? "val" : candidate;
+                        return candidatePath;
+                    }
+                }
+
+                if (HasClassDirectoriesWithImages(root))
+                {
+                    selectedSplit = "root";
+                    return root;
+                }
+
+                throw new InvalidOperationException(
+                    "The classification dataset does not contain train, val, or test class folders.");
+            }
+
+            string splitDirectory = Path.Combine(root, requestedSplit);
+            if (requestedSplit == "val" && !Directory.Exists(splitDirectory))
+                splitDirectory = Path.Combine(root, "valid");
+            if (!Directory.Exists(splitDirectory) || !HasClassDirectoriesWithImages(splitDirectory))
+            {
+                throw new InvalidOperationException(string.Format(CultureInfo.InvariantCulture,
+                    "The classification dataset does not contain a labeled '{0}' split.",
+                    requestedSplit));
+            }
+            return splitDirectory;
+        }
+
+        private static List<ClassificationSample> LoadClassificationSamples(string root)
+        {
+            var samples = new List<ClassificationSample>();
+            foreach (string classDirectory in Directory.EnumerateDirectories(root)
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
+            {
+                string className = new DirectoryInfo(classDirectory).Name;
+                foreach (string imagePath in EnumerateImages(classDirectory))
+                    samples.Add(new ClassificationSample(imagePath, className));
+            }
+            return samples;
+        }
+
+        private static DetectionInput LoadDetectionInput(string source, InputOptions options)
+        {
+            if (File.Exists(source) && !IsJsonFile(source))
+            {
+                if (options.ForceDataset || options.Validate || options.Set != null)
+                    throw new InvalidOperationException(
+                        "A COCO dataset is required for -validate and -set; a single image has no labels.");
+                if (!Extensions.Contains(Path.GetExtension(source)))
+                    throw new InvalidOperationException("The input file is not a supported image.");
+                return new DetectionInput(
+                    new List<DetectionSample> { new DetectionSample(source, new List<GroundTruthDetection>()) },
+                    false, null, null, null);
+            }
+
+            bool datasetRequested = options.ForceDataset || IsCocoDatasetSource(source);
+            if (datasetRequested)
+            {
+                string root = Directory.Exists(source) ? source : InferCocoRoot(source);
+                string annotationPath = Directory.Exists(source) && IsJsonFile(source)
+                    ? source
+                    : FindCocoAnnotation(source, options.Set);
+                if (annotationPath == null)
+                    throw new InvalidOperationException(
+                        "The COCO dataset does not contain annotations for the requested split.");
+
+                string split = options.Set ?? InferCocoSplit(annotationPath);
+                return LoadCocoInput(root, annotationPath, split);
+            }
+
+            if (!Directory.Exists(source))
+                throw new DirectoryNotFoundException("Image or COCO dataset does not exist: " + source);
+            if (options.Validate || options.Set != null)
+                throw new InvalidOperationException("-validate and -set require a COCO detection dataset.");
+
+            return new DetectionInput(
+                EnumerateImages(source)
+                    .Select(path => new DetectionSample(path, new List<GroundTruthDetection>()))
+                    .ToList(), false, null, null, null);
+        }
+
+        private static bool IsCocoDatasetSource(string source)
+        {
+            if (File.Exists(source))
+                return IsJsonFile(source);
+            return Directory.Exists(source) && FindCocoAnnotation(source, null) != null;
+        }
+
+        private static bool IsJsonFile(string path)
+        {
+            return string.Equals(Path.GetExtension(path), ".json",
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string FindCocoAnnotation(string source, string requestedSplit)
+        {
+            if (File.Exists(source))
+                return IsJsonFile(source) ? source : null;
+            if (!Directory.Exists(source))
+                return null;
+
+            string[] splits = requestedSplit == null
+                ? new[] { "val", "train", "test" }
+                : new[] { requestedSplit };
+            foreach (string split in splits)
+            {
+                foreach (string candidate in CocoAnnotationCandidates(source, split))
+                {
+                    if (File.Exists(candidate))
+                        return candidate;
+                }
+            }
+            return null;
+        }
+
+        private static IEnumerable<string> CocoAnnotationCandidates(string root, string split)
+        {
+            string canonical = split == "valid" ? "val" : split;
+            string[] splitNames = canonical == "val"
+                ? new[] { "val", "valid" }
+                : new[] { canonical };
+            foreach (string name in splitNames)
+            {
+                yield return Path.Combine(root, "annotations", "instances_" + name + ".json");
+                yield return Path.Combine(root, "annotations", "instances_" + name + "2017.json");
+                yield return Path.Combine(root, "annotations", "instances_" + name + "_2017.json");
+                yield return Path.Combine(root, name, "_annotations.coco.json");
+                yield return Path.Combine(root, name, "annotations.json");
+                yield return Path.Combine(root, "instances_" + name + ".json");
+                yield return Path.Combine(root, name + ".json");
+            }
+
+            string splitDirectory = Path.Combine(root, canonical);
+            if (canonical == "val" && !Directory.Exists(splitDirectory))
+                splitDirectory = Path.Combine(root, "valid");
+            if (File.Exists(Path.Combine(splitDirectory, "_annotations.coco.json")))
+                yield return Path.Combine(splitDirectory, "_annotations.coco.json");
+
+            string annotationDirectory = Path.Combine(root, "annotations");
+            if (Directory.Exists(annotationDirectory))
+            {
+                foreach (string path in Directory.EnumerateFiles(annotationDirectory, "*.json",
+                    SearchOption.TopDirectoryOnly).OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
+                {
+                    string name = Path.GetFileName(path).ToLowerInvariant();
+                    if (name.Contains(canonical) || (canonical == "val" && name.Contains("valid")))
+                        yield return path;
+                }
+            }
+        }
+
+        private static string InferCocoRoot(string annotationPath)
+        {
+            string parent = Path.GetDirectoryName(annotationPath);
+            if (parent != null && string.Equals(new DirectoryInfo(parent).Name, "annotations",
+                StringComparison.OrdinalIgnoreCase))
+            {
+                return Directory.GetParent(parent).FullName;
+            }
+            return parent;
+        }
+
+        private static string InferCocoSplit(string annotationPath)
+        {
+            string name = Path.GetFileName(annotationPath).ToLowerInvariant();
+            if (name.Contains("val") || name.Contains("valid"))
+                return "val";
+            if (name.Contains("test"))
+                return "test";
+            string parent = Path.GetDirectoryName(annotationPath);
+            if (parent != null)
+            {
+                string parentName = new DirectoryInfo(parent).Name.ToLowerInvariant();
+                if (parentName == "val" || parentName == "valid")
+                    return "val";
+                if (parentName == "test")
+                    return "test";
+            }
+            return "train";
+        }
+
+        private static DetectionInput LoadCocoInput(string root, string annotationPath,
+            string split)
+        {
+            CocoDocument document;
+            var serializer = new DataContractJsonSerializer(typeof(CocoDocument));
+            using (var stream = File.OpenRead(annotationPath))
+                document = (CocoDocument)serializer.ReadObject(stream);
+            if (document == null || document.Images == null || document.Annotations == null ||
+                document.Categories == null)
+            {
+                throw new InvalidOperationException(
+                    "COCO annotations must contain images, annotations, and categories arrays.");
+            }
+
+            var categoryNames = new Dictionary<long, string>();
+            foreach (CocoCategory category in document.Categories)
+            {
+                if (category == null || string.IsNullOrWhiteSpace(category.Name))
+                    throw new InvalidOperationException("COCO contains an empty category name.");
+                if (categoryNames.ContainsKey(category.Id))
+                    throw new InvalidOperationException("COCO contains duplicate category IDs.");
+                categoryNames.Add(category.Id, category.Name.Trim());
+            }
+
+            var annotationsByImage = new Dictionary<long, List<GroundTruthDetection>>();
+            foreach (CocoAnnotation annotation in document.Annotations)
+            {
+                string className;
+                if (!categoryNames.TryGetValue(annotation.CategoryId, out className))
+                    throw new InvalidOperationException("COCO annotation references an unknown category ID.");
+                if (annotation.BoundingBox == null || annotation.BoundingBox.Length < 4)
+                    throw new InvalidOperationException("COCO contains an annotation without a valid bbox.");
+                double x = annotation.BoundingBox[0];
+                double y = annotation.BoundingBox[1];
+                double width = annotation.BoundingBox[2];
+                double height = annotation.BoundingBox[3];
+                if (width <= 0 || height <= 0)
+                    continue;
+                List<GroundTruthDetection> imageAnnotations;
+                if (!annotationsByImage.TryGetValue(annotation.ImageId, out imageAnnotations))
+                {
+                    imageAnnotations = new List<GroundTruthDetection>();
+                    annotationsByImage.Add(annotation.ImageId, imageAnnotations);
+                }
+                imageAnnotations.Add(new GroundTruthDetection(className,
+                    (float)x, (float)y, (float)(x + width), (float)(y + height)));
+            }
+
+            var samples = new List<DetectionSample>();
+            foreach (CocoImage image in document.Images)
+            {
+                string imagePath = ResolveCocoImagePath(root, split, image.FileName);
+                List<GroundTruthDetection> groundTruths;
+                if (!annotationsByImage.TryGetValue(image.Id, out groundTruths))
+                    groundTruths = new List<GroundTruthDetection>();
+                samples.Add(new DetectionSample(imagePath, groundTruths));
+            }
+            return new DetectionInput(samples, true, "coco", split,
+                categoryNames.Values.Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray());
+        }
+
+        private static string ResolveCocoImagePath(string root, string split, string fileName)
+        {
+            if (string.IsNullOrWhiteSpace(fileName))
+                throw new InvalidOperationException("COCO contains an image without file_name.");
+            string[] directories = split == "val"
+                ? new[] { "val", "valid", "val2017" }
+                : new[] { split, split + "2017" };
+            var candidates = new List<string> { Path.Combine(root, fileName) };
+            foreach (string directory in directories)
+                candidates.Add(Path.Combine(root, directory, fileName));
+            candidates.Add(Path.Combine(root, "images", fileName));
+            foreach (string candidate in candidates)
+            {
+                if (File.Exists(candidate))
+                    return Path.GetFullPath(candidate);
+            }
+
+            string basename = Path.GetFileName(fileName);
+            string discovered = Directory.EnumerateFiles(root, basename, SearchOption.AllDirectories)
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase).FirstOrDefault();
+            if (discovered != null)
+                return Path.GetFullPath(discovered);
+            throw new FileNotFoundException("COCO image referenced by annotations was not found.", fileName);
+        }
+
+        private sealed class InputOptions
+        {
+            public bool Validate { get; set; }
+            public bool ForceDataset { get; set; }
+            public string Set { get; set; }
+        }
+
+        private sealed class ClassificationSample
+        {
+            public ClassificationSample(string path, string expectedClassName)
+            {
+                Path = path;
+                ExpectedClassName = expectedClassName;
+            }
+
+            public string Path { get; private set; }
+            public string ExpectedClassName { get; private set; }
+        }
+
+        private sealed class ClassificationInput
+        {
+            public ClassificationInput(List<ClassificationSample> samples, bool isDataset,
+                string datasetFormat, string datasetSplit)
+            {
+                Samples = samples;
+                IsDataset = isDataset;
+                DatasetFormat = datasetFormat;
+                DatasetSplit = datasetSplit;
+            }
+
+            public List<ClassificationSample> Samples { get; private set; }
+            public bool IsDataset { get; private set; }
+            public string DatasetFormat { get; private set; }
+            public string DatasetSplit { get; private set; }
+        }
+
+        private sealed class DetectionSample
+        {
+            public DetectionSample(string path, List<GroundTruthDetection> groundTruths)
+            {
+                Path = path;
+                GroundTruths = groundTruths;
+            }
+
+            public string Path { get; private set; }
+            public List<GroundTruthDetection> GroundTruths { get; private set; }
+        }
+
+        private sealed class DetectionInput
+        {
+            public DetectionInput(List<DetectionSample> samples, bool isDataset,
+                string datasetFormat, string datasetSplit, string[] datasetClassNames)
+            {
+                Samples = samples;
+                IsDataset = isDataset;
+                DatasetFormat = datasetFormat;
+                DatasetSplit = datasetSplit;
+                DatasetClassNames = datasetClassNames;
+            }
+
+            public List<DetectionSample> Samples { get; private set; }
+            public bool IsDataset { get; private set; }
+            public string DatasetFormat { get; private set; }
+            public string DatasetSplit { get; private set; }
+            public string[] DatasetClassNames { get; private set; }
+        }
+
+        private sealed class GroundTruthDetection
+        {
+            public GroundTruthDetection(string className, float x1, float y1, float x2, float y2)
+            {
+                ClassName = className;
+                X1 = x1;
+                Y1 = y1;
+                X2 = x2;
+                Y2 = y2;
+            }
+
+            public string ClassName { get; private set; }
+            public float X1 { get; private set; }
+            public float Y1 { get; private set; }
+            public float X2 { get; private set; }
+            public float Y2 { get; private set; }
+        }
+
+        [DataContract]
+        private sealed class CocoDocument
+        {
+            [DataMember(Name = "images")]
+            public List<CocoImage> Images { get; set; }
+
+            [DataMember(Name = "annotations")]
+            public List<CocoAnnotation> Annotations { get; set; }
+
+            [DataMember(Name = "categories")]
+            public List<CocoCategory> Categories { get; set; }
+        }
+
+        [DataContract]
+        private sealed class CocoImage
+        {
+            [DataMember(Name = "id")]
+            public long Id { get; set; }
+
+            [DataMember(Name = "file_name")]
+            public string FileName { get; set; }
+        }
+
+        [DataContract]
+        private sealed class CocoAnnotation
+        {
+            [DataMember(Name = "image_id")]
+            public long ImageId { get; set; }
+
+            [DataMember(Name = "category_id")]
+            public long CategoryId { get; set; }
+
+            [DataMember(Name = "bbox")]
+            public double[] BoundingBox { get; set; }
+        }
+
+        [DataContract]
+        private sealed class CocoCategory
+        {
+            [DataMember(Name = "id")]
+            public long Id { get; set; }
+
+            [DataMember(Name = "name")]
+            public string Name { get; set; }
+        }
+
+        private sealed class ClassificationValidationMetrics
+        {
+            private readonly string[] classNames;
+            private readonly string datasetFormat;
+            private readonly string datasetSplit;
+            private readonly Dictionary<string, int> classIndices;
+            private readonly int[] support;
+            private readonly int[] truePositives;
+            private readonly int[] falsePositives;
+            private readonly int[] falseNegatives;
+            private int correct;
+
+            public ClassificationValidationMetrics(IReadOnlyList<string> classNames,
+                string datasetFormat, string datasetSplit)
+            {
+                this.classNames = classNames.ToArray();
+                this.datasetFormat = datasetFormat;
+                this.datasetSplit = datasetSplit;
+                classIndices = this.classNames.Select((name, index) => new { name, index })
+                    .ToDictionary(item => item.name, item => item.index,
+                        StringComparer.OrdinalIgnoreCase);
+                support = new int[this.classNames.Length];
+                truePositives = new int[this.classNames.Length];
+                falsePositives = new int[this.classNames.Length];
+                falseNegatives = new int[this.classNames.Length];
+            }
+
+            public void Add(string expectedClassName, OnnxClassification prediction)
+            {
+                int expectedIndex;
+                if (!classIndices.TryGetValue(expectedClassName, out expectedIndex))
+                {
+                    throw new InvalidOperationException(string.Format(CultureInfo.InvariantCulture,
+                        "Dataset class '{0}' is not present in the model class names.",
+                        expectedClassName));
+                }
+                if (prediction.ClassIndex < 0 || prediction.ClassIndex >= classNames.Length)
+                    throw new InvalidOperationException("The model returned an invalid classification index.");
+
+                support[expectedIndex]++;
+                if (expectedIndex == prediction.ClassIndex)
+                {
+                    correct++;
+                    truePositives[expectedIndex]++;
+                }
+                else
+                {
+                    falseNegatives[expectedIndex]++;
+                    falsePositives[prediction.ClassIndex]++;
+                }
+            }
+
+            public Dictionary<string, object> ToReport()
+            {
+                int total = support.Sum();
+                var perClass = new List<Dictionary<string, object>>();
+                var precisions = new List<double>();
+                var recalls = new List<double>();
+                var f1Scores = new List<double>();
+                for (int index = 0; index < classNames.Length; index++)
+                {
+                    if (support[index] == 0)
+                        continue;
+                    double precision = Divide(truePositives[index],
+                        truePositives[index] + falsePositives[index]);
+                    double recall = Divide(truePositives[index],
+                        truePositives[index] + falseNegatives[index]);
+                    double f1 = Divide(2.0 * precision * recall, precision + recall);
+                    precisions.Add(precision);
+                    recalls.Add(recall);
+                    f1Scores.Add(f1);
+                    perClass.Add(new Dictionary<string, object>
+                    {
+                        { "class_name", classNames[index] },
+                        { "support", support[index] },
+                        { "correct", truePositives[index] },
+                        { "precision", precision },
+                        { "recall", recall },
+                        { "f1", f1 }
+                    });
+                }
+
+                return new Dictionary<string, object>
+                {
+                    { "format", datasetFormat },
+                    { "set", datasetSplit },
+                    { "images", total },
+                    { "correct", correct },
+                    { "top1_accuracy", Divide(correct, total) },
+                    { "macro_precision", Average(precisions) },
+                    { "macro_recall", Average(recalls) },
+                    { "macro_f1", Average(f1Scores) },
+                    { "per_class", perClass }
+                };
+            }
+
+            private static double Average(List<double> values)
+            {
+                return values.Count == 0 ? 0 : values.Average();
+            }
+        }
+
+        private sealed class DetectionValidationMetrics
+        {
+            private readonly string[] classNames;
+            private readonly string datasetFormat;
+            private readonly string datasetSplit;
+            private readonly Dictionary<string, int> classIndices;
+            private readonly Dictionary<string, List<GroundTruthDetection>> groundTruths =
+                new Dictionary<string, List<GroundTruthDetection>>(StringComparer.OrdinalIgnoreCase);
+            private readonly List<PredictedDetection> predictions = new List<PredictedDetection>();
+
+            public DetectionValidationMetrics(IReadOnlyList<string> classNames,
+                string datasetFormat, string datasetSplit)
+            {
+                this.classNames = classNames.ToArray();
+                this.datasetFormat = datasetFormat;
+                this.datasetSplit = datasetSplit;
+                classIndices = this.classNames.Select((name, index) => new { name, index })
+                    .ToDictionary(item => item.name, item => item.index,
+                        StringComparer.OrdinalIgnoreCase);
+            }
+
+            public void Add(string imagePath, List<GroundTruthDetection> imageGroundTruths,
+                IReadOnlyList<OnnxDetection> imagePredictions)
+            {
+                if (groundTruths.ContainsKey(imagePath))
+                    throw new InvalidOperationException("Duplicate image path in detection dataset.");
+                var mappedGroundTruths = new List<GroundTruthDetection>();
+                foreach (GroundTruthDetection groundTruth in imageGroundTruths)
+                {
+                    int classIndex;
+                    if (!classIndices.TryGetValue(groundTruth.ClassName, out classIndex))
+                    {
+                        throw new InvalidOperationException(string.Format(CultureInfo.InvariantCulture,
+                            "COCO class '{0}' is not present in the model class names.",
+                            groundTruth.ClassName));
+                    }
+                    mappedGroundTruths.Add(new GroundTruthDetection(classIndex.ToString(CultureInfo.InvariantCulture),
+                        groundTruth.X1, groundTruth.Y1, groundTruth.X2, groundTruth.Y2));
+                }
+                groundTruths.Add(imagePath, mappedGroundTruths);
+                foreach (OnnxDetection prediction in imagePredictions)
+                {
+                    predictions.Add(new PredictedDetection(imagePath, prediction.ClassIndex,
+                        prediction.Confidence, prediction.X1, prediction.Y1,
+                        prediction.X2, prediction.Y2));
+                }
+            }
+
+            public Dictionary<string, object> ToReport()
+            {
+                var perClass = new List<Dictionary<string, object>>();
+                var ap50Values = new List<double>();
+                var ap50To95Values = new List<double>();
+                int truePositives = 0;
+                int falsePositives = 0;
+                int falseNegatives = 0;
+                int groundTruthCount = groundTruths.Values.Sum(items => items.Count);
+                int detectionCount = predictions.Count;
+
+                for (int classIndex = 0; classIndex < classNames.Length; classIndex++)
+                {
+                    DetectionClassEvaluation at50 = EvaluateClass(classIndex, 0.50);
+                    double ap50To95 = 0;
+                    int thresholds = 0;
+                    for (int step = 0; step < 10; step++)
+                    {
+                        DetectionClassEvaluation current = EvaluateClass(classIndex,
+                            0.50 + step * 0.05);
+                        if (!double.IsNaN(current.AveragePrecision))
+                        {
+                            ap50To95 += current.AveragePrecision;
+                            thresholds++;
+                        }
+                    }
+                    ap50To95 = thresholds == 0 ? double.NaN : ap50To95 / thresholds;
+                    if (!double.IsNaN(at50.AveragePrecision))
+                        ap50Values.Add(at50.AveragePrecision);
+                    if (!double.IsNaN(ap50To95))
+                        ap50To95Values.Add(ap50To95);
+                    truePositives += at50.TruePositives;
+                    falsePositives += at50.FalsePositives;
+                    falseNegatives += at50.FalseNegatives;
+
+                    if (at50.GroundTruthCount > 0 || at50.PredictionCount > 0)
+                    {
+                        perClass.Add(new Dictionary<string, object>
+                        {
+                            { "class_name", classNames[classIndex] },
+                            { "ground_truth", at50.GroundTruthCount },
+                            { "predictions", at50.PredictionCount },
+                            { "true_positives", at50.TruePositives },
+                            { "false_positives", at50.FalsePositives },
+                            { "false_negatives", at50.FalseNegatives },
+                            { "precision", at50.Precision },
+                            { "recall", at50.Recall },
+                            { "f1", at50.F1 },
+                            { "ap50", at50.AveragePrecision },
+                            { "ap50_95", ap50To95 }
+                        });
+                    }
+                }
+
+                double precision = Divide(truePositives, truePositives + falsePositives);
+                double recall = Divide(truePositives, truePositives + falseNegatives);
+                return new Dictionary<string, object>
+                {
+                    { "format", datasetFormat },
+                    { "set", datasetSplit },
+                    { "iou_matching", "0.50" },
+                    { "images", groundTruths.Count },
+                    { "ground_truth_boxes", groundTruthCount },
+                    { "predictions", detectionCount },
+                    { "true_positives", truePositives },
+                    { "false_positives", falsePositives },
+                    { "false_negatives", falseNegatives },
+                    { "precision", precision },
+                    { "recall", recall },
+                    { "f1", Divide(2.0 * precision * recall, precision + recall) },
+                    { "map50", Average(ap50Values) },
+                    { "map50_95", Average(ap50To95Values) },
+                    { "per_class", perClass }
+                };
+            }
+
+            private DetectionClassEvaluation EvaluateClass(int classIndex, double iouThreshold)
+            {
+                var classGroundTruths = new Dictionary<string, List<GroundTruthDetection>>(
+                    StringComparer.OrdinalIgnoreCase);
+                int groundTruthCount = 0;
+                foreach (KeyValuePair<string, List<GroundTruthDetection>> item in groundTruths)
+                {
+                    List<GroundTruthDetection> values = item.Value
+                        .Where(groundTruth => GetClassIndex(groundTruth) == classIndex).ToList();
+                    classGroundTruths[item.Key] = values;
+                    groundTruthCount += values.Count;
+                }
+
+                List<PredictedDetection> classPredictions = predictions
+                    .Where(prediction => prediction.ClassIndex == classIndex)
+                    .OrderByDescending(prediction => prediction.Confidence)
+                    .ToList();
+                var matched = new Dictionary<string, bool[]>(StringComparer.OrdinalIgnoreCase);
+                foreach (KeyValuePair<string, List<GroundTruthDetection>> item in classGroundTruths)
+                    matched[item.Key] = new bool[item.Value.Count];
+
+                int truePositives = 0;
+                int falsePositives = 0;
+                var truePositiveFlags = new List<bool>();
+                foreach (PredictedDetection prediction in classPredictions)
+                {
+                    List<GroundTruthDetection> candidates;
+                    if (!classGroundTruths.TryGetValue(prediction.ImagePath, out candidates))
+                        candidates = new List<GroundTruthDetection>();
+                    bool[] matchedCandidates = matched[prediction.ImagePath];
+                    int bestIndex = -1;
+                    float bestIou = 0;
+                    for (int index = 0; index < candidates.Count; index++)
+                    {
+                        if (matchedCandidates[index])
+                            continue;
+                        float currentIou = IntersectionOverUnion(prediction, candidates[index]);
+                        if (currentIou >= iouThreshold && currentIou > bestIou)
+                        {
+                            bestIou = currentIou;
+                            bestIndex = index;
+                        }
+                    }
+                    if (bestIndex >= 0)
+                    {
+                        matchedCandidates[bestIndex] = true;
+                        truePositives++;
+                        truePositiveFlags.Add(true);
+                    }
+                    else
+                    {
+                        falsePositives++;
+                        truePositiveFlags.Add(false);
+                    }
+                }
+
+                int falseNegatives = groundTruthCount - truePositives;
+                double precision = Divide(truePositives, truePositives + falsePositives);
+                double recall = Divide(truePositives, truePositives + falseNegatives);
+                return new DetectionClassEvaluation(groundTruthCount, classPredictions.Count,
+                    truePositives, falsePositives, falseNegatives, precision, recall,
+                    Divide(2.0 * precision * recall, precision + recall),
+                    CalculateAveragePrecision(truePositiveFlags, groundTruthCount));
+            }
+
+            private int GetClassIndex(GroundTruthDetection groundTruth)
+            {
+                int classIndex;
+                return int.TryParse(groundTruth.ClassName, NumberStyles.Integer,
+                    CultureInfo.InvariantCulture, out classIndex) ? classIndex : -1;
+            }
+
+            private static double CalculateAveragePrecision(List<bool> truePositiveFlags,
+                int groundTruthCount)
+            {
+                if (groundTruthCount == 0)
+                    return double.NaN;
+                int truePositives = 0;
+                int falsePositives = 0;
+                var precisions = new List<double>();
+                var recalls = new List<double>();
+                foreach (bool truePositive in truePositiveFlags)
+                {
+                    if (truePositive)
+                        truePositives++;
+                    else
+                        falsePositives++;
+                    precisions.Add(Divide(truePositives, truePositives + falsePositives));
+                    recalls.Add(Divide(truePositives, groundTruthCount));
+                }
+
+                double sum = 0;
+                for (int step = 0; step <= 100; step++)
+                {
+                    double threshold = step / 100.0;
+                    double maximum = 0;
+                    for (int index = 0; index < recalls.Count; index++)
+                    {
+                        if (recalls[index] >= threshold)
+                            maximum = Math.Max(maximum, precisions[index]);
+                    }
+                    sum += maximum;
+                }
+                return sum / 101.0;
+            }
+
+            private static float IntersectionOverUnion(PredictedDetection prediction,
+                GroundTruthDetection groundTruth)
+            {
+                float x1 = Math.Max(prediction.X1, groundTruth.X1);
+                float y1 = Math.Max(prediction.Y1, groundTruth.Y1);
+                float x2 = Math.Min(prediction.X2, groundTruth.X2);
+                float y2 = Math.Min(prediction.Y2, groundTruth.Y2);
+                float intersection = Math.Max(0, x2 - x1) * Math.Max(0, y2 - y1);
+                float predictionArea = Math.Max(0, prediction.X2 - prediction.X1) *
+                    Math.Max(0, prediction.Y2 - prediction.Y1);
+                float groundTruthArea = Math.Max(0, groundTruth.X2 - groundTruth.X1) *
+                    Math.Max(0, groundTruth.Y2 - groundTruth.Y1);
+                float union = predictionArea + groundTruthArea - intersection;
+                return union <= 0 ? 0 : intersection / union;
+            }
+
+            private static double Average(List<double> values)
+            {
+                return values.Count == 0 ? 0 : values.Average();
+            }
+        }
+
+        private sealed class PredictedDetection
+        {
+            public PredictedDetection(string imagePath, int classIndex, float confidence,
+                float x1, float y1, float x2, float y2)
+            {
+                ImagePath = imagePath;
+                ClassIndex = classIndex;
+                Confidence = confidence;
+                X1 = x1;
+                Y1 = y1;
+                X2 = x2;
+                Y2 = y2;
+            }
+
+            public string ImagePath { get; private set; }
+            public int ClassIndex { get; private set; }
+            public float Confidence { get; private set; }
+            public float X1 { get; private set; }
+            public float Y1 { get; private set; }
+            public float X2 { get; private set; }
+            public float Y2 { get; private set; }
+        }
+
+        private sealed class DetectionClassEvaluation
+        {
+            public DetectionClassEvaluation(int groundTruthCount, int predictionCount,
+                int truePositives, int falsePositives, int falseNegatives,
+                double precision, double recall, double f1, double averagePrecision)
+            {
+                GroundTruthCount = groundTruthCount;
+                PredictionCount = predictionCount;
+                TruePositives = truePositives;
+                FalsePositives = falsePositives;
+                FalseNegatives = falseNegatives;
+                Precision = precision;
+                Recall = recall;
+                F1 = f1;
+                AveragePrecision = averagePrecision;
+            }
+
+            public int GroundTruthCount { get; private set; }
+            public int PredictionCount { get; private set; }
+            public int TruePositives { get; private set; }
+            public int FalsePositives { get; private set; }
+            public int FalseNegatives { get; private set; }
+            public double Precision { get; private set; }
+            public double Recall { get; private set; }
+            public double F1 { get; private set; }
+            public double AveragePrecision { get; private set; }
+        }
+
         private static List<LoadedImage> LoadImages(string[] paths, bool color)
         {
             var images = new List<LoadedImage>(paths.Length);
@@ -820,9 +1896,15 @@ namespace OnnxVision
         private static void PrintUsage()
         {
             Console.WriteLine("Usage:");
-            Console.WriteLine("  OnnxVisionCLI.exe <model.onnx> <image-or-directory> [task options] [--json]");
+            Console.WriteLine("  OnnxVisionCLI.exe <model.onnx> <image-file|image-directory|dataset> [task options]");
             Console.WriteLine("  Classification options: [provider] [repeats] [roi-x roi-y roi-width roi-height]");
             Console.WriteLine("  Detection options: [confidence] [repeats] [provider]");
+            Console.WriteLine("  Dataset options: [-dataset] [-validate] [-set train|val|test] [--json]");
+            Console.WriteLine("  ImageNet classification datasets use train/val/test/<class>/image files.");
+            Console.WriteLine("  COCO detection datasets use annotations/instances_<set>.json or " +
+                "<set>/_annotations.coco.json.");
+            Console.WriteLine("  Validation is available only when a labeled dataset is supplied; " +
+                "default dataset set is val when present.");
             Console.WriteLine("  'detect' remains an optional object-detection command alias.");
             Console.WriteLine("Providers: cpu, openvino-cpu, openvino-gpu");
             Console.WriteLine("Models are classified automatically from their ONNX metadata contract.");

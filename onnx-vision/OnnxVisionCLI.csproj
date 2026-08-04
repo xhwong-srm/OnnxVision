@@ -20,5 +20,6 @@
       <HintPath>C:\VisionRef64\Open_eVision_NetApi_22_12.dll</HintPath>
       <Private>true</Private>
     </Reference>
+    <Reference Include="System.Runtime.Serialization" />
   </ItemGroup>
 </Project>

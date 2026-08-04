@@ -79,29 +79,52 @@ Show usage:
 
 The CLI identifies classification versus object detection from the required ONNX metadata contract. Classification models use `onnx-vision-classification`; object-detection models use `onnx-vision-object-detection`. Each model must provide `vision_task`, `contract_name`, `contract_version` (`major.minor.micro`, currently `1.0.0`), and `names`; detection models also provide `nms_required`. Tensor and input validation is then performed by the selected model implementation. The CLI preloads images, runs ten warmup calls, repeats the measured pass as requested, and reports session construction, image loading, warmup calls, shared model calls, measured wall time, end-to-end time, and throughput. `repeats` defaults to `1`.
 
-Classification expects a directory grouped by class name:
+Both tasks accept a single image, a directory of images, or a labeled dataset. A
+single image and a flat image directory are inference-only inputs. Add `-dataset`
+to force dataset interpretation when the layout is ambiguous. `-set` selects a
+dataset split (`train`, `val`, or `test`); when it is omitted, `val` is selected
+when present, followed by `train` and then `test`.
+
+Classification datasets use the usual ImageNet folder layout:
 
 ```text
-test-directory/
-├── class-a/
-│   └── image.bmp
-└── class-b/
-    └── image.bmp
+classification-dataset/
+├── train/
+│   ├── class-a/image.bmp
+│   └── class-b/image.bmp
+├── val/
+│   ├── class-a/image.bmp
+│   └── class-b/image.bmp
+└── test/
+    └── class-a/image.bmp
 ```
 
 ```powershell
-OnnxVisionCLI.exe model.onnx test-directory cpu
-OnnxVisionCLI.exe model.onnx test-directory openvino-cpu --json
-OnnxVisionCLI.exe model.onnx test-directory cpu 5 --json
-OnnxVisionCLI.exe model.onnx test-directory cpu 1 10 20 224 224 --json
+OnnxVisionCLI.exe model.onnx image.bmp cpu
+OnnxVisionCLI.exe model.onnx image-directory cpu --json
+OnnxVisionCLI.exe model.onnx classification-dataset cpu -set val -validate
+OnnxVisionCLI.exe model.onnx classification-dataset cpu -set test -validate --json
+OnnxVisionCLI.exe model.onnx classification-dataset cpu 1 10 20 224 224 -set val -validate
 ```
 
-Detection uses the same general command and accepts an optional confidence threshold and repeat count:
+Classification validation reports top-1 accuracy, macro precision/recall/F1,
+and per-class support and scores.
+
+Detection datasets use COCO annotations. The loader supports standard
+`annotations/instances_<set>.json` files, including `instances_train2017.json`
+and `instances_val2017.json`, as well as split-local
+`<set>/_annotations.coco.json` files.
 
 ```powershell
-OnnxVisionCLI.exe model.onnx image-or-directory 0.5 1 cpu
+OnnxVisionCLI.exe model.onnx image.bmp 0.5 1 cpu
 OnnxVisionCLI.exe model.onnx image-directory 0.5 10 cpu --json
+OnnxVisionCLI.exe model.onnx coco-dataset 0.5 cpu -set val -validate
+OnnxVisionCLI.exe model.onnx coco-dataset 0.5 cpu -set test -validate --json
 ```
+
+Detection validation reports IoU-0.50 precision/recall/F1, mAP50, mAP50-95,
+and per-class AP and matching counts. Validation is rejected for a single
+image or an unlabeled image directory.
 
 Supported providers are `cpu`, `openvino-cpu`, and `openvino-gpu`. The report includes both the requested and actual provider because provider initialization may fall back to CPU.
 
