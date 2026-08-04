@@ -11,3 +11,6 @@ uv run seal-vision export --help
 
 The existing scripts under `python-scripts` remain supported for backend-
 specific workflows and compatibility.
+
+All Python workflow code lives under `python-scripts` so it remains isolated
+from the repository's C# projects.
