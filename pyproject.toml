@@ -1,39 +1,57 @@
 [project]
-name = "0603-seal"
+name = "vision-workflows"
 version = "0.1.0"
-description = "Add your description here"
+description = "Reusable dataset and model workflows for computer vision"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "calflops>=0.3.2",
-    "libreyolo>=1.4.0",
-    "onnx>=1.22.0",
-    "onnxruntime>=1.27.0",
-    "onnxruntime-gpu<1.27",
-    "onnxscript>=0.5",
-    "onnxslim>=0.1.94",
-    "opencv-python>=4.12",
     "pillow>=11.0",
-    "pyside6>=6.8",
-    "rfdetr[augment,loggers,lora,onnx,train,visual]>=1.9.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+timm = [
     "timm>=1.0.19",
     "torch>=2.11.0",
     "torchvision>=0.26.0",
-    "tqdm>=4.66.0",
-    "triton-windows>=3.7.1.post27",
+]
+ultralytics = [
+    "onnx>=1.22.0",
+    "onnxruntime>=1.27.0",
+    "onnxscript>=0.5",
+    "onnxslim>=0.1.94",
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
     "ultralytics>=8.4.113",
+]
+libreyolo = [
+    "libreyolo>=1.4.0",
+    "onnx>=1.22.0",
+    "onnxruntime>=1.27.0",
+    "onnxscript>=0.5",
+    "onnxslim>=0.1.94",
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
+]
+gui = [
+    "opencv-python>=4.12",
+    "pyside6>=6.8",
 ]
 
 [project.scripts]
-seal-vision = "vision_pipeline.cli:main"
+vision-workflows = "vision_workflows.cli.app:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-where = ["python-scripts"]
-include = ["vision_pipeline*", "detection_dataset*", "classification_dataset*"]
+where = ["src"]
+include = ["vision_workflows*"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
@@ -43,3 +61,19 @@ torchvision = { index = "pytorch-cu128" }
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.coverage.run]
+source = ["src/vision_workflows"]
+omit = [
+    "*/backends/*",
+    "*/cli/*",
+    "*/__main__.py",
+]
+
+[tool.coverage.report]
+fail_under = 75
+show_missing = true

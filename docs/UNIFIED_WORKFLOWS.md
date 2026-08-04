@@ -1,61 +1,54 @@
-# Unified model workflows
+# Unified workflows
 
-The repository provides one dispatching entrypoint for the current training
-and export scripts. `uv run` synchronizes the local project environment; no
-global package installation is required.
+The package separates workflow logic from interaction. The CLI is one adapter;
+other applications can import the same typed services.
 
 ```powershell
-uv run seal-vision list-models
-uv run seal-vision train --help
-uv run seal-vision export --help
+uv run vision-workflows model list
+uv run vision-workflows dataset --help
+uv run vision-workflows train --help
 ```
 
-The direct-file form is equivalent:
+## Dataset management
 
 ```powershell
-uv run python python-scripts\vision_cli.py list-models
+uv run vision-workflows dataset validate images\dataset --require-train-val
+uv run vision-workflows dataset convert images\dataset artifacts\yolo --output-format yolo --materialization copy
+uv run vision-workflows dataset split images\classification artifacts\classification-split --grouping image
+uv run vision-workflows dataset merge source-a source-b --output artifacts\merged --split
 ```
 
-## Training
+Supported formats currently cover image-folder classification, COCO, YOLO,
+RF-DETR, and Neurocle rectangular detection. Segmentation is a first-class
+task kind in the domain contract and can be added with task-specific mask or
+polygon formats and backends.
 
-The common options are normalized by the dispatcher. Backend-specific options
-can be passed after `--` and are forwarded unchanged to the native script.
+## Training and export
+
+Models use `BACKEND/FAMILY/VARIANT` identifiers:
 
 ```powershell
-uv run seal-vision train `
-  --backend ultralytics `
-  --task detection `
-  --model yolo26n `
-  --data images\seal_dataset\data.yaml `
+uv run vision-workflows train `
+  --model ultralytics/yolo26/n `
+  --data images\dataset\data.yaml `
   --output runs\yolo26-n `
   --epochs 100 `
-  --imgsz 640 `
+  --image-size 640 `
   --device 0
-```
 
-For a timm classifier, use a class-folder dataset and the timm model name:
-
-```powershell
-uv run seal-vision train `
-  --backend timm `
-  --task classification `
-  --model mobilenetv3_small_100.lamb_in1k `
-  --data images\seal_dataset_v2
-```
-
-## Export
-
-```powershell
-uv run seal-vision export `
-  --backend libreyolo `
-  --task detection `
-  --model yolov9-t `
-  --checkpoint runs\yolov9-t\weights\best.pt `
+uv run vision-workflows export `
+  --model libreyolo/yolov9/t `
+  --checkpoint runs\yolov9-t\best.pt `
   --output artifacts\yolov9.onnx `
-  --imgsz 640 `
-  --data images\seal_dataset\data.yaml
+  --image-size 640
 ```
 
-The dispatcher preserves each backend's existing defaults and output contract.
-Model-specific export and validation flags remain available after `--`.
-Legacy script paths continue to work unchanged.
+Validation and held-out testing are separate operations:
+
+```powershell
+uv run vision-workflows validate --model ultralytics/yolo26/n --target runs\yolo26-n\best.pt --data images\dataset\data.yaml
+uv run vision-workflows test --model ultralytics/yolo26/n --target runs\yolo26-n\best.pt --data images\dataset\data.yaml --split test
+```
+
+Every workflow writes a JSON manifest, configuration, event log, metrics, and
+artifact references in its run directory.
