@@ -57,6 +57,7 @@ DEFAULT_BBOX_LOSS_WEIGHT = 5.0
 DEFAULT_GIOU_LOSS_WEIGHT = 2.0
 DEFAULT_NO_OBJECT_WEIGHT = 0.1
 PROGRESS_BAR_FORMAT = "{desc}: {percentage:3.0f}% {bar} {n_fmt}/{total_fmt} {rate_fmt} {elapsed}"
+PROGRESS_UPDATE_INTERVAL = 10
 
 
 def set_seed(seed: int, deterministic: bool) -> None:
@@ -81,7 +82,21 @@ def seed_worker(worker_id: int) -> None:
 
 def collate_detection_batch(batch):
     images, targets = zip(*batch)
+    first_shape = images[0].shape
+    if all(image.shape == first_shape for image in images[1:]):
+        return torch.stack(images), list(targets)
     return list(images), list(targets)
+
+
+def move_images(
+    images: torch.Tensor | list[torch.Tensor],
+    device: torch.device,
+) -> torch.Tensor:
+    if isinstance(images, torch.Tensor):
+        device_images = images.to(device, non_blocking=True)
+    else:
+        device_images = torch.stack([image.to(device, non_blocking=True) for image in images])
+    return device_images
 
 
 def resolve_image_path(root: Path, split: str, file_name: str) -> Path:
@@ -670,7 +685,7 @@ def detection_metrics(
 
 
 def move_targets(targets: list[dict[str, torch.Tensor]], device: torch.device):
-    return [{key: value.to(device) for key, value in target.items()} for target in targets]
+    return [{key: value.to(device, non_blocking=True) for key, value in target.items()} for target in targets]
 
 
 def amp_context(device: torch.device, enabled: bool, dtype: torch.dtype):
@@ -736,10 +751,11 @@ def train_epoch(
     imgsz: int = 0,
 ) -> dict[str, float]:
     model.train()
-    totals: defaultdict[str, float] = defaultdict(float)
+    totals: dict[str, torch.Tensor] = {}
     batches = 0
+    total_batches = len(loader)
     for images, targets in loader:
-        images = torch.stack([image.to(device, non_blocking=True) for image in images])
+        images = move_images(images, device)
         targets = move_targets(targets, device)
         optimizer.zero_grad(set_to_none=True)
         with amp_context(device, amp_enabled, amp_dtype):
@@ -754,22 +770,29 @@ def train_epoch(
         scaler.step(optimizer)
         scaler.update()
         for name, value in losses.items():
-            totals[name] += float(value.detach().cpu())
+            detached = value.detach()
+            if name in totals:
+                totals[name] = totals[name] + detached
+            else:
+                totals[name] = detached
         batches += 1
         if progress is not None:
-            averages = {name: value / batches for name, value in totals.items()}
-            progress.set_description(
-                train_progress_description(
-                    epoch,
-                    total_epochs,
-                    averages,
-                    sum(int(target["boxes"].shape[0]) for target in targets),
-                    imgsz,
-                    peak_gpu_memory(device),
-                )
-            )
             progress.update(1)
-    return {name: value / max(1, batches) for name, value in totals.items()}
+            if batches % PROGRESS_UPDATE_INTERVAL == 0 or batches == total_batches:
+                averages = {
+                    name: float(value.cpu()) / batches for name, value in totals.items()
+                }
+                progress.set_description(
+                    train_progress_description(
+                        epoch,
+                        total_epochs,
+                        averages,
+                        sum(int(target["boxes"].shape[0]) for target in targets),
+                        imgsz,
+                        peak_gpu_memory(device),
+                    )
+                )
+    return {name: float(value.cpu()) / max(1, batches) for name, value in totals.items()}
 
 
 @torch.no_grad()
@@ -780,13 +803,16 @@ def evaluate(
     device: torch.device,
     score_threshold: float,
     progress: Any | None = None,
+    amp_enabled: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
 ) -> dict[str, Any]:
     model.eval()
     predictions = []
     targets = []
     for images, batch_targets in loader:
-        device_images = torch.stack([image.to(device, non_blocking=True) for image in images])
-        class_logits, boxes = model(device_images)
+        device_images = move_images(images, device)
+        with amp_context(device, amp_enabled, amp_dtype):
+            class_logits, boxes = model(device_images)
         predictions.extend(decode_predictions(class_logits, boxes, class_names, score_threshold))
         targets.extend(batch_targets)
         if progress is not None:
@@ -1067,6 +1093,8 @@ def main() -> None:
                 device,
                 args.score_threshold,
                 progress=val_progress,
+                amp_enabled=amp_enabled,
+                amp_dtype=amp_dtype,
             )
         finally:
             val_progress.close()
@@ -1102,14 +1130,30 @@ def main() -> None:
 
     best = torch.load(output / "best.pt", map_location=device, weights_only=False)
     model.load_state_dict(best["model_state_dict"])
-    best_metrics = evaluate(model, val_loader, train_set.class_names, device, args.score_threshold)
+    best_metrics = evaluate(
+        model,
+        val_loader,
+        train_set.class_names,
+        device,
+        args.score_threshold,
+        amp_enabled=amp_enabled,
+        amp_dtype=amp_dtype,
+    )
     print(
         f"best_epoch={best['epoch']} best_map50={best_metrics['map50']:.5f} "
         f"best_map50_95={best_metrics['map50_95']:.5f}"
     )
     if test_set is not None:
         test_loader = make_loader(test_set, args.batch, 0, pin_memory, args.seed + 2, False)
-        test_metrics = evaluate(model, test_loader, train_set.class_names, device, args.score_threshold)
+        test_metrics = evaluate(
+            model,
+            test_loader,
+            train_set.class_names,
+            device,
+            args.score_threshold,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+        )
         print(
             f"test_map50={test_metrics['map50']:.5f} test_precision50={test_metrics['precision50']:.5f} "
             f"test_recall50={test_metrics['recall50']:.5f} test_map50_95={test_metrics['map50_95']:.5f}"
