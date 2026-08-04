@@ -11,20 +11,19 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from convert_detection_dataset import (  # noqa: E402
-    build_parser,
+from detection_dataset import (  # noqa: E402
     convert_dataset,
     detect_input_format,
     load_coco,
     load_neurocle,
     load_rfdetr,
     load_yolo,
-    main,
     write_coco,
     write_neurocle,
     write_rfdetr,
     write_yolo,
 )
+from detection_dataset.cli import build_parser, main  # noqa: E402
 
 
 class DetectionDatasetConverterTests(unittest.TestCase):
