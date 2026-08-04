@@ -12,10 +12,13 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from convert_detection_dataset import (  # noqa: E402
+    build_parser,
+    detect_input_format,
     load_coco,
     load_neurocle,
     load_rfdetr,
     load_yolo,
+    main,
     write_coco,
     write_neurocle,
     write_rfdetr,
@@ -29,6 +32,7 @@ class DetectionDatasetConverterTests(unittest.TestCase):
             root = Path(temporary)
             coco = root / "coco"
             self._write_coco_source(coco)
+            self.assertEqual(detect_input_format(coco), "coco")
 
             loaded_coco = load_coco(coco)
             self.assertEqual(loaded_coco.classes, ["seal", "defect"])
@@ -48,11 +52,14 @@ class DetectionDatasetConverterTests(unittest.TestCase):
             yolo = root / "yolo"
             yolo.mkdir()
             write_yolo(loaded_coco, yolo, "copy")
+            self.assertEqual(detect_input_format(yolo), "yolo")
+            self.assertEqual(detect_input_format(yolo / "data.yaml"), "yolo")
             loaded_yolo = load_yolo(yolo)
 
             rfdetr = root / "rfdetr"
             rfdetr.mkdir()
             write_rfdetr(loaded_yolo, rfdetr, "copy")
+            self.assertEqual(detect_input_format(rfdetr), "rfdetr")
             loaded_rfdetr = load_rfdetr(rfdetr)
 
             output_coco = root / "output-coco"
@@ -148,11 +155,54 @@ class DetectionDatasetConverterTests(unittest.TestCase):
             self.assertFalse(any(neurocle_output.glob("*.zip")))
             self.assertTrue((neurocle_output / "images" / "train-image.png").is_file())
             unzipped = load_neurocle(neurocle_output)
+            self.assertEqual(detect_input_format(neurocle_output), "neurocle")
             self.assertEqual(
                 {split: len(images) for split, images in unzipped.splits.items()},
                 {"train": 1, "test": 1},
             )
             unzipped.cleanup()
+
+    def test_input_format_is_optional_when_it_can_be_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            coco = root / "coco"
+            self._write_coco_source(coco)
+            output = root / "yolo"
+
+            arguments = build_parser().parse_args(
+                [
+                    "--output-format",
+                    "yolo",
+                    "--data",
+                    str(coco),
+                    "--output",
+                    str(output),
+                    "--image-mode",
+                    "copy",
+                ]
+            )
+            self.assertIsNone(arguments.input_format)
+
+            main(
+                [
+                    "--output-format",
+                    "yolo",
+                    "--data",
+                    str(coco),
+                    "--output",
+                    str(output),
+                    "--image-mode",
+                    "copy",
+                ]
+            )
+            self.assertTrue((output / "data.yaml").is_file())
+
+    def test_input_format_detection_reports_unknown_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            unknown = Path(temporary) / "unknown"
+            unknown.mkdir()
+            with self.assertRaisesRegex(ValueError, "Could not detect"):
+                detect_input_format(unknown)
 
     @staticmethod
     def _write_coco_source(root: Path) -> None:

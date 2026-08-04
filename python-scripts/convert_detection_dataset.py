@@ -43,6 +43,10 @@ Examples::
         --input-format coco --output-format neurocle \
         --data images/seal_dataset --output artifacts/neurocle-labelset
 
+    uv run python python-scripts/convert_detection_dataset.py \
+        --output-format yolo \
+        --data images/seal_dataset --output artifacts/seal-yolo
+
 The converter handles bounding-box object detection only. Segmentation
 polygons, keypoints, and other format-specific fields are not carried through
 the canonical representation.
@@ -797,6 +801,57 @@ def prepare_output(output: Path, input_path: Path) -> None:
         output.mkdir(parents=True)
 
 
+def looks_like_neurocle(root: Path) -> bool:
+    json_paths = sorted(path for path in root.glob("*.json") if path.is_file())
+    if any(path.name.casefold() == "neurocle_labeling.json" for path in json_paths):
+        return True
+    for path in json_paths:
+        try:
+            document = read_json(path)
+        except ValueError:
+            continue
+        if "classes" in document and "data" in document:
+            return True
+    return False
+
+
+def detect_input_format(data: Path) -> str:
+    """Detect the input layout from its supported structural markers."""
+
+    if not data.exists():
+        raise FileNotFoundError(f"Input dataset does not exist: {data}")
+
+    candidates: list[str] = []
+    if data.is_file():
+        if data.suffix.casefold() in {".yaml", ".yml"}:
+            candidates.append("yolo")
+    elif data.is_dir():
+        if find_annotation(data, "train") is not None and find_annotation(data, "val") is not None:
+            candidates.append("coco")
+        if (
+            (data / "train" / "_annotations.coco.json").is_file()
+            and (data / "valid" / "_annotations.coco.json").is_file()
+        ):
+            candidates.append("rfdetr")
+        if (data / "data.yaml").is_file():
+            candidates.append("yolo")
+        if looks_like_neurocle(data):
+            candidates.append("neurocle")
+
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise ValueError(
+            f"Could not detect the input dataset format for {data}. "
+            "Specify --input-format (coco, yolo, rfdetr, or neurocle)."
+        )
+    detected = ", ".join(candidates)
+    raise ValueError(
+        f"Could not uniquely detect the input dataset format for {data}; "
+        f"matching formats: {detected}. Specify --input-format."
+    )
+
+
 def place_image(source: Path, target: Path, mode: str) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     if mode == "copy":
@@ -1044,8 +1099,7 @@ def build_parser(
         "--input-format",
         choices=INPUT_FORMATS,
         default=default_input_format,
-        required=default_input_format is None,
-        help="Input dataset layout",
+        help="Input dataset layout; omitted to detect it automatically",
     )
     parser.add_argument(
         "--output-format",
@@ -1097,8 +1151,9 @@ def main(
     args = build_parser(default_input_format, default_output_format).parse_args(argv)
     data = args.data.expanduser().resolve()
     output = args.output.expanduser().resolve()
-    input_root = data.parent if args.input_format == "yolo" and data.is_file() else data
-    dataset = load_dataset(args.input_format, data)
+    input_format = args.input_format or detect_input_format(data)
+    input_root = data.parent if input_format == "yolo" and data.is_file() else data
+    dataset = load_dataset(input_format, data)
     try:
         prepare_output(output, input_root)
         if args.output_format == "coco":
@@ -1111,7 +1166,7 @@ def main(
             write_yolo(dataset, output, args.image_mode)
         counts = {split: len(records) for split, records in dataset.splits.items()}
         print(
-            f"Converted {args.input_format} dataset to {args.output_format}; "
+            f"Converted {input_format} dataset to {args.output_format}; "
             f"classes={dataset.classes}; split images={counts}; output={output}"
         )
     finally:
