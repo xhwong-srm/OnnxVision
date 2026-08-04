@@ -9,7 +9,12 @@ The shared library accepts `EImageBW8`, `EImageC24`, and Euresys ROI objects dir
 ```text
 onnx-vision/
 ├── OnnxVisionCLI.csproj             # SDK-style CLI executable
-├── Program.cs                       # CLI, JSON reports, and benchmark harness
+├── Program.cs                       # CLI entrypoint and classification/detection orchestration
+├── Cli/                              # CLI options and ROI argument parsing
+├── Datasets/                         # ImageNet/COCO loaders and input models
+├── Imaging/                          # Euresys image loading and disposal
+├── Reporting/                        # Text/JSON reports and classification helpers
+├── Validation/                       # Classification and COCO-style detection metrics
 └── OnnxVision/
     ├── OnnxVision.csproj            # Legacy project for Vision Studio workflows
     ├── OnnxVision.Sdk.csproj        # SDK-style shared-library project

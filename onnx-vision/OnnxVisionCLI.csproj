@@ -15,6 +15,13 @@
 
   <ItemGroup>
     <Compile Include="Program.cs" />
+    <Compile Include="Cli\Program.Options.cs" />
+    <Compile Include="Datasets\Program.DatasetLoading.cs" />
+    <Compile Include="Datasets\Program.InputModels.cs" />
+    <Compile Include="Validation\Program.ValidationMetrics.cs" />
+    <Compile Include="Imaging\Program.ImageLoading.cs" />
+    <Compile Include="Reporting\Program.Reporting.cs" />
+    <Compile Include="Reporting\Program.RocPoint.cs" />
     <ProjectReference Include="OnnxVision\OnnxVision.Sdk.csproj" />
     <Reference Include="Open_eVision_NetApi_22_12">
       <HintPath>C:\VisionRef64\Open_eVision_NetApi_22_12.dll</HintPath>
