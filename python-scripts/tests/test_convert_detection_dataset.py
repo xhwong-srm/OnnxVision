@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from convert_detection_dataset import (  # noqa: E402
     build_parser,
+    convert_dataset,
     detect_input_format,
     load_coco,
     load_neurocle,
@@ -182,6 +183,13 @@ class DetectionDatasetConverterTests(unittest.TestCase):
                 ]
             )
             self.assertIsNone(arguments.input_format)
+
+            api_output = root / "api-yolo"
+            result = convert_dataset(coco, api_output, "yolo", image_mode="copy")
+            self.assertEqual(result.input_format, "coco")
+            self.assertEqual(result.output_format, "yolo")
+            self.assertEqual(result.split_image_counts, {"train": 1, "val": 1, "test": 1})
+            self.assertTrue((api_output / "data.yaml").is_file())
 
             main(
                 [

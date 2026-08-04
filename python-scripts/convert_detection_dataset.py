@@ -124,6 +124,15 @@ class DetectionDataset:
             self.temporary_directory = None
 
 
+@dataclass(frozen=True)
+class ConversionResult:
+    input_format: str
+    output_format: str
+    classes: tuple[str, ...]
+    split_image_counts: dict[str, int]
+    output: Path
+
+
 def canonical_split(name: str) -> str:
     normalized = name.casefold()
     if normalized == "train":
@@ -1142,6 +1151,54 @@ def load_dataset(input_format: str, data: Path) -> DetectionDataset:
     return load_yolo(data)
 
 
+def convert_dataset(
+    data: Path,
+    output: Path,
+    output_format: str,
+    *,
+    input_format: str | None = None,
+    image_mode: str = "hardlink",
+) -> ConversionResult:
+    """Convert a dataset and return details about the completed conversion.
+
+    ``input_format`` may be omitted to use :func:`detect_input_format`. The
+    loaded dataset is always cleaned up before this function returns.
+    """
+
+    if output_format not in OUTPUT_FORMATS:
+        raise ValueError(f"Unsupported output dataset format: {output_format!r}")
+    if input_format is not None and input_format not in INPUT_FORMATS:
+        raise ValueError(f"Unsupported input dataset format: {input_format!r}")
+    if image_mode not in {"hardlink", "copy"}:
+        raise ValueError(f"Unsupported image mode: {image_mode!r}")
+
+    data = data.expanduser().resolve()
+    output = output.expanduser().resolve()
+    detected_input_format = input_format or detect_input_format(data)
+    input_root = data.parent if detected_input_format == "yolo" and data.is_file() else data
+    dataset = load_dataset(detected_input_format, data)
+    try:
+        prepare_output(output, input_root)
+        split_image_counts = {split: len(records) for split, records in dataset.splits.items()}
+        if output_format == "coco":
+            write_coco(dataset, output, image_mode)
+        elif output_format == "rfdetr":
+            write_rfdetr(dataset, output, image_mode)
+        elif output_format == "neurocle":
+            write_neurocle(dataset, output, image_mode)
+        else:
+            write_yolo(dataset, output, image_mode)
+        return ConversionResult(
+            detected_input_format,
+            output_format,
+            tuple(dataset.classes),
+            split_image_counts,
+            output,
+        )
+    finally:
+        dataset.cleanup()
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -1151,26 +1208,18 @@ def main(
     args = build_parser(default_input_format, default_output_format).parse_args(argv)
     data = args.data.expanduser().resolve()
     output = args.output.expanduser().resolve()
-    input_format = args.input_format or detect_input_format(data)
-    input_root = data.parent if input_format == "yolo" and data.is_file() else data
-    dataset = load_dataset(input_format, data)
-    try:
-        prepare_output(output, input_root)
-        if args.output_format == "coco":
-            write_coco(dataset, output, args.image_mode)
-        elif args.output_format == "rfdetr":
-            write_rfdetr(dataset, output, args.image_mode)
-        elif args.output_format == "neurocle":
-            write_neurocle(dataset, output, args.image_mode)
-        else:
-            write_yolo(dataset, output, args.image_mode)
-        counts = {split: len(records) for split, records in dataset.splits.items()}
-        print(
-            f"Converted {input_format} dataset to {args.output_format}; "
-            f"classes={dataset.classes}; split images={counts}; output={output}"
-        )
-    finally:
-        dataset.cleanup()
+    result = convert_dataset(
+        data,
+        output,
+        args.output_format,
+        input_format=args.input_format,
+        image_mode=args.image_mode,
+    )
+    print(
+        f"Converted {result.input_format} dataset to {result.output_format}; "
+        f"classes={list(result.classes)}; split images={result.split_image_counts}; "
+        f"output={result.output}"
+    )
 
 
 if __name__ == "__main__":
