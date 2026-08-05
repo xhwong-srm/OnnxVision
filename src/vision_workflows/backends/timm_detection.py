@@ -125,7 +125,7 @@ class TimmDetectionBackend:
             raise ValueError("evaluation requires a detection dataset")
         dataset = load_dataset(request.data, DatasetFormat.COCO)
         if not isinstance(dataset, DetectionDataset):
-            raise ValueError("query-detector requires an object-detection dataset")
+            raise ValueError("timm-obd-v1 requires an object-detection dataset")
         image_size = request.image_size or int(request.options.get("image_size", 640))
         return dataset, TimmDetectionDataset(dataset, split, image_size)
 

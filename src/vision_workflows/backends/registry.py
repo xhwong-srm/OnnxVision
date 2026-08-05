@@ -13,7 +13,6 @@ from ..domain.models import (
     ProviderDescriptor,
     StaticModelCatalog,
 )
-from ..workflows.context import optional_import
 from .base import FrameworkTaskPlugin, OperationHandler
 from .libreyolo import LibreYoloBackend
 from .timm_classification import TimmClassificationBackend
@@ -112,17 +111,9 @@ def _all_handlers(backend, train_schema, export_size: int, dataset: DatasetRequi
     }
 
 
-class TimmCatalog:
-    def list(self, pattern: str | None = None) -> tuple[ModelInfo, ...]:
-        timm = optional_import("timm")
-        query = pattern or "*"
-        return tuple(ModelInfo(name, name) for name in timm.list_models(filter=query))
-
-    def resolve(self, model: str) -> ModelInfo:
-        timm = optional_import("timm")
-        if model not in {item.id for item in self.list(model)} and model not in timm.list_models(filter=model, pretrained=True):
-            raise ConfigurationError(f"unknown timm model: {model}")
-        return ModelInfo(model, model)
+_TIMM_CLASSIFICATION_MODELS = (
+    ModelInfo("mobilenetv4_conv_small_050.e3000_r224_in1k", "mobilenetv4_conv_small_050.e3000_r224_in1k"),
+)
 
 
 def _plugins() -> tuple[FrameworkTaskPlugin, ...]:
@@ -158,8 +149,8 @@ def _plugins() -> tuple[FrameworkTaskPlugin, ...]:
         )
     }
     return (
-        FrameworkTaskPlugin(ProviderDescriptor("timm", TaskKind.CLASSIFICATION, frozenset(Operation), "timm image classifier", "timm"), TimmCatalog(), _all_handlers(timm_backend, _timm_train, 224, classification_data)),
-        FrameworkTaskPlugin(ProviderDescriptor("pytorch", TaskKind.OBJECT_DETECTION, frozenset(Operation), "PyTorch learned-query detector", "torch,timm,torchvision"), StaticModelCatalog((ModelInfo("query-detector", "query-detector"),)), _all_handlers(query_backend, _query_train, 640, coco_data)),
+        FrameworkTaskPlugin(ProviderDescriptor("timm", TaskKind.CLASSIFICATION, frozenset(Operation), "timm image classifier", "timm"), StaticModelCatalog(_TIMM_CLASSIFICATION_MODELS), _all_handlers(timm_backend, _timm_train, 224, classification_data)),
+        FrameworkTaskPlugin(ProviderDescriptor("pytorch", TaskKind.OBJECT_DETECTION, frozenset(Operation), "PyTorch timm object detector v1", "torch,timm,torchvision"), StaticModelCatalog((ModelInfo("timm-obd-v1", "timm-obd-v1"),)), _all_handlers(query_backend, _query_train, 640, coco_data)),
         FrameworkTaskPlugin(ProviderDescriptor("ultralytics", TaskKind.CLASSIFICATION, frozenset(Operation), "Ultralytics classifier", "ultralytics"), StaticModelCatalog(yolo26_cls), _all_handlers(ultralytics_cls, _ultralytics_train(TaskKind.CLASSIFICATION), 224, classification_data)),
         FrameworkTaskPlugin(ProviderDescriptor("ultralytics", TaskKind.OBJECT_DETECTION, frozenset(Operation), "Ultralytics detector", "ultralytics"), StaticModelCatalog(yolo26), _all_handlers(ultralytics_det, _ultralytics_train(TaskKind.OBJECT_DETECTION), 640, yolo_data, nms_configurable=True)),
         FrameworkTaskPlugin(ProviderDescriptor("libreyolo", TaskKind.OBJECT_DETECTION, frozenset(Operation), "LibreYOLO detector", "libreyolo"), StaticModelCatalog(libre_models), libre_handlers),

@@ -73,8 +73,8 @@ def test_timm_detection_supports_resume_patience_and_determinism(monkeypatch, tm
         "amp_dtype": None, "compile": False,
     }
     request = ResolvedTrainRequest(
-        ModelSelection(TaskKind.OBJECT_DETECTION, "pytorch", "query-detector"),
-        ModelInfo("query-detector", "query-detector"),
+        ModelSelection(TaskKind.OBJECT_DETECTION, "pytorch", "timm-obd-v1"),
+        ModelInfo("timm-obd-v1", "timm-obd-v1"),
         tmp_path / "data",
         run_dir,
         None,

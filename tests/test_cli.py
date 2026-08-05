@@ -45,7 +45,7 @@ def test_cli_does_not_expose_timm_parameters_to_ultralytics() -> None:
 def test_cli_exposes_timm_loader_and_amp_options() -> None:
     argv = [
         "train", "--task", "classification", "--framework", "timm",
-        "--model", "resnet18", "--data", "data", "--output", "run",
+        "--model", "mobilenetv4_conv_small_050.e3000_r224_in1k", "--data", "data", "--output", "run",
         "--workers", "4", "--prefetch-factor", "3", "--persistent-workers",
         "--pin-memory", "--amp", "--amp-dtype", "bfloat16",
     ]

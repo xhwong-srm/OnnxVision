@@ -54,7 +54,7 @@ uv run vision-workflows model describe --task classification --framework ultraly
 Timm classification and detection training support DataLoader and AMP options:
 
 ```powershell
-uv run vision-workflows train --task classification --framework timm --model resnet18 `
+uv run vision-workflows train --task classification --framework timm --model mobilenetv4_conv_small_050.e3000_r224_in1k `
   --data data --output run --workers 4 --prefetch-factor 2 `
   --persistent-workers --pin-memory --amp --amp-dtype float16
 ```

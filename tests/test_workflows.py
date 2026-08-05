@@ -36,6 +36,13 @@ def test_model_selection_is_explicit_and_catalog_resolves_native_model() -> None
     assert models_for(TaskKind.OBJECT_DETECTION, "libreyolo", "picodet*")
 
 
+def test_timm_classification_catalog_exposes_only_validated_model() -> None:
+    model = "mobilenetv4_conv_small_050.e3000_r224_in1k"
+    assert [item.id for item in models_for(TaskKind.CLASSIFICATION, "timm")] == [model]
+    with pytest.raises(ConfigurationError, match="unsupported model: resnet18"):
+        plugin_for(ModelSelection(TaskKind.CLASSIFICATION, "timm", "resnet18")).catalog.resolve("resnet18")
+
+
 def test_provider_schema_rejects_parameters_owned_by_another_provider() -> None:
     selection = ModelSelection(TaskKind.CLASSIFICATION, "ultralytics", "yolo26n")
     plugin = plugin_for(selection)
