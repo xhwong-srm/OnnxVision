@@ -118,6 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--resume", action="store_true")
     train.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
     train.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True)
+    train.add_argument("--allow-experimental", action="store_true", help="allow backends with gated experimental training")
 
     export = commands.add_parser("export")
     export.add_argument("--model", type=_model, required=True)
@@ -171,7 +172,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print(asdict(result))
         return 0
     if args.command == "train":
-        result = TrainService().run(TrainRequest(args.model, args.data, args.output, args.epochs, args.batch, args.image_size, args.learning_rate, args.workers, args.patience, args.seed, args.device, args.weights, args.resume, args.pretrained, args.deterministic))
+        options = {"allow_experimental": True} if args.allow_experimental else {}
+        result = TrainService().run(TrainRequest(args.model, args.data, args.output, args.epochs, args.batch, args.image_size, args.learning_rate, args.workers, args.patience, args.seed, args.device, args.weights, args.resume, args.pretrained, args.deterministic, options))
         _print(asdict(result))
         return 0
     if args.command == "export":
