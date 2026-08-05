@@ -17,3 +17,12 @@ def test_cli_exposes_explicit_experimental_training_opt_in() -> None:
     ])
     assert args.allow_experimental is True
     assert args.overwrite is True
+
+
+def test_cli_uses_model_image_size_when_training_size_is_omitted() -> None:
+    args = build_parser().parse_args([
+        "train", "--model", "timm/classification/mobilenetv4_conv_small_050.e3000_r224_in1k",
+        "--data", "data", "--output", "run", "--worker", "4",
+    ])
+    assert args.image_size is None
+    assert args.workers == 4

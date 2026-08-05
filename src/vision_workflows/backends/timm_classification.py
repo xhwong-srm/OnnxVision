@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import random
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
@@ -19,6 +20,73 @@ from .common import classification_contract, metadata_for_contract, require_file
 
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_MEAN = (0.485, 0.456, 0.406)
+_DEFAULT_STD = (0.229, 0.224, 0.225)
+
+
+def _seed_everything(torch, seed: int, deterministic: bool) -> None:
+    random.seed(seed)
+    try:
+        import numpy as np
+        np.random.seed(seed)
+    except ImportError:
+        pass
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(deterministic)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = deterministic
+        torch.backends.cudnn.benchmark = not deterministic
+        if hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = not deterministic
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = not deterministic
+
+
+def _capture_rng_state(torch, loader_generator) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "torch": torch.get_rng_state(),
+        "loader": loader_generator.get_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    try:
+        import numpy as np
+        state["numpy"] = np.random.get_state()
+    except ImportError:
+        pass
+    return state
+
+
+def _restore_rng_state(torch, loader_generator, state: dict[str, Any]) -> None:
+    if state.get("python") is not None:
+        random.setstate(state["python"])
+    if state.get("torch") is not None:
+        torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and state.get("cuda") is not None:
+        torch.cuda.set_rng_state_all(state["cuda"])
+    if state.get("loader") is not None:
+        loader_generator.set_state(state["loader"])
+    if state.get("numpy") is not None:
+        try:
+            import numpy as np
+            np.random.set_state(state["numpy"])
+        except ImportError:
+            pass
+
+
+def _worker_seed(worker_id: int) -> None:
+    import torch
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    try:
+        import numpy as np
+        np.random.seed(worker_seed)
+    except ImportError:
+        pass
 
 
 @dataclass(frozen=True)
@@ -47,23 +115,41 @@ class TimmClassificationBackend(ModelBackend):
         return timm, torch, torchvision
 
     @staticmethod
-    def _datasets(data: Path, image_size: int, train: bool):
+    def _datasets(data: Path, image_size: int, train: bool, mean: tuple[float, ...] = _DEFAULT_MEAN, std: tuple[float, ...] = _DEFAULT_STD):
         _, _, torchvision = TimmClassificationBackend._imports()
         transforms = torchvision.transforms
         operations = [transforms.Resize((image_size, image_size))]
         if train:
             operations.extend([transforms.RandomHorizontalFlip(), transforms.RandomRotation(5)])
-        operations.extend([transforms.ToTensor(), transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))])
+        operations.extend([transforms.ToTensor(), transforms.Normalize(mean, std)])
         transform = transforms.Compose(operations)
         root = data / ("train" if train else "val")
         if not root.is_dir():
             raise FileNotFoundError(f"classification split does not exist: {root}")
         return torchvision.datasets.ImageFolder(str(root), transform=transform)
 
+    @staticmethod
+    def _dataset_classes(data: Path, torchvision) -> tuple[list[str], list[str]]:
+        roots = (data / "train", data / "val")
+        for root in roots:
+            if not root.is_dir():
+                raise FileNotFoundError(f"classification split does not exist: {root}")
+        return (
+            torchvision.datasets.ImageFolder(str(roots[0])).classes,
+            torchvision.datasets.ImageFolder(str(roots[1])).classes,
+        )
+
+    @staticmethod
+    def _model_data_config(timm, model) -> dict[str, Any]:
+        try:
+            return dict(timm.data.resolve_model_data_config(model))
+        except (AttributeError, KeyError, TypeError):
+            return dict(getattr(model, "pretrained_cfg", {}) or getattr(model, "default_cfg", {}) or {})
+
     def train(self, request: TrainRequest, context: WorkflowContext) -> BackendExecution:
         started = time.perf_counter()
         logger.info(
-            "Training parameters: model=%s data=%s output=%s device=%s epochs=%d batch=%d image_size=%d learning_rate=%g workers=%d seed=%d pretrained=%s resume=%s patience=%d deterministic=%s weights=%s options=%s",
+            "Training parameters: model=%s data=%s output=%s device=%s epochs=%d batch=%d image_size=%s learning_rate=%g workers=%d seed=%d pretrained=%s resume=%s patience=%d deterministic=%s weights=%s options=%s",
             request.model,
             request.data,
             context.run_dir,
@@ -82,33 +168,70 @@ class TimmClassificationBackend(ModelBackend):
             dict(request.options),
         )
         logger.info("Loading timm, torch, and torchvision")
-        timm, torch, _ = self._imports()
+        timm, torch, torchvision = self._imports()
+        tqdm = optional_import("tqdm.auto").tqdm
         data = request.data.expanduser().resolve()
         logger.info("Loading image-folder datasets from %s", data)
-        train_set = self._datasets(data, request.image_size, True)
-        val_set = self._datasets(data, request.image_size, False)
-        if train_set.classes != val_set.classes:
+        train_classes, val_classes = self._dataset_classes(data, torchvision)
+        if train_classes != val_classes:
             raise ValueError("train and val class folders differ")
-        logger.info("Dataset ready: train=%d val=%d classes=%s", len(train_set), len(val_set), ", ".join(train_set.classes))
+        _seed_everything(torch, request.seed, request.deterministic)
         device = torch.device("cuda" if request.device in {"auto", "cuda"} and torch.cuda.is_available() else request.device if request.device != "auto" else "cpu")
         logger.info("Using device: %s", device)
-        logger.info("Creating timm model %s (pretrained=%s)", request.model.variant, request.pretrained)
-        model = timm.create_model(request.model.variant, pretrained=request.pretrained, num_classes=len(train_set.classes))
+        model_pretrained = request.pretrained and not request.resume
+        logger.info("Creating timm model %s (pretrained=%s)", request.model.variant, model_pretrained)
+        model = timm.create_model(request.model.variant, pretrained=model_pretrained, num_classes=len(train_classes))
         logger.info("Model ready")
-        if request.weights:
+        model_data_config = self._model_data_config(timm, model)
+        input_size = model_data_config.get("input_size", (3, 224, 224))
+        image_size = int(request.image_size or input_size[-1])
+        mean = tuple(float(value) for value in model_data_config.get("mean", _DEFAULT_MEAN))
+        std = tuple(float(value) for value in model_data_config.get("std", _DEFAULT_STD))
+        logger.info("Effective image size: %d (requested=%s, model_suggested=%s)", image_size, request.image_size, input_size[-1])
+        train_set = self._datasets(data, image_size, True, mean, std)
+        val_set = self._datasets(data, image_size, False, mean, std)
+        logger.info("Dataset ready: train=%d val=%d classes=%s", len(train_set), len(val_set), ", ".join(train_set.classes))
+        if request.weights and not request.resume:
             logger.info("Loading custom weights from %s", request.weights)
-            checkpoint = torch.load(require_file(request.weights, "weights"), map_location=device, weights_only=False)
+            checkpoint = torch.load(require_file(request.weights, "weights"), map_location="cpu", weights_only=False)
             model.load_state_dict(checkpoint["model_state_dict"], strict=True)
         model.to(device)
-        workers = max(0, request.workers)
-        loader = torch.utils.data.DataLoader(train_set, batch_size=request.batch, shuffle=True, num_workers=workers, generator=torch.Generator().manual_seed(request.seed))
-        val_loader = torch.utils.data.DataLoader(val_set, batch_size=request.batch, shuffle=False, num_workers=workers)
-        logger.info("DataLoaders ready: batch=%d workers=%d", request.batch, workers)
+        requested_workers = max(0, request.workers)
+        workers = requested_workers
+        loader_generator = torch.Generator().manual_seed(request.seed)
+        worker_init_fn = _worker_seed if workers > 0 else None
+        loader = torch.utils.data.DataLoader(train_set, batch_size=request.batch, shuffle=True, num_workers=workers, generator=loader_generator, worker_init_fn=worker_init_fn)
+        val_loader = torch.utils.data.DataLoader(val_set, batch_size=request.batch, shuffle=False, num_workers=workers, worker_init_fn=worker_init_fn)
+        logger.info("DataLoaders ready: batch=%d requested_workers=%d effective_workers=%d", request.batch, requested_workers, workers)
         optimizer = torch.optim.AdamW(model.parameters(), lr=request.learning_rate)
         criterion = torch.nn.CrossEntropyLoss()
+        start_epoch = 1
         best_accuracy = -1.0
+        best_epoch = 0
+        stale_epochs = 0
         history = []
-        for epoch in range(1, request.epochs + 1):
+        if request.resume:
+            resume_path = require_file(request.weights or context.run_dir / "last.pt", "resume checkpoint")
+            logger.info("Resuming checkpoint from %s", resume_path)
+            resume_state = torch.load(resume_path, map_location="cpu", weights_only=False)
+            model.load_state_dict(resume_state["model_state_dict"], strict=True)
+            if resume_state.get("optimizer_state_dict") is not None:
+                optimizer.load_state_dict(resume_state["optimizer_state_dict"])
+            else:
+                logger.warning("Resume checkpoint has no optimizer state; optimizer starts fresh")
+            completed_epoch = int(resume_state.get("epoch", 0))
+            start_epoch = completed_epoch + 1
+            metrics = resume_state.get("metrics", {})
+            best_accuracy = float(resume_state.get("best_accuracy", metrics.get("val_accuracy", -1.0)))
+            best_epoch = int(resume_state.get("best_epoch", completed_epoch if best_accuracy >= 0 else 0))
+            stale_epochs = int(resume_state.get("stale_epochs", 0))
+            history = list(resume_state.get("history", []))
+            if resume_state.get("rng_state") is not None:
+                _restore_rng_state(torch, loader_generator, resume_state["rng_state"])
+            else:
+                logger.warning("Resume checkpoint has no RNG state; continuation is not bitwise identical")
+            logger.info("Resume state: start_epoch=%d best_epoch=%d best_val_accuracy=%.4f stale_epochs=%d", start_epoch, best_epoch, best_accuracy, stale_epochs)
+        for epoch in range(start_epoch, request.epochs + 1):
             epoch_started = time.perf_counter()
             logger.info("Epoch %d/%d started", epoch, request.epochs)
             model.train()
@@ -117,41 +240,56 @@ class TimmClassificationBackend(ModelBackend):
                     if isinstance(layer, torch.nn.modules.batchnorm._BatchNorm):
                         layer.eval()
             train_loss = 0.0
-            for images, labels in loader:
-                images, labels = images.to(device), labels.to(device)
-                optimizer.zero_grad(set_to_none=True)
-                loss = criterion(model(images), labels)
-                loss.backward()
-                optimizer.step()
-                train_loss += float(loss.detach().cpu())
+            with tqdm(loader, desc=f"Epoch {epoch}/{request.epochs} train", unit="batch", leave=False) as progress:
+                for images, labels in progress:
+                    images, labels = images.to(device), labels.to(device)
+                    optimizer.zero_grad(set_to_none=True)
+                    loss = criterion(model(images), labels)
+                    loss.backward()
+                    optimizer.step()
+                    train_loss += float(loss.detach().cpu())
+                    progress.set_postfix(loss=f"{train_loss / max(1, progress.n):.4f}")
             model.eval()
             correct = total = 0
             with torch.inference_mode():
-                for images, labels in val_loader:
-                    predictions = model(images.to(device)).argmax(1).cpu()
-                    correct += int((predictions == labels).sum())
-                    total += len(labels)
+                with tqdm(val_loader, desc=f"Epoch {epoch}/{request.epochs} val", unit="batch", leave=False) as progress:
+                    for images, labels in progress:
+                        predictions = model(images.to(device)).argmax(1).cpu()
+                        correct += int((predictions == labels).sum())
+                        total += len(labels)
             accuracy = correct / max(1, total)
             row = {"epoch": epoch, "train_loss": train_loss / max(1, len(loader)), "val_accuracy": accuracy}
             history.append(row)
-            payload = {"task": "classification", "model_name": request.model.variant, "classes": train_set.classes, "data_config": {"input_size": [3, request.image_size, request.image_size], "mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]}, "epoch": epoch, "model_state_dict": model.state_dict(), "metrics": row}
-            torch.save(payload, context.run_dir / "last.pt")
             improved = accuracy > best_accuracy
             if improved:
                 best_accuracy = accuracy
+                best_epoch = epoch
+                stale_epochs = 0
+            else:
+                stale_epochs += 1
+            payload = {
+                "task": "classification", "model_name": request.model.variant, "classes": train_set.classes,
+                "data_config": {"input_size": [3, image_size, image_size], "mean": list(mean), "std": list(std)},
+                "epoch": epoch, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(),
+                "metrics": row, "best_accuracy": best_accuracy, "best_epoch": best_epoch,
+                "stale_epochs": stale_epochs, "history": history, "rng_state": _capture_rng_state(torch, loader_generator),
+            }
+            torch.save(payload, context.run_dir / "last.pt")
+            if improved:
                 torch.save(payload, context.run_dir / "best.pt")
             logger.info(
-                "Epoch %d/%d complete: train_loss=%.6f val_accuracy=%.4f duration=%.1fs%s",
-                epoch,
-                request.epochs,
-                row["train_loss"],
-                accuracy,
-                time.perf_counter() - epoch_started,
-                " best" if improved else "",
+                "Epoch %d/%d complete: train_loss=%.6f val_accuracy=%.4f duration=%.1fs%s%s",
+                epoch, request.epochs, row["train_loss"], accuracy, time.perf_counter() - epoch_started,
+                " best" if improved else "", f" patience={stale_epochs}/{request.patience}" if request.patience > 0 else "",
             )
-        logger.info("Training complete: best_val_accuracy=%.4f elapsed=%.1fs", best_accuracy, time.perf_counter() - started)
-        context.write_json("metrics.json", {"history": history, "best_val_accuracy": best_accuracy, "classes": train_set.classes})
-        return Execution(tuple(artifact(context.run_dir / name, "checkpoint") for name in ("best.pt", "last.pt")), {"best_val_accuracy": best_accuracy, "epochs": request.epochs})
+            if request.patience > 0 and stale_epochs >= request.patience:
+                logger.info("Early stopping after epoch %d: no validation improvement for %d epochs", epoch, request.patience)
+                break
+        completed_epochs = max(start_epoch - 1, max((int(row.get("epoch", 0)) for row in history), default=0))
+        stopped_early = request.patience > 0 and stale_epochs >= request.patience
+        logger.info("Training complete: epochs=%d/%d best_epoch=%d best_val_accuracy=%.4f elapsed=%.1fs", completed_epochs, request.epochs, best_epoch, best_accuracy, time.perf_counter() - started)
+        context.write_json("metrics.json", {"history": history, "best_val_accuracy": best_accuracy, "best_epoch": best_epoch, "epochs": completed_epochs, "stopped_early": stopped_early, "image_size": image_size, "classes": train_set.classes})
+        return Execution(tuple(artifact(context.run_dir / name, "checkpoint") for name in ("best.pt", "last.pt")), {"best_val_accuracy": best_accuracy, "best_epoch": best_epoch, "epochs": completed_epochs, "stopped_early": stopped_early, "image_size": image_size})
 
     def _load(self, checkpoint: Path, device: str):
         timm, torch, _ = self._imports()
@@ -186,10 +324,11 @@ class TimmClassificationBackend(ModelBackend):
         data = request.data
         split = request.split
         _, _, torchvision = self._imports()
+        data_config = value.get("data_config", {})
         transform_ops = torchvision.transforms.Compose([
-            torchvision.transforms.Resize((int(value.get("data_config", {}).get("input_size", [3, 224, 224])[-1]),) * 2),
+            torchvision.transforms.Resize((int(data_config.get("input_size", [3, 224, 224])[-1]),) * 2),
             torchvision.transforms.ToTensor(),
-            torchvision.transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+            torchvision.transforms.Normalize(tuple(data_config.get("mean", _DEFAULT_MEAN)), tuple(data_config.get("std", _DEFAULT_STD))),
         ])
         dataset = torchvision.datasets.ImageFolder(str(data / split), transform=transform_ops)
         if dataset.classes != classes:

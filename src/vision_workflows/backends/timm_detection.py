@@ -116,12 +116,14 @@ class TimmDetectionBackend(ModelBackend):
         from ..datasets.formats.base import load_dataset
 
         dataset = load_dataset(request.data, DatasetFormat.COCO)
-        return dataset, TimmDetectionDataset(dataset, split, request.image_size if hasattr(request, "image_size") else int(request.options.get("image_size", 384)))
+        image_size = request.image_size or int(request.options.get("image_size", 640))
+        return dataset, TimmDetectionDataset(dataset, split, image_size)
 
     def train(self, request: TrainRequest, context: WorkflowContext) -> BackendExecution:
         torch, timm, _ = _torch_components()
         dataset, train_set = self._dataset(request, "train")
         _, val_set = self._dataset(request, "val")
+        image_size = train_set.image_size
         queries = int(request.options.get("num_queries", max(8, max((len(sample.annotations) for sample in dataset.samples), default=1) + 4)))
         variant = str(request.options.get("backbone", "mobilenetv4_conv_small.e3600_r256_in1k"))
         device = torch.device("cuda" if request.device == "auto" and torch.cuda.is_available() else request.device if request.device != "auto" else "cpu")
@@ -157,7 +159,7 @@ class TimmDetectionBackend(ModelBackend):
             metrics = self._evaluate(model, val_loader, device, len(dataset.classes))
             row = {"epoch": epoch, "loss": loss_total / max(1, len(loader)), **metrics}
             history.append(row)
-            payload = {"task": "detection", "architecture": "query", "model_name": variant, "classes": list(dataset.classes), "num_queries": queries, "image_size": request.image_size, "model_state_dict": model.state_dict(), "metrics": row}
+            payload = {"task": "detection", "architecture": "query", "model_name": variant, "classes": list(dataset.classes), "num_queries": queries, "image_size": image_size, "model_state_dict": model.state_dict(), "metrics": row}
             torch.save(payload, context.run_dir / "last.pt")
             if metrics["mean_score"] > best:
                 best = metrics["mean_score"]

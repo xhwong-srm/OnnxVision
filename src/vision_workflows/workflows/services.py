@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict
 
 from ..backends.registry import backend_for
-from ..domain.errors import ValidationFailedError
+from ..domain.errors import ConfigurationError, ValidationFailedError
 from ..domain.results import ExportResult, RunStatus, TestResult, TrainResult, ValidationResult
 from .requests import ExportRequest, TestRequest, TrainRequest, ValidateRequest
 from .runs import RunStore
@@ -17,10 +17,12 @@ def _request_config(request) -> dict:
 
 class TrainService:
     def run(self, request: TrainRequest) -> TrainResult:
+        if request.resume and request.overwrite and request.weights is None:
+            raise ConfigurationError("--resume cannot use --overwrite without --weights; overwriting would delete last.pt")
         backend = backend_for(request.model)
         config = _request_config(request)
         store = RunStore(request.output.parent)
-        context, run_id = store.start("train", config, device=request.device, run_dir=request.output, overwrite=request.overwrite)
+        context, run_id = store.start("train", config, device=request.device, run_dir=request.output, overwrite=request.overwrite, allow_existing=request.resume)
         try:
             execution = backend.train(request, context)
         except Exception as error:

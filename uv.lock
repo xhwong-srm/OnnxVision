@@ -1838,6 +1838,7 @@ test = [
 ]
 timm = [
     { name = "timm" },
+    { name = "tqdm" },
     { name = "torch" },
     { name = "torchvision" },
 ]
@@ -1869,6 +1870,7 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'test'", specifier = ">=5.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "timm", marker = "extra == 'timm'", specifier = ">=1.0.19" },
+    { name = "tqdm", marker = "extra == 'timm'", specifier = ">=4.65.0" },
     { name = "torch", marker = "extra == 'libreyolo'", specifier = ">=2.11.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torch", marker = "extra == 'timm'", specifier = ">=2.11.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torch", marker = "extra == 'ultralytics'", specifier = ">=2.11.0", index = "https://download.pytorch.org/whl/cu128" },

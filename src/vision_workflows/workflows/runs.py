@@ -41,14 +41,14 @@ class RunStore:
         self.output = output.expanduser().resolve()
         self.run_dir: Path | None = None
 
-    def start(self, operation: str, config: dict[str, Any], *, device: str = "auto", run_dir: Path | None = None, overwrite: bool = False) -> tuple[WorkflowContext, str]:
+    def start(self, operation: str, config: dict[str, Any], *, device: str = "auto", run_dir: Path | None = None, overwrite: bool = False, allow_existing: bool = False) -> tuple[WorkflowContext, str]:
         self.output.mkdir(parents=True, exist_ok=True)
         run_id = uuid.uuid4().hex
         self.run_dir = _absolute_path(run_dir or self.output / f"{operation}-{run_id[:12]}")
         if _path_exists(self.run_dir) and overwrite:
             _assert_safe_overwrite_target(self.run_dir)
             _remove_path(self.run_dir)
-        if _path_exists(self.run_dir) and (self.run_dir.is_symlink() or self.run_dir.is_junction() or not self.run_dir.is_dir() or any(self.run_dir.iterdir())):
+        if _path_exists(self.run_dir) and (self.run_dir.is_symlink() or self.run_dir.is_junction() or not self.run_dir.is_dir() or (not allow_existing and any(self.run_dir.iterdir()))):
             raise FileExistsError(f"run directory is not empty: {self.run_dir}")
         self.run_dir.mkdir(parents=True, exist_ok=True)
         events = self.run_dir / "events.jsonl"

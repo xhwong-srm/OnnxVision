@@ -14,7 +14,7 @@ class TrainRequest:
     output: Path
     epochs: int = 100
     batch: int = 16
-    image_size: int = 640
+    image_size: int | None = None
     learning_rate: float = 1e-3
     workers: int = -1
     patience: int = 20

@@ -122,3 +122,16 @@ def test_run_store_refuses_overwriting_current_directory(tmp_path: Path) -> None
 
     with pytest.raises(ValueError, match="current directory"):
         store.start("train", {}, run_dir=Path.cwd(), overwrite=True)
+
+
+def test_run_store_allows_existing_directory_for_resume(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    checkpoint = run_dir / "last.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    store = RunStore(tmp_path / "runs")
+
+    context, _ = store.start("train", {}, run_dir=run_dir, allow_existing=True)
+
+    assert context.run_dir == run_dir.resolve()
+    assert checkpoint.read_bytes() == b"checkpoint"
