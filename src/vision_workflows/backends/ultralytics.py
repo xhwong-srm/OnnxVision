@@ -73,7 +73,7 @@ class UltralyticsBackend(ModelBackend):
         options: dict[str, Any] = {
             "data": str(data), "epochs": request.epochs,
             "imgsz": request.image_size or (224 if self._task == "classification" else 640),
-            "batch": request.batch, "lr0": request.learning_rate, "workers": request.workers,
+            "batch": request.batch, "lr0": request.learning_rate, "workers": max(0, request.workers),
             "patience": request.patience, "seed": request.seed, "project": str(context.run_dir.parent),
             "name": context.run_dir.name, "exist_ok": True, "resume": request.resume,
         }

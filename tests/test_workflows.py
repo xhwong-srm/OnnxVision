@@ -107,6 +107,33 @@ def test_ultralytics_classification_training_uses_image_folder_defaults(monkeypa
     assert events == [("backend_train_started", {"backend": "ultralytics/yolo26-cls", "task": "classification", "data": str(data.resolve())})]
 
 
+def test_ultralytics_classification_training_clamps_auto_worker_sentinel(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeModel:
+        def __init__(self, checkpoint: str):
+            pass
+
+        def train(self, **options):
+            captured.update(options)
+
+    class FakeModule:
+        YOLO = FakeModel
+
+    import vision_workflows.backends.ultralytics as backend_module
+    monkeypatch.setattr(backend_module, "optional_import", lambda _: FakeModule())
+    data = tmp_path / "classification"
+    data.mkdir()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    context = type("Context", (), {"run_dir": run_dir, "emit": lambda *_: None})()
+    request = TrainRequest(ModelRef("ultralytics", "yolo26-cls", "n"), data, run_dir)
+
+    UltralyticsBackend("classification").train(request, context)
+
+    assert captured["workers"] == 0
+
+
 def test_train_service_writes_typed_run_manifest(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from vision_workflows.backends import registry
 
