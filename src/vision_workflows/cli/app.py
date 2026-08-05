@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from dataclasses import asdict
 from pathlib import Path
 from typing import Sequence
@@ -147,6 +148,7 @@ def _print(value) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     args = build_parser().parse_args(argv)
     service = DatasetService()
     materialization = MaterializationMode(args.materialization) if hasattr(args, "materialization") else MaterializationMode.HARDLINK
