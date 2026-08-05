@@ -79,7 +79,9 @@ class UltralyticsBackend(ModelBackend):
         }
         if request.device != "auto":
             options["device"] = request.device
-        options.update(request.options)
+        # This is a vision-workflows scheduler option consumed by the timm
+        # trainers; Ultralytics rejects unknown model.train overrides.
+        options.update({key: value for key, value in request.options.items() if key != "validate_every"})
         context.emit("backend_train_started", {"backend": str(self.descriptor.model_prefix), "task": self._task, "data": str(data)})
         model.train(**options)
         weights = context.run_dir / "weights"

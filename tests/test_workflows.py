@@ -89,7 +89,10 @@ def test_ultralytics_classification_training_uses_image_folder_defaults(monkeypa
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     context = type("Context", (), {"run_dir": run_dir, "emit": lambda _, name, value: events.append((name, value))})()
-    request = TrainRequest(ModelRef("ultralytics", "yolo26-cls", "n"), data, run_dir, workers=2)
+    request = TrainRequest(
+        ModelRef("ultralytics", "yolo26-cls", "n"), data, run_dir, workers=2,
+        options={"validate_every": 2, "mosaic": 0.0},
+    )
 
     result = UltralyticsBackend("classification").train(request, context)
 
@@ -97,6 +100,8 @@ def test_ultralytics_classification_training_uses_image_folder_defaults(monkeypa
     assert captured["data"] == str(data.resolve())
     assert captured["imgsz"] == 224
     assert captured["workers"] == 2
+    assert captured["mosaic"] == 0.0
+    assert "validate_every" not in captured
     assert "device" not in captured
     assert {item.name for item in result.artifacts} == {"best.pt", "last.pt"}
     assert events == [("backend_train_started", {"backend": "ultralytics/yolo26-cls", "task": "classification", "data": str(data.resolve())})]
