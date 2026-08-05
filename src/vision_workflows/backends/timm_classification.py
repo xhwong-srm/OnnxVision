@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import io
-import json
 import logging
-import random
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
@@ -17,77 +15,19 @@ from ..workflows.requests import ExportRequest, TestRequest, TrainRequest, Valid
 from ..workflows.runs import artifact
 from .base import BackendExecution, ModelBackend
 from .common import classification_contract, metadata_for_contract, require_file, set_onnx_metadata, validate_onnx
-from .timm_training import TimmTrainingOptions
+from .timm_training import (
+    TimmTrainingOptions,
+    capture_rng_state,
+    restore_rng_state,
+    seed_everything,
+    worker_seed,
+)
 
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MEAN = (0.485, 0.456, 0.406)
 _DEFAULT_STD = (0.229, 0.224, 0.225)
-
-
-def _seed_everything(torch, seed: int, deterministic: bool) -> None:
-    random.seed(seed)
-    try:
-        import numpy as np
-        np.random.seed(seed)
-    except ImportError:
-        pass
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.use_deterministic_algorithms(deterministic)
-    if hasattr(torch.backends, "cudnn"):
-        torch.backends.cudnn.deterministic = deterministic
-        torch.backends.cudnn.benchmark = not deterministic
-        if hasattr(torch.backends.cudnn, "allow_tf32"):
-            torch.backends.cudnn.allow_tf32 = not deterministic
-    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
-        torch.backends.cuda.matmul.allow_tf32 = not deterministic
-
-
-def _capture_rng_state(torch, loader_generator) -> dict[str, Any]:
-    state: dict[str, Any] = {
-        "python": random.getstate(),
-        "torch": torch.get_rng_state(),
-        "loader": loader_generator.get_state(),
-    }
-    if torch.cuda.is_available():
-        state["cuda"] = torch.cuda.get_rng_state_all()
-    try:
-        import numpy as np
-        state["numpy"] = np.random.get_state()
-    except ImportError:
-        pass
-    return state
-
-
-def _restore_rng_state(torch, loader_generator, state: dict[str, Any]) -> None:
-    if state.get("python") is not None:
-        random.setstate(state["python"])
-    if state.get("torch") is not None:
-        torch.set_rng_state(state["torch"])
-    if torch.cuda.is_available() and state.get("cuda") is not None:
-        torch.cuda.set_rng_state_all(state["cuda"])
-    if state.get("loader") is not None:
-        loader_generator.set_state(state["loader"])
-    if state.get("numpy") is not None:
-        try:
-            import numpy as np
-            np.random.set_state(state["numpy"])
-        except ImportError:
-            pass
-
-
-def _worker_seed(worker_id: int) -> None:
-    import torch
-    worker_seed = torch.initial_seed() % (2**32)
-    random.seed(worker_seed)
-    try:
-        import numpy as np
-        np.random.seed(worker_seed)
-    except ImportError:
-        pass
 
 
 @dataclass(frozen=True)
@@ -176,10 +116,10 @@ class TimmClassificationBackend(ModelBackend):
         train_classes, val_classes = self._dataset_classes(data, torchvision)
         if train_classes != val_classes:
             raise ValueError("train and val class folders differ")
-        _seed_everything(torch, request.seed, request.deterministic)
+        seed_everything(torch, request.seed, request.deterministic)
         device = torch.device("cuda" if request.device in {"auto", "cuda"} and torch.cuda.is_available() else request.device if request.device != "auto" else "cpu")
         logger.info("Using device: %s", device)
-        model_pretrained = request.pretrained and not request.resume
+        model_pretrained = request.pretrained and not request.resume and not request.weights
         logger.info("Creating timm model %s (pretrained=%s)", request.model.variant, model_pretrained)
         model = timm.create_model(request.model.variant, pretrained=model_pretrained, num_classes=len(train_classes))
         logger.info("Model ready")
@@ -201,7 +141,7 @@ class TimmClassificationBackend(ModelBackend):
         workers = requested_workers
         training_options = TimmTrainingOptions.from_mapping(request.options)
         loader_generator = torch.Generator().manual_seed(request.seed)
-        worker_init_fn = _worker_seed if workers > 0 else None
+        worker_init_fn = worker_seed if workers > 0 else None
         loader_options = training_options.data_loader_kwargs(workers)
         loader = torch.utils.data.DataLoader(train_set, batch_size=request.batch, shuffle=True, generator=loader_generator, worker_init_fn=worker_init_fn, **loader_options)
         val_loader = torch.utils.data.DataLoader(val_set, batch_size=request.batch, shuffle=False, worker_init_fn=worker_init_fn, **loader_options)
@@ -231,9 +171,11 @@ class TimmClassificationBackend(ModelBackend):
             stale_epochs = int(resume_state.get("stale_epochs", 0))
             history = list(resume_state.get("history", []))
             if resume_state.get("rng_state") is not None:
-                _restore_rng_state(torch, loader_generator, resume_state["rng_state"])
+                restore_rng_state(torch, loader_generator, resume_state["rng_state"])
             else:
                 logger.warning("Resume checkpoint has no RNG state; continuation is not bitwise identical")
+            if scaler is not None and resume_state.get("scaler_state_dict") is not None:
+                scaler.load_state_dict(resume_state["scaler_state_dict"])
             logger.info("Resume state: start_epoch=%d best_epoch=%d best_val_accuracy=%.4f stale_epochs=%d", start_epoch, best_epoch, best_accuracy, stale_epochs)
         for epoch in range(start_epoch, request.epochs + 1):
             epoch_started = time.perf_counter()
@@ -278,7 +220,8 @@ class TimmClassificationBackend(ModelBackend):
                 "data_config": {"input_size": [3, image_size, image_size], "mean": list(mean), "std": list(std)},
                 "epoch": epoch, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(),
                 "metrics": row, "best_accuracy": best_accuracy, "best_epoch": best_epoch,
-                "stale_epochs": stale_epochs, "history": history, "rng_state": _capture_rng_state(torch, loader_generator),
+                "stale_epochs": stale_epochs, "history": history, "rng_state": capture_rng_state(torch, loader_generator),
+                "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
             }
             torch.save(payload, context.run_dir / "last.pt")
             if improved:

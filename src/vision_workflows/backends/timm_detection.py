@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
 import io
+import logging
+import time
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,7 +16,16 @@ from ..workflows.requests import ExportRequest, TestRequest, TrainRequest, Valid
 from ..workflows.runs import artifact
 from .base import BackendExecution, ModelBackend
 from .common import detection_contract, metadata_for_contract, require_file, set_onnx_metadata, validate_onnx
-from .timm_training import TimmTrainingOptions
+from .timm_training import (
+    TimmTrainingOptions,
+    capture_rng_state,
+    restore_rng_state,
+    seed_everything,
+    worker_seed,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -121,27 +131,85 @@ class TimmDetectionBackend(ModelBackend):
         return dataset, TimmDetectionDataset(dataset, split, image_size)
 
     def train(self, request: TrainRequest, context: WorkflowContext) -> BackendExecution:
+        started = time.perf_counter()
         torch, timm, _ = _torch_components()
         dataset, train_set = self._dataset(request, "train")
         _, val_set = self._dataset(request, "val")
         image_size = train_set.image_size
         queries = int(request.options.get("num_queries", max(8, max((len(sample.annotations) for sample in dataset.samples), default=1) + 4)))
         variant = str(request.options.get("backbone", "mobilenetv4_conv_small.e3600_r256_in1k"))
+        seed_everything(torch, request.seed, request.deterministic)
         device = torch.device("cuda" if request.device == "auto" and torch.cuda.is_available() else request.device if request.device != "auto" else "cpu")
-        model = _model_class(torch, timm, len(dataset.classes), variant, queries, request.pretrained)()
+        model_pretrained = request.pretrained and not request.resume and not request.weights
+        logger.info(
+            "Training timm detection: model=%s data=%s output=%s device=%s epochs=%d batch=%d image_size=%d learning_rate=%g workers=%d seed=%d pretrained=%s resume=%s patience=%d deterministic=%s weights=%s options=%s",
+            variant,
+            request.data,
+            context.run_dir,
+            request.device,
+            request.epochs,
+            request.batch,
+            image_size,
+            request.learning_rate,
+            request.workers,
+            request.seed,
+            request.pretrained,
+            request.resume,
+            request.patience,
+            request.deterministic,
+            request.weights,
+            dict(request.options),
+        )
+        model = _model_class(torch, timm, len(dataset.classes), variant, queries, model_pretrained)()
+        if request.weights and not request.resume:
+            logger.info("Loading custom detection weights from %s", request.weights)
+            checkpoint = torch.load(require_file(request.weights, "weights"), map_location="cpu", weights_only=False)
+            model.load_state_dict(checkpoint["model_state_dict"], strict=True)
         model.to(device)
         workers = max(0, request.workers)
         training_options = TimmTrainingOptions.from_mapping(request.options)
         loader_options = training_options.data_loader_kwargs(workers)
-        loader = torch.utils.data.DataLoader(train_set, request.batch, shuffle=True, collate_fn=_collate, **loader_options)
-        val_loader = torch.utils.data.DataLoader(val_set, request.batch, shuffle=False, collate_fn=_collate, **loader_options)
+        loader_generator = torch.Generator().manual_seed(request.seed)
+        worker_init_fn = worker_seed if workers > 0 else None
+        loader = torch.utils.data.DataLoader(train_set, request.batch, shuffle=True, collate_fn=_collate, generator=loader_generator, worker_init_fn=worker_init_fn, **loader_options)
+        val_loader = torch.utils.data.DataLoader(val_set, request.batch, shuffle=False, collate_fn=_collate, worker_init_fn=worker_init_fn, **loader_options)
         optimizer = torch.optim.AdamW(model.parameters(), lr=request.learning_rate)
         criterion = torch.nn.CrossEntropyLoss()
         scaler = training_options.grad_scaler(torch, device)
+        start_epoch = 1
         best = -1.0
+        best_epoch = 0
+        stale_epochs = 0
         history = []
-        for epoch in range(1, request.epochs + 1):
+        if request.resume:
+            resume_path = require_file(request.weights or context.run_dir / "last.pt", "resume checkpoint")
+            logger.info("Resuming detection checkpoint from %s", resume_path)
+            resume_state = torch.load(resume_path, map_location="cpu", weights_only=False)
+            model.load_state_dict(resume_state["model_state_dict"], strict=True)
+            if resume_state.get("optimizer_state_dict") is not None:
+                optimizer.load_state_dict(resume_state["optimizer_state_dict"])
+            else:
+                logger.warning("Resume checkpoint has no optimizer state; optimizer starts fresh")
+            completed_epoch = int(resume_state.get("epoch", 0))
+            start_epoch = completed_epoch + 1
+            metrics = resume_state.get("metrics", {})
+            best = float(resume_state.get("best_mean_score", metrics.get("mean_score", -1.0)))
+            best_epoch = int(resume_state.get("best_epoch", completed_epoch if best >= 0 else 0))
+            stale_epochs = int(resume_state.get("stale_epochs", 0))
+            history = list(resume_state.get("history", []))
+            if resume_state.get("rng_state") is not None:
+                restore_rng_state(torch, loader_generator, resume_state["rng_state"])
+            else:
+                logger.warning("Resume checkpoint has no RNG state; continuation is not bitwise identical")
+            if scaler is not None and resume_state.get("scaler_state_dict") is not None:
+                scaler.load_state_dict(resume_state["scaler_state_dict"])
+            logger.info("Resume state: start_epoch=%d best_epoch=%d best_mean_score=%.4f stale_epochs=%d", start_epoch, best_epoch, best, stale_epochs)
+        for epoch in range(start_epoch, request.epochs + 1):
             model.train()
+            if request.batch == 1:
+                for layer in model.modules():
+                    if isinstance(layer, torch.nn.modules.batchnorm._BatchNorm):
+                        layer.eval()
             loss_total = 0.0
             for images, boxes, labels in loader:
                 images = images.to(device, non_blocking=training_options.pin_memory)
@@ -164,13 +232,36 @@ class TimmDetectionBackend(ModelBackend):
             metrics = self._evaluate(model, val_loader, device, len(dataset.classes), training_options)
             row = {"epoch": epoch, "loss": loss_total / max(1, len(loader)), **metrics}
             history.append(row)
-            payload = {"task": "detection", "architecture": "query", "model_name": variant, "classes": list(dataset.classes), "num_queries": queries, "image_size": image_size, "model_state_dict": model.state_dict(), "metrics": row}
-            torch.save(payload, context.run_dir / "last.pt")
-            if metrics["mean_score"] > best:
+            improved = metrics["mean_score"] > best
+            if improved:
                 best = metrics["mean_score"]
+                best_epoch = epoch
+                stale_epochs = 0
+            else:
+                stale_epochs += 1
+            payload = {
+                "task": "detection", "architecture": "query", "model_name": variant,
+                "classes": list(dataset.classes), "num_queries": queries, "image_size": image_size,
+                "epoch": epoch, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(),
+                "metrics": row, "best_mean_score": best, "best_epoch": best_epoch,
+                "stale_epochs": stale_epochs, "history": history,
+                "rng_state": capture_rng_state(torch, loader_generator),
+                "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+            }
+            torch.save(payload, context.run_dir / "last.pt")
+            if improved:
                 torch.save(payload, context.run_dir / "best.pt")
-        context.write_json("metrics.json", {"history": history, "best_mean_score": best})
-        return Execution(tuple(artifact(context.run_dir / name, "checkpoint") for name in ("best.pt", "last.pt")), {"best_mean_score": best})
+            if request.patience > 0 and stale_epochs >= request.patience:
+                logger.info("Early stopping detection after epoch %d: no validation improvement for %d epochs", epoch, request.patience)
+                break
+        completed_epochs = max(start_epoch - 1, max((int(row.get("epoch", 0)) for row in history), default=0))
+        stopped_early = request.patience > 0 and stale_epochs >= request.patience
+        logger.info("Detection training complete: epochs=%d/%d best_epoch=%d best_mean_score=%.4f elapsed=%.1fs", completed_epochs, request.epochs, best_epoch, best, time.perf_counter() - started)
+        context.write_json("metrics.json", {"history": history, "best_mean_score": best, "best_epoch": best_epoch, "epochs": completed_epochs, "stopped_early": stopped_early, "image_size": image_size, "classes": list(dataset.classes)})
+        return Execution(
+            tuple(artifact(context.run_dir / name, "checkpoint") for name in ("best.pt", "last.pt")),
+            {"best_mean_score": best, "best_epoch": best_epoch, "epochs": completed_epochs, "stopped_early": stopped_early, "image_size": image_size},
+        )
 
     def _load(self, target: Path, device):
         torch, timm, _ = _torch_components()

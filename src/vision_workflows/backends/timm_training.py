@@ -2,7 +2,72 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+import random
 from typing import Any, Mapping
+
+
+def seed_everything(torch, seed: int, deterministic: bool) -> None:
+    random.seed(seed)
+    try:
+        import numpy as np
+        np.random.seed(seed)
+    except ImportError:
+        pass
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(deterministic)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = deterministic
+        torch.backends.cudnn.benchmark = not deterministic
+        if hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = not deterministic
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = not deterministic
+
+
+def capture_rng_state(torch, loader_generator) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "torch": torch.get_rng_state(),
+        "loader": loader_generator.get_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    try:
+        import numpy as np
+        state["numpy"] = np.random.get_state()
+    except ImportError:
+        pass
+    return state
+
+
+def restore_rng_state(torch, loader_generator, state: dict[str, Any]) -> None:
+    if state.get("python") is not None:
+        random.setstate(state["python"])
+    if state.get("torch") is not None:
+        torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and state.get("cuda") is not None:
+        torch.cuda.set_rng_state_all(state["cuda"])
+    if state.get("loader") is not None:
+        loader_generator.set_state(state["loader"])
+    if state.get("numpy") is not None:
+        try:
+            import numpy as np
+            np.random.set_state(state["numpy"])
+        except ImportError:
+            pass
+
+
+def worker_seed(worker_id: int) -> None:
+    import torch
+    worker_seed_value = torch.initial_seed() % (2**32)
+    random.seed(worker_seed_value)
+    try:
+        import numpy as np
+        np.random.seed(worker_seed_value)
+    except ImportError:
+        pass
 
 
 def _bool_option(options: Mapping[str, Any], name: str, default: bool) -> bool:
