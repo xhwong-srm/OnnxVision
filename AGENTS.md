@@ -9,3 +9,4 @@
 
 ## Notes
 - This repo is using `uv` for Python environment management. Use `uv run <script>` to run scripts in the correct environment.
+- There is a remote machine running Windows with NVIDIA GPU and is accessible via SSH. You can use access it with `admin@192.168.1.217` and it will authenticate with SSH keys, so no password is needed. You can run tests, experiments, and training jobs on the remote machine. Any changes you make to the codebase will need to be pushed to GitHub and pulled on the remote machine before running any jobs.
