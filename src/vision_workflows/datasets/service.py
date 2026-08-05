@@ -179,6 +179,21 @@ def _remove_path(path: Path) -> None:
         path.unlink()
 
 
+def _detach_hardlinks(root: Path) -> bool:
+    detached = False
+    for path in root.rglob("*"):
+        if not path.is_file() or path.stat().st_nlink <= 1:
+            continue
+        temporary = path.with_name(f".{path.name}.copy-{uuid.uuid4().hex}")
+        try:
+            shutil.copy2(path, temporary)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        detached = True
+    return detached
+
+
 def _prepare_output(output: Path, overwrite: bool) -> tuple[Path, Path | None]:
     output = _absolute_output_path(output)
     if _path_exists(output) and not overwrite:
@@ -193,7 +208,12 @@ def _prepare_output(output: Path, overwrite: bool) -> tuple[Path, Path | None]:
 def _finalize(staging: Path, output: Path, old: Path | None) -> None:
     if old is not None:
         _remove_path(old)
-    staging.replace(output)
+    try:
+        staging.replace(output)
+    except PermissionError:
+        if not _detach_hardlinks(staging):
+            raise
+        staging.replace(output)
 
 
 class DatasetService:

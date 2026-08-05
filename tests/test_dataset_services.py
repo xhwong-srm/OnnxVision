@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from vision_workflows.api import (
     ValidateDatasetRequest,
 )
 from vision_workflows.domain.datasets import DatasetFormat, MaterializationMode, SplitPolicy, TaskKind
+from vision_workflows.datasets import service as dataset_service
 
 
 def test_task_kind_is_not_domain_specific() -> None:
@@ -96,6 +98,33 @@ def test_convert_handles_broken_output_symlink(tmp_path: Path) -> None:
     assert result.output.is_dir()
     assert not result.output.is_symlink()
     assert (result.output / "data.yaml").is_file()
+
+
+def test_finalize_detaches_hardlinks_after_permission_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "source.png"
+    image(source)
+    staging = tmp_path / "staging"
+    output = tmp_path / "output"
+    staging.mkdir()
+    hardlink = staging / "image.png"
+    os.link(source, hardlink)
+    real_replace = type(staging).replace
+    calls = 0
+
+    def replace(path: Path, target: Path) -> Path:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise PermissionError(5, "Access is denied")
+        return real_replace(path, target)
+
+    monkeypatch.setattr(type(staging), "replace", replace)
+    dataset_service._finalize(staging, output, None)
+
+    assert calls == 2
+    assert output.is_dir()
+    assert os.stat(source).st_nlink == 1
+    assert (output / "image.png").read_bytes() == source.read_bytes()
 
 
 def test_detection_validation_rejects_invalid_box(tmp_path: Path) -> None:
