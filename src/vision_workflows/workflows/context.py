@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,7 +27,7 @@ class WorkflowContext:
 
 def optional_import(module: str):
     try:
-        return __import__(module, fromlist=["*"])
+        return importlib.import_module(module)
     except ImportError as error:
         raise BackendUnavailableError(
             f"optional dependency for {module!r} is not installed"

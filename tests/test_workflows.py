@@ -11,6 +11,7 @@ from vision_workflows.domain.results import ArtifactRef, RunStatus
 from vision_workflows.workflows.requests import TrainRequest
 from vision_workflows.workflows.runs import RunStore
 from vision_workflows.workflows.services import TrainService
+from vision_workflows.workflows.context import optional_import
 
 
 def test_registry_exposes_all_active_backend_families() -> None:
@@ -29,6 +30,11 @@ def test_model_ref_requires_three_components() -> None:
     assert str(ModelRef.parse("ultralytics/yolo26/n")) == "ultralytics/yolo26/n"
     with pytest.raises(ValueError):
         ModelRef.parse("yolo26n")
+
+
+def test_optional_import_does_not_eagerly_load_optional_exports() -> None:
+    libreyolo = optional_import("libreyolo")
+    assert libreyolo.LibrePICODET is not None
 
 
 def test_train_service_writes_typed_run_manifest(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
