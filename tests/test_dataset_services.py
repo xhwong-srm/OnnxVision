@@ -82,6 +82,22 @@ def test_coco_yolo_round_trip(tmp_path: Path) -> None:
     assert back.split_counts == yolo.split_counts
 
 
+def test_convert_handles_broken_output_symlink(tmp_path: Path) -> None:
+    source = tmp_path / "coco"
+    coco_source(source)
+    output = tmp_path / "yolo"
+    output.symlink_to(tmp_path / "missing-output", target_is_directory=True)
+    service = DatasetService()
+
+    with pytest.raises(FileExistsError, match="output already exists"):
+        service.convert(ConvertDatasetRequest(source, output, DatasetFormat.YOLO, materialization=MaterializationMode.COPY))
+
+    result = service.convert(ConvertDatasetRequest(source, output, DatasetFormat.YOLO, materialization=MaterializationMode.COPY, overwrite=True))
+    assert result.output.is_dir()
+    assert not result.output.is_symlink()
+    assert (result.output / "data.yaml").is_file()
+
+
 def test_detection_validation_rejects_invalid_box(tmp_path: Path) -> None:
     source = tmp_path / "coco"
     coco_source(source)

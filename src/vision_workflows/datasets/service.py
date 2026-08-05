@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import uuid
 from dataclasses import dataclass, replace
@@ -159,20 +160,39 @@ def _manifest(dataset, output: Path, *, operation: str, extra: dict[str, Any] | 
     return path
 
 
+def _absolute_output_path(output: Path) -> Path:
+    # Do not resolve the final component: a broken link must remain visible so
+    # overwrite handling can remove the link instead of replacing it directly.
+    return Path(os.path.abspath(os.fspath(output.expanduser())))
+
+
+def _path_exists(path: Path) -> bool:
+    return path.exists() or path.is_symlink() or path.is_junction()
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_junction():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
 def _prepare_output(output: Path, overwrite: bool) -> tuple[Path, Path | None]:
-    output = output.expanduser().resolve()
-    if output.exists() and not overwrite:
+    output = _absolute_output_path(output)
+    if _path_exists(output) and not overwrite:
         raise FileExistsError(f"output already exists; use overwrite=True: {output}")
     staging = output.with_name(f".{output.name}.staging-{uuid.uuid4().hex}")
-    if staging.exists():
-        shutil.rmtree(staging)
+    if _path_exists(staging):
+        _remove_path(staging)
     staging.mkdir(parents=True)
-    return staging, output if output.exists() else None
+    return staging, output if _path_exists(output) else None
 
 
 def _finalize(staging: Path, output: Path, old: Path | None) -> None:
     if old is not None:
-        shutil.rmtree(old)
+        _remove_path(old)
     staging.replace(output)
 
 
@@ -212,16 +232,17 @@ class DatasetService:
         dataset = load_dataset(request.source, selected)
         if isinstance(dataset, ClassificationDataset) and request.output_format != DatasetFormat.IMAGE_FOLDER:
             raise ConfigurationError("classification conversion only supports image-folder output")
-        staging, old = _prepare_output(request.output, request.overwrite)
+        output = _absolute_output_path(request.output)
+        staging, old = _prepare_output(output, request.overwrite)
         try:
             write_dataset(dataset, staging, request.output_format, request.materialization)
             manifest = _manifest(dataset, staging, operation="convert", extra={"input_format": selected.value, "output_format": request.output_format.value})
-            _finalize(staging, request.output.expanduser().resolve(), old)
+            _finalize(staging, output, old)
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
             raise
         counts = _split_counts(dataset.samples)
-        return ConversionResult(selected.value, request.output_format.value, request.output.expanduser().resolve(), dataset.classes, counts, request.output.expanduser().resolve() / manifest.name)
+        return ConversionResult(selected.value, request.output_format.value, output, dataset.classes, counts, output / manifest.name)
 
     def split(self, request: SplitDatasetRequest) -> SplitResult:
         dataset = load_dataset(request.source, request.format)
@@ -230,16 +251,17 @@ class DatasetService:
         else:
             split_dataset = replace(dataset, samples=split_samples(dataset.samples, len(dataset.classes), request.policy))
         output_format = request.output_format or dataset.source_format
-        staging, old = _prepare_output(request.output, request.overwrite)
+        output = _absolute_output_path(request.output)
+        staging, old = _prepare_output(output, request.overwrite)
         try:
             write_dataset(split_dataset, staging, output_format, request.materialization)
             manifest = _manifest(split_dataset, staging, operation="split", extra={"seed": request.policy.seed, "grouping": request.policy.grouping, "ratios": request.policy.ratios()})
-            _finalize(staging, request.output.expanduser().resolve(), old)
+            _finalize(staging, output, old)
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
             raise
         counts = _split_counts(split_dataset.samples)
-        return SplitResult(request.output.expanduser().resolve(), request.output.expanduser().resolve() / manifest.name, counts, request.policy.seed, request.policy.grouping)
+        return SplitResult(output, output / manifest.name, counts, request.policy.seed, request.policy.grouping)
 
     def merge(self, request: MergeDatasetRequest) -> MergeResult:
         if not request.sources:
@@ -261,13 +283,14 @@ class DatasetService:
             if request.split_policy is not None:
                 merged = replace(merged, samples=split_samples(merged.samples, len(classes), request.split_policy))
         output_format = request.output_format or merged.source_format
-        staging, old = _prepare_output(request.output, request.overwrite)
+        output = _absolute_output_path(request.output)
+        staging, old = _prepare_output(output, request.overwrite)
         try:
             write_dataset(merged, staging, output_format, request.materialization)
             manifest = _manifest(merged, staging, operation="merge", extra={"sources": [str(source.resolve()) for source in request.sources], "output_format": output_format.value})
-            _finalize(staging, request.output.expanduser().resolve(), old)
+            _finalize(staging, output, old)
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
             raise
         counts = _split_counts(merged.samples)
-        return MergeResult(request.output.expanduser().resolve(), request.output.expanduser().resolve() / manifest.name, merged.task.value, len(merged.samples), classes, counts)
+        return MergeResult(output, output / manifest.name, merged.task.value, len(merged.samples), classes, counts)
