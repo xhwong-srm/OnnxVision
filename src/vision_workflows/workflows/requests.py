@@ -4,59 +4,127 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-from ..domain.models import ModelRef
+from ..domain.models import ModelInfo, ModelSelection
 
 
 @dataclass(frozen=True)
 class TrainRequest:
-    model: ModelRef
+    selection: ModelSelection
     data: Path
     output: Path
-    epochs: int = 100
-    batch: int = 16
-    image_size: int | None = None
-    learning_rate: float = 1e-3
-    workers: int = -1
-    patience: int = 20
-    seed: int = 42
-    device: str = "auto"
     weights: Path | None = None
     resume: bool = False
-    pretrained: bool = True
-    deterministic: bool = True
     overwrite: bool = False
-    options: Mapping[str, Any] = field(default_factory=dict)
+    parameters: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class ExportRequest:
-    model: ModelRef
+    selection: ModelSelection
     checkpoint: Path
     output: Path
     data: Path | None = None
-    image_size: int = 640
-    opset: int = 18
-    simplify: bool = True
-    device: str = "auto"
-    embedded_preprocessing: bool = False
-    options: Mapping[str, Any] = field(default_factory=dict)
+    parameters: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class ValidateRequest:
-    model: ModelRef
+    selection: ModelSelection
     target: Path
     data: Path | None = None
     split: str = "val"
-    device: str = "cpu"
-    options: Mapping[str, Any] = field(default_factory=dict)
+    parameters: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class TestRequest:
-    model: ModelRef
+    selection: ModelSelection
     target: Path
     data: Path
     split: str = "test"
-    device: str = "auto"
-    options: Mapping[str, Any] = field(default_factory=dict)
+    parameters: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ResolvedTrainRequest:
+    selection: ModelSelection
+    model: ModelInfo
+    data: Path
+    output: Path
+    weights: Path | None
+    resume: bool
+    overwrite: bool
+    parameters: Mapping[str, Any]
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self.parameters[name]
+        except KeyError as error:
+            raise AttributeError(name) from error
+
+    @property
+    def options(self) -> Mapping[str, Any]:
+        return self.parameters
+
+
+@dataclass(frozen=True)
+class ResolvedExportRequest:
+    selection: ModelSelection
+    model: ModelInfo
+    checkpoint: Path
+    output: Path
+    data: Path | None
+    parameters: Mapping[str, Any]
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self.parameters[name]
+        except KeyError as error:
+            raise AttributeError(name) from error
+
+    @property
+    def options(self) -> Mapping[str, Any]:
+        return self.parameters
+
+
+@dataclass(frozen=True)
+class ResolvedValidateRequest:
+    selection: ModelSelection
+    model: ModelInfo
+    target: Path
+    data: Path | None
+    split: str
+    parameters: Mapping[str, Any]
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self.parameters[name]
+        except KeyError as error:
+            raise AttributeError(name) from error
+
+    @property
+    def options(self) -> Mapping[str, Any]:
+        return self.parameters
+
+
+@dataclass(frozen=True)
+class ResolvedTestRequest:
+    selection: ModelSelection
+    model: ModelInfo
+    target: Path
+    data: Path
+    split: str
+    parameters: Mapping[str, Any]
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self.parameters[name]
+        except KeyError as error:
+            raise AttributeError(name) from error
+
+    @property
+    def options(self) -> Mapping[str, Any]:
+        return self.parameters
+
+
+ResolvedRequest = ResolvedTrainRequest | ResolvedExportRequest | ResolvedValidateRequest | ResolvedTestRequest

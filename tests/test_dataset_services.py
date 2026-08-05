@@ -20,8 +20,7 @@ from vision_workflows.datasets import service as dataset_service
 
 def test_task_kind_is_not_domain_specific() -> None:
     assert TaskKind.CLASSIFICATION.value == "classification"
-    assert TaskKind.DETECTION.value == "detection"
-    assert TaskKind.SEGMENTATION.value == "segmentation"
+    assert TaskKind.OBJECT_DETECTION.value == "object-detection"
 
 
 def image(path: Path, size: tuple[int, int] = (100, 80)) -> None:

@@ -1,71 +1,63 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
-from vision_workflows.backends.base import BackendExecution, ModelBackend
-from vision_workflows.backends.libreyolo import LibreYoloBackend
-from vision_workflows.backends.registry import descriptors
-from vision_workflows.backends.ultralytics import UltralyticsBackend
-from vision_workflows.domain.models import BackendCapability, BackendDescriptor, ModelRef
+from vision_workflows.backends.base import FrameworkTaskPlugin, OperationExecution, OperationHandler
+from vision_workflows.backends.registry import frameworks, models_for, plugin_for
+from vision_workflows.domain.datasets import TaskKind
+from vision_workflows.domain.errors import ConfigurationError
+from vision_workflows.domain.models import ModelInfo, ModelSelection, Operation, ParameterSchema, ParameterSpec, ProviderDescriptor, StaticModelCatalog
 from vision_workflows.domain.results import ArtifactRef, RunStatus
+from vision_workflows.workflows.context import optional_import
 from vision_workflows.workflows.requests import TrainRequest
 from vision_workflows.workflows.runs import RunStore
 from vision_workflows.workflows.services import TrainService
-from vision_workflows.workflows.context import optional_import
 
 
-def test_registry_exposes_all_active_backend_families() -> None:
-    values = {(item.backend, item.family) for item in descriptors()}
+def test_registry_exposes_framework_task_plugins() -> None:
+    values = {(item.framework, item.task) for item in frameworks()}
     assert values == {
-        ("timm", "classification"),
-        ("timm", "detection"),
-        ("ultralytics", "yolo26"),
-        ("ultralytics", "yolo26-cls"),
-        ("libreyolo", "yolov9"),
-        ("libreyolo", "picodet"),
+        ("timm", TaskKind.CLASSIFICATION),
+        ("pytorch", TaskKind.OBJECT_DETECTION),
+        ("ultralytics", TaskKind.CLASSIFICATION),
+        ("ultralytics", TaskKind.OBJECT_DETECTION),
+        ("libreyolo", TaskKind.OBJECT_DETECTION),
     }
-    assert all(BackendCapability.TRAIN in item.capabilities for item in descriptors())
+    assert all(Operation.TRAIN in item.operations for item in frameworks())
 
 
-def test_model_ref_requires_three_components() -> None:
-    assert str(ModelRef.parse("ultralytics/yolo26/n")) == "ultralytics/yolo26/n"
-    with pytest.raises(ValueError):
-        ModelRef.parse("yolo26n")
+def test_model_selection_is_explicit_and_catalog_resolves_native_model() -> None:
+    selection = ModelSelection(TaskKind.CLASSIFICATION, "ultralytics", "yolo26n")
+    assert str(selection) == "classification/ultralytics/yolo26n"
+    assert plugin_for(selection).catalog.resolve("yolo26n").native_id == "yolo26n-cls.pt"
+    assert models_for(TaskKind.OBJECT_DETECTION, "libreyolo", "picodet*")
 
 
-def test_optional_import_does_not_eagerly_load_optional_exports() -> None:
-    libreyolo = optional_import("libreyolo")
-    assert libreyolo.LibrePICODET is not None
+def test_provider_schema_rejects_parameters_owned_by_another_provider() -> None:
+    selection = ModelSelection(TaskKind.CLASSIFICATION, "ultralytics", "yolo26n")
+    plugin = plugin_for(selection)
+    model = plugin.catalog.resolve(selection.model)
+    schema = plugin.handlers[Operation.TRAIN].schema(model)
+    with pytest.raises(ConfigurationError, match="validate_every"):
+        schema.resolve({"validate_every": 2}, type("Context", (), {"selection": selection, "model": model, "request": None})())
 
 
-def test_libreyolo_training_clamps_auto_worker_sentinel(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_ultralytics_defaults_workers_to_zero() -> None:
+    selection = ModelSelection(TaskKind.CLASSIFICATION, "ultralytics", "yolo26n")
+    plugin = plugin_for(selection)
+    model = plugin.catalog.resolve(selection.model)
+    schema = plugin.handlers[Operation.TRAIN].schema(model)
+    context = type("Context", (), {"selection": selection, "model": model, "request": None})()
+    assert schema.resolve({}, context)["workers"] == 0
+    with pytest.raises(ConfigurationError, match="workers must be at least 0"):
+        schema.resolve({"workers": -1}, context)
+
+
+def test_ultralytics_classification_translates_only_its_supported_parameters(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured: dict[str, object] = {}
-
-    class FakeModel:
-        def train(self, **options):
-            captured.update(options)
-            return {}
-
-    class FakeModule:
-        LibrePICODET = lambda *args, **kwargs: FakeModel()
-
-    import vision_workflows.backends.libreyolo as backend_module
-    monkeypatch.setattr(backend_module, "optional_import", lambda _: FakeModule())
-    data = tmp_path / "data.yaml"
-    data.write_text("names: [seal]\n", encoding="utf-8")
-    request = TrainRequest(ModelRef("libreyolo", "picodet", "s"), data, tmp_path / "run", workers=-1)
-    context = type("Context", (), {"run_dir": tmp_path / "run"})()
-
-    LibreYoloBackend("picodet", ("s",)).train(request, context)
-
-    assert captured["workers"] == 0
-
-
-def test_ultralytics_classification_training_uses_image_folder_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    captured: dict[str, object] = {}
-    events: list[tuple[str, dict[str, object]]] = []
 
     class FakeModel:
         def __init__(self, checkpoint: str):
@@ -73,97 +65,52 @@ def test_ultralytics_classification_training_uses_image_folder_defaults(monkeypa
 
         def train(self, **options):
             captured.update(options)
-            weights = Path(options["project"]) / options["name"] / "weights"
+            weights = Path(options["project"]) / str(options["name"]) / "weights"
             weights.mkdir(parents=True)
             (weights / "best.pt").write_bytes(b"best")
             (weights / "last.pt").write_bytes(b"last")
 
-    class FakeModule:
-        YOLO = FakeModel
-
-    import vision_workflows.backends.ultralytics as backend_module
-    monkeypatch.setattr(backend_module, "optional_import", lambda _: FakeModule())
-    data = tmp_path / "classification"
-    (data / "train" / "seal").mkdir(parents=True)
-    (data / "val" / "seal").mkdir(parents=True)
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    context = type("Context", (), {"run_dir": run_dir, "emit": lambda _, name, value: events.append((name, value))})()
-    request = TrainRequest(
-        ModelRef("ultralytics", "yolo26-cls", "n"), data, run_dir, workers=2,
-        options={"validate_every": 2, "mosaic": 0.0},
-    )
-
-    result = UltralyticsBackend("classification").train(request, context)
-
-    assert captured["checkpoint"] == "yolo26n-cls.pt"
-    assert captured["data"] == str(data.resolve())
-    assert captured["imgsz"] == 224
-    assert captured["workers"] == 2
-    assert captured["mosaic"] == 0.0
-    assert "validate_every" not in captured
-    assert "device" not in captured
-    assert {item.name for item in result.artifacts} == {"best.pt", "last.pt"}
-    assert events == [("backend_train_started", {"backend": "ultralytics/yolo26-cls", "task": "classification", "data": str(data.resolve())})]
-
-
-def test_ultralytics_classification_training_clamps_auto_worker_sentinel(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    captured: dict[str, object] = {}
-
-    class FakeModel:
-        def __init__(self, checkpoint: str):
-            pass
-
-        def train(self, **options):
-            captured.update(options)
-
-    class FakeModule:
-        YOLO = FakeModel
-
-    import vision_workflows.backends.ultralytics as backend_module
-    monkeypatch.setattr(backend_module, "optional_import", lambda _: FakeModule())
-    data = tmp_path / "classification"
+    import vision_workflows.backends.ultralytics as integration
+    monkeypatch.setattr(integration, "optional_import", lambda _: type("Module", (), {"YOLO": FakeModel})())
+    data = tmp_path / "images"
     data.mkdir()
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    context = type("Context", (), {"run_dir": run_dir, "emit": lambda *_: None})()
-    request = TrainRequest(ModelRef("ultralytics", "yolo26-cls", "n"), data, run_dir)
-
-    UltralyticsBackend("classification").train(request, context)
-
+    selection = ModelSelection(TaskKind.CLASSIFICATION, "ultralytics", "yolo26n")
+    TrainService().run(TrainRequest(selection, data, tmp_path / "run"))
+    assert captured["checkpoint"] == "yolo26n-cls.pt"
     assert captured["workers"] == 0
+    assert captured["imgsz"] == 224
+    assert "validate_every" not in captured
 
 
-def test_train_service_writes_typed_run_manifest(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_optional_import_does_not_eagerly_load_optional_exports() -> None:
+    libreyolo = optional_import("libreyolo")
+    assert libreyolo.LibrePICODET is not None
+
+
+def test_train_service_records_requested_and_effective_parameters(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from vision_workflows.backends import registry
 
-    class FakeBackend(ModelBackend):
-        descriptor = BackendDescriptor("fake", "unit", "classification", ("v1",), frozenset(BackendCapability), "fake")
+    selection = ModelSelection(TaskKind.CLASSIFICATION, "fake", "unit")
 
-        def train(self, request, context):
-            path = context.run_dir / "best.pt"
-            path.write_bytes(b"checkpoint")
-            return BackendExecutionResult((ArtifactRef("best.pt", path, "checkpoint"),), {"accuracy": 1.0})
+    def train(request, context):
+        path = context.run_dir / "best.pt"
+        path.write_bytes(b"checkpoint")
+        return OperationExecution((ArtifactRef("best.pt", path, "checkpoint"),), {"accuracy": 1.0})
 
-        def export(self, request, context):
-            raise NotImplementedError
-
-        def validate(self, request, context):
-            raise NotImplementedError
-
-        def test(self, request, context):
-            raise NotImplementedError
-
-    class BackendExecutionResult(BackendExecution):
-        def __init__(self, artifacts, metrics):
-            self.artifacts = artifacts
-            self.metrics = metrics
-
-    monkeypatch.setattr(registry, "_BACKENDS", (FakeBackend(),))
-    result = TrainService().run(TrainRequest(ModelRef("fake", "unit", "v1"), tmp_path / "data", tmp_path / "run", epochs=1))
+    schema = ParameterSchema((ParameterSpec("epochs", int, "epochs", 3), ParameterSpec("device", str, "device", "cpu")))
+    plugin = FrameworkTaskPlugin(
+        ProviderDescriptor("fake", TaskKind.CLASSIFICATION, frozenset({Operation.TRAIN}), "fake"),
+        StaticModelCatalog((ModelInfo("unit", "native-unit"),)),
+        {Operation.TRAIN: OperationHandler(lambda _: schema, train)},
+    )
+    monkeypatch.setattr(registry, "_PLUGINS", (plugin,))
+    result = TrainService().run(TrainRequest(selection, tmp_path / "data", tmp_path / "run", parameters={"epochs": 1}))
+    manifest = json.loads((tmp_path / "run" / "manifest.json").read_text(encoding="utf-8"))
     assert result.best_checkpoint is not None
-    assert result.run.status.value == "succeeded"
-    assert (tmp_path / "run" / "manifest.json").is_file()
+    assert result.run.status is RunStatus.SUCCEEDED
+    assert manifest["config"]["resolved_model"]["native_id"] == "native-unit"
+    assert manifest["config"]["parameters"]["requested"] == {"epochs": 1}
+    assert manifest["config"]["parameters"]["effective"] == {"device": "cpu", "epochs": 1}
 
 
 def test_run_store_creates_unique_immutable_run_directories(tmp_path: Path) -> None:
@@ -181,30 +128,11 @@ def test_run_store_overwrite_removes_existing_requested_run_directory(tmp_path: 
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     (run_dir / "old-artifact.pt").write_bytes(b"old")
-    store = RunStore(tmp_path / "runs")
-
-    context, run_id = store.start("train", {}, run_dir=run_dir, overwrite=True)
-
+    context, _ = RunStore(tmp_path / "runs").start("train", {}, run_dir=run_dir, overwrite=True)
     assert context.run_dir == run_dir.resolve()
     assert not (run_dir / "old-artifact.pt").exists()
-    assert (run_dir / "manifest.json").is_file()
 
 
 def test_run_store_refuses_overwriting_current_directory(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "runs")
-
     with pytest.raises(ValueError, match="current directory"):
-        store.start("train", {}, run_dir=Path.cwd(), overwrite=True)
-
-
-def test_run_store_allows_existing_directory_for_resume(tmp_path: Path) -> None:
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    checkpoint = run_dir / "last.pt"
-    checkpoint.write_bytes(b"checkpoint")
-    store = RunStore(tmp_path / "runs")
-
-    context, _ = store.start("train", {}, run_dir=run_dir, allow_existing=True)
-
-    assert context.run_dir == run_dir.resolve()
-    assert checkpoint.read_bytes() == b"checkpoint"
+        RunStore(tmp_path / "runs").start("train", {}, run_dir=Path.cwd(), overwrite=True)

@@ -1,39 +1,48 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping, Protocol
 
-from ..domain.models import BackendDescriptor
+from ..domain.models import DatasetRequirement, ModelInfo, Operation, ParameterSchema, ProviderDescriptor
 from ..domain.results import ArtifactRef
 from ..workflows.context import WorkflowContext
-from ..workflows.requests import ExportRequest, TestRequest, TrainRequest, ValidateRequest
+from ..workflows.requests import ResolvedRequest
 
 
-class BackendExecution(ABC):
+@dataclass(frozen=True)
+class OperationExecution:
     artifacts: tuple[ArtifactRef, ...] = ()
-    metrics: dict[str, Any] = {}
-    contract: dict[str, Any] = {}
+    metrics: Mapping[str, Any] = field(default_factory=dict)
+    contract: Mapping[str, Any] = field(default_factory=dict)
     checks: tuple[dict[str, Any], ...] = ()
 
 
-class ModelBackend(ABC):
-    @property
-    @abstractmethod
-    def descriptor(self) -> BackendDescriptor:
-        raise NotImplementedError
+class ModelCatalog(Protocol):
+    def list(self, pattern: str | None = None) -> tuple[ModelInfo, ...]: ...
 
-    @abstractmethod
-    def train(self, request: TrainRequest, context: WorkflowContext) -> BackendExecution:
-        raise NotImplementedError
+    def resolve(self, model: str) -> ModelInfo: ...
 
-    @abstractmethod
-    def export(self, request: ExportRequest, context: WorkflowContext) -> BackendExecution:
-        raise NotImplementedError
 
-    @abstractmethod
-    def validate(self, request: ValidateRequest, context: WorkflowContext) -> BackendExecution:
-        raise NotImplementedError
+SchemaFactory = Callable[[ModelInfo], ParameterSchema]
+OperationCallable = Callable[[ResolvedRequest, WorkflowContext], OperationExecution]
 
-    @abstractmethod
-    def test(self, request: TestRequest, context: WorkflowContext) -> BackendExecution:
-        raise NotImplementedError
+
+@dataclass(frozen=True)
+class OperationHandler:
+    schema: SchemaFactory
+    execute: OperationCallable
+    dataset: DatasetRequirement | None = None
+
+
+@dataclass(frozen=True)
+class FrameworkTaskPlugin:
+    descriptor: ProviderDescriptor
+    catalog: ModelCatalog
+    handlers: Mapping[Operation, OperationHandler]
+
+    def __post_init__(self) -> None:
+        if frozenset(self.handlers) != self.descriptor.operations:
+            raise ValueError("descriptor operations must match registered handlers")
+
+
+BackendExecution = OperationExecution

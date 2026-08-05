@@ -9,8 +9,9 @@ torch = pytest.importorskip("torch")
 
 from vision_workflows.backends import timm_detection as backend_module
 from vision_workflows.backends.timm_detection import TimmDetectionBackend
-from vision_workflows.domain.models import ModelRef
-from vision_workflows.workflows.requests import TrainRequest
+from vision_workflows.domain.datasets import TaskKind
+from vision_workflows.domain.models import ModelInfo, ModelSelection
+from vision_workflows.workflows.requests import ResolvedTrainRequest
 
 
 class _EmptyDetectionSet(torch.utils.data.Dataset):
@@ -63,19 +64,23 @@ def test_timm_detection_supports_resume_patience_and_determinism(monkeypatch, tm
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     context = _Context(run_dir)
-    request = TrainRequest(
-        ModelRef("timm", "detection", "query"),
+    parameters = {
+        "epochs": 5, "batch": 1, "image_size": 8, "learning_rate": 1e-3,
+        "workers": 0, "patience": 1, "seed": 7, "device": "cpu",
+        "pretrained": False, "deterministic": True, "num_queries": 1,
+        "backbone": "unused", "validate_every": 1, "prefetch_factor": None,
+        "persistent_workers": False, "pin_memory": False, "amp": False,
+        "amp_dtype": None, "compile": False,
+    }
+    request = ResolvedTrainRequest(
+        ModelSelection(TaskKind.OBJECT_DETECTION, "pytorch", "query-detector"),
+        ModelInfo("query-detector", "query-detector"),
         tmp_path / "data",
         run_dir,
-        epochs=5,
-        batch=1,
-        workers=0,
-        patience=1,
-        seed=7,
-        device="cpu",
-        pretrained=False,
-        deterministic=True,
-        options={"num_queries": 1},
+        None,
+        False,
+        False,
+        parameters,
     )
 
     first = TimmDetectionBackend().train(request, context)
@@ -90,13 +95,7 @@ def test_timm_detection_supports_resume_patience_and_determinism(monkeypatch, tm
 
     scores[:] = [0.5]
     resumed = TimmDetectionBackend().train(
-        request.__class__(
-            **{
-                **request.__dict__,
-                "epochs": 3,
-                "resume": True,
-            }
-        ),
+        request.__class__(request.selection, request.model, request.data, request.output, request.weights, True, request.overwrite, {**request.parameters, "epochs": 3}),
         context,
     )
 

@@ -3,9 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from dataclasses import asdict
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from ..api import (
     ConvertDatasetRequest,
@@ -22,9 +23,9 @@ from ..api import (
     ValidateRequest,
     ValidationService,
 )
-from ..backends.registry import descriptors
-from ..domain.datasets import DatasetFormat, MaterializationMode, SplitPolicy
-from ..domain.models import ModelRef
+from ..backends.registry import frameworks, models_for, plugin_for
+from ..domain.datasets import BalanceMode, DatasetFormat, MaterializationMode, SplitPolicy, TaskKind
+from ..domain.models import ModelSelection, Operation, ParameterSchema
 
 
 def _path(value: str) -> Path:
@@ -38,13 +39,6 @@ def _format(value: str) -> DatasetFormat:
         raise argparse.ArgumentTypeError(f"unsupported dataset format: {value}") from error
 
 
-def _model(value: str) -> ModelRef:
-    try:
-        return ModelRef.parse(value)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(str(error)) from error
-
-
 def _common_dataset(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--format", type=_format)
     parser.add_argument("--overwrite", action="store_true")
@@ -55,7 +49,53 @@ def _split_policy(args: argparse.Namespace) -> SplitPolicy:
     return SplitPolicy(args.train, args.val, args.test, args.seed, args.grouping, not args.no_stratify)
 
 
-def build_parser() -> argparse.ArgumentParser:
+def _add_selection(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--task", choices=[item.value for item in TaskKind], required=True)
+    parser.add_argument("--framework", required=True)
+    parser.add_argument("--model", required=True)
+
+
+def _selection(args: argparse.Namespace) -> ModelSelection:
+    return ModelSelection(TaskKind(args.task), args.framework, args.model)
+
+
+def _selected_schema(argv: Sequence[str]) -> tuple[Operation, ModelSelection, ParameterSchema] | None:
+    if not argv or argv[0] not in {item.value for item in Operation}:
+        return None
+    probe = argparse.ArgumentParser(add_help=False)
+    probe.add_argument("command")
+    probe.add_argument("--task")
+    probe.add_argument("--framework")
+    probe.add_argument("--model")
+    values, _ = probe.parse_known_args(argv)
+    if not all((values.task, values.framework, values.model)):
+        return None
+    operation = Operation(values.command)
+    selection = ModelSelection(TaskKind(values.task), values.framework, values.model)
+    plugin = plugin_for(selection)
+    model = plugin.catalog.resolve(selection.model)
+    return operation, selection, plugin.handlers[operation].schema(model)
+
+
+def _add_parameters(parser: argparse.ArgumentParser, schema: ParameterSchema) -> None:
+    groups: dict[str, argparse._ArgumentGroup] = {}
+    for spec in schema.parameters:
+        group = groups.setdefault(spec.origin.value, parser.add_argument_group(f"{spec.origin.value} parameters"))
+        kwargs: dict[str, Any] = {"dest": spec.name, "help": spec.help, "default": argparse.SUPPRESS}
+        if spec.choices:
+            kwargs["choices"] = spec.choices
+        if spec.value_type is bool:
+            kwargs["action"] = argparse.BooleanOptionalAction
+        else:
+            kwargs["type"] = spec.value_type
+        if spec.required:
+            kwargs["required"] = True
+        group.add_argument(spec.cli_flag, **kwargs)
+
+
+def build_parser(argv: Sequence[str] | None = None) -> argparse.ArgumentParser:
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    selected = _selected_schema(effective_argv)
     parser = argparse.ArgumentParser(prog="vision-workflows", description="Dataset and model workflows")
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -64,10 +104,10 @@ def build_parser() -> argparse.ArgumentParser:
     inspect = dataset_commands.add_parser("inspect")
     inspect.add_argument("source", type=_path)
     inspect.add_argument("--format", type=_format)
-    validate = dataset_commands.add_parser("validate")
-    validate.add_argument("source", type=_path)
-    validate.add_argument("--format", type=_format)
-    validate.add_argument("--require-train-val", action="store_true")
+    validate_dataset = dataset_commands.add_parser("validate")
+    validate_dataset.add_argument("source", type=_path)
+    validate_dataset.add_argument("--format", type=_format)
+    validate_dataset.add_argument("--require-train-val", action="store_true")
     convert = dataset_commands.add_parser("convert")
     convert.add_argument("source", type=_path)
     convert.add_argument("output", type=_path)
@@ -85,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--seed", type=int, default=42)
     merge.add_argument("--grouping", default="sample")
     merge.add_argument("--no-stratify", action="store_true")
-    merge.add_argument("--balance", choices=("none", "undersample", "oversample"), default="none")
+    merge.add_argument("--balance", choices=[item.value for item in BalanceMode], default="none")
     _common_dataset(merge)
     split = dataset_commands.add_parser("split")
     split.add_argument("source", type=_path)
@@ -99,54 +139,40 @@ def build_parser() -> argparse.ArgumentParser:
     split.add_argument("--no-stratify", action="store_true")
     _common_dataset(split)
 
-    model = commands.add_parser("model", help="model registry")
+    framework = commands.add_parser("framework", help="framework providers")
+    framework.add_subparsers(dest="framework_command", required=True).add_parser("list")
+    model = commands.add_parser("model", help="model catalogs")
     model_commands = model.add_subparsers(dest="model_command", required=True)
-    model_commands.add_parser("list")
+    model_list = model_commands.add_parser("list")
+    model_list.add_argument("--task", choices=[item.value for item in TaskKind], required=True)
+    model_list.add_argument("--framework", required=True)
+    model_list.add_argument("--pattern")
+    describe = model_commands.add_parser("describe")
+    _add_selection(describe)
+    describe.add_argument("--operation", choices=[item.value for item in Operation], required=True)
 
-    train = commands.add_parser("train")
-    train.add_argument("--model", type=_model, required=True)
+    workflow_parsers: dict[Operation, argparse.ArgumentParser] = {}
+    train = workflow_parsers[Operation.TRAIN] = commands.add_parser("train")
+    _add_selection(train)
     train.add_argument("--data", type=_path, required=True)
     train.add_argument("--output", type=_path, required=True)
-    train.add_argument("--epochs", type=int, default=100)
-    train.add_argument("--batch", type=int, default=16)
-    train.add_argument("--validate-every", type=int, default=1, help="run validation every N epochs; the first and final epochs are always validated")
-    train.add_argument("--image-size", type=int, help="override the model's suggested training image size")
-    train.add_argument("--learning-rate", type=float, default=1e-3)
-    train.add_argument("--workers", "--worker", dest="workers", type=int, default=-1)
-    train.add_argument("--patience", type=int, default=20)
-    train.add_argument("--seed", type=int, default=42)
-    train.add_argument("--device", default="auto")
     train.add_argument("--weights", type=_path)
     train.add_argument("--resume", action="store_true")
-    train.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
-    train.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True)
-    train.add_argument("--allow-experimental", action="store_true", help="allow backends with gated experimental training")
-    train.add_argument("--overwrite", action="store_true", help="delete the requested run directory before training")
-    train.add_argument("--prefetch-factor", type=int)
-    train.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=None)
-    train.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=None)
-    train.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
-    train.add_argument("--amp-dtype", choices=("float16", "bfloat16"))
-    train.add_argument("--compile", action=argparse.BooleanOptionalAction, default=None)
-
-    export = commands.add_parser("export")
-    export.add_argument("--model", type=_model, required=True)
+    train.add_argument("--overwrite", action="store_true")
+    export = workflow_parsers[Operation.EXPORT] = commands.add_parser("export")
+    _add_selection(export)
     export.add_argument("--checkpoint", type=_path, required=True)
     export.add_argument("--output", type=_path, required=True)
     export.add_argument("--data", type=_path)
-    export.add_argument("--image-size", type=int, default=640)
-    export.add_argument("--opset", type=int, default=18)
-    export.add_argument("--simplify", action=argparse.BooleanOptionalAction, default=True)
-    export.add_argument("--device", default="auto")
-    export.add_argument("--embedded-preprocessing", action="store_true")
-
-    for name in ("validate", "test"):
-        command = commands.add_parser(name)
-        command.add_argument("--model", type=_model, required=True)
+    for operation in (Operation.VALIDATE, Operation.TEST):
+        command = workflow_parsers[operation] = commands.add_parser(operation.value)
+        _add_selection(command)
         command.add_argument("--target", type=_path, required=True)
-        command.add_argument("--data", type=_path, required=name == "test")
-        command.add_argument("--split", default="test" if name == "test" else "val")
-        command.add_argument("--device", default="cpu" if name == "validate" else "auto")
+        command.add_argument("--data", type=_path, required=operation is Operation.TEST)
+        command.add_argument("--split", default="test" if operation is Operation.TEST else "val")
+    if selected is not None:
+        operation, _, schema = selected
+        _add_parameters(workflow_parsers[operation], schema)
     return parser
 
 
@@ -154,15 +180,35 @@ def _print(value) -> None:
     print(json.dumps(value, indent=2, default=str))
 
 
+def _parameters(args: argparse.Namespace, operation: Operation) -> dict:
+    selection = _selection(args)
+    plugin = plugin_for(selection)
+    model = plugin.catalog.resolve(selection.model)
+    schema = plugin.handlers[operation].schema(model)
+    return {spec.name: getattr(args, spec.name) for spec in schema.parameters if hasattr(args, spec.name)}
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    args = build_parser().parse_args(argv)
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser(effective_argv).parse_args(effective_argv)
+    if args.command == "framework":
+        for item in frameworks():
+            _print({"framework": item.framework, "task": item.task.value, "operations": sorted(item.operations), "description": item.description, "optional_dependency": item.optional_dependency})
+        return 0
+    if args.command == "model":
+        if args.model_command == "list":
+            for item in models_for(TaskKind(args.task), args.framework, args.pattern):
+                _print(asdict(item))
+        else:
+            selection = _selection(args)
+            plugin = plugin_for(selection)
+            model_info = plugin.catalog.resolve(selection.model)
+            handler = plugin.handlers[Operation(args.operation)]
+            _print({"selection": str(selection), "resolved_model": asdict(model_info), "parameters": handler.schema(model_info).describe(), "dataset": asdict(handler.dataset) if handler.dataset else None})
+        return 0
     service = DatasetService()
     materialization = MaterializationMode(args.materialization) if hasattr(args, "materialization") else MaterializationMode.HARDLINK
-    if args.command == "model":
-        for item in descriptors():
-            _print({"backend": item.backend, "family": item.family, "task": item.task, "variants": item.variants, "capabilities": sorted(capability.value for capability in item.capabilities), "description": item.description})
-        return 0
     if args.command == "dataset":
         if args.dataset_command == "inspect":
             _print(asdict(service.inspect(args.source, args.format)))
@@ -173,32 +219,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.dataset_command == "convert":
             _print(asdict(service.convert(ConvertDatasetRequest(args.source, args.output, args.output_format, args.input_format, materialization, args.overwrite))))
         elif args.dataset_command == "split":
-            result = service.split(SplitDatasetRequest(args.source, args.output, _split_policy(args), args.format, args.output_format, materialization, args.overwrite))
-            _print(asdict(result))
-        elif args.dataset_command == "merge":
+            _print(asdict(service.split(SplitDatasetRequest(args.source, args.output, _split_policy(args), args.format, args.output_format, materialization, args.overwrite))))
+        else:
             policy = _split_policy(args) if args.split else None
-            from ..domain.datasets import BalanceMode
-            result = service.merge(MergeDatasetRequest(tuple(args.sources), args.output, args.output_format, policy, materialization, args.overwrite, BalanceMode(args.balance)))
-            _print(asdict(result))
+            _print(asdict(service.merge(MergeDatasetRequest(tuple(args.sources), args.output, args.output_format, policy, materialization, args.overwrite, BalanceMode(args.balance)))))
         return 0
-    if args.command == "train":
-        options = {"allow_experimental": True} if args.allow_experimental else {}
-        options["validate_every"] = args.validate_every
-        for name in ("prefetch_factor", "persistent_workers", "pin_memory", "amp", "amp_dtype", "compile"):
-            value = getattr(args, name)
-            if value is not None:
-                options[name] = value
-        result = TrainService().run(TrainRequest(args.model, args.data, args.output, args.epochs, args.batch, args.image_size, args.learning_rate, args.workers, args.patience, args.seed, args.device, args.weights, args.resume, args.pretrained, args.deterministic, args.overwrite, options))
-        _print(asdict(result))
-        return 0
-    if args.command == "export":
-        result = ExportService().run(ExportRequest(args.model, args.checkpoint, args.output, args.data, args.image_size, args.opset, args.simplify, args.device, args.embedded_preprocessing))
-        _print(asdict(result))
-        return 0
-    if args.command == "validate":
-        result = ValidationService().run(ValidateRequest(args.model, args.target, args.data, args.split, args.device))
-        _print(asdict(result))
-        return 0
-    result = TestService().run(TestRequest(args.model, args.target, args.data, args.split, args.device))
+    operation = Operation(args.command)
+    selection = _selection(args)
+    parameters = _parameters(args, operation)
+    if operation is Operation.TRAIN:
+        result = TrainService().run(TrainRequest(selection, args.data, args.output, args.weights, args.resume, args.overwrite, parameters))
+    elif operation is Operation.EXPORT:
+        result = ExportService().run(ExportRequest(selection, args.checkpoint, args.output, args.data, parameters))
+    elif operation is Operation.VALIDATE:
+        result = ValidationService().run(ValidateRequest(selection, args.target, args.data, args.split, parameters))
+    else:
+        result = TestService().run(TestRequest(selection, args.target, args.data, args.split, parameters))
     _print(asdict(result))
     return 0

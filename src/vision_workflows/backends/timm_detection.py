@@ -9,12 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from ..domain.datasets import DatasetFormat, DetectionDataset, Split
-from ..domain.models import BackendCapability, BackendDescriptor
 from ..domain.results import ArtifactRef
 from ..workflows.context import WorkflowContext, optional_import
-from ..workflows.requests import ExportRequest, TestRequest, TrainRequest, ValidateRequest
+from ..workflows.requests import ResolvedExportRequest, ResolvedTestRequest, ResolvedTrainRequest, ResolvedValidateRequest
 from ..workflows.runs import artifact
-from .base import BackendExecution, ModelBackend
+from .base import BackendExecution
 from .common import detection_contract, metadata_for_contract, require_file, set_onnx_metadata, validate_onnx
 from .timm_training import (
     TimmTrainingOptions,
@@ -117,26 +116,27 @@ def _collate(batch):
     return __import__("torch").stack(images), list(boxes), list(labels)
 
 
-class TimmDetectionBackend(ModelBackend):
-    descriptor = BackendDescriptor(
-        "timm", "detection", "detection", ("query",),
-        frozenset(BackendCapability), "timm NMS-free query detector", "timm,torchvision",
-    )
+class TimmDetectionBackend:
 
-    def _dataset(self, request: TrainRequest | ValidateRequest | TestRequest, split: str):
+    def _dataset(self, request: ResolvedTrainRequest | ResolvedValidateRequest | ResolvedTestRequest, split: str):
         from ..datasets.formats.base import load_dataset
 
+        if request.data is None:
+            raise ValueError("evaluation requires a detection dataset")
         dataset = load_dataset(request.data, DatasetFormat.COCO)
+        if not isinstance(dataset, DetectionDataset):
+            raise ValueError("query-detector requires an object-detection dataset")
         image_size = request.image_size or int(request.options.get("image_size", 640))
         return dataset, TimmDetectionDataset(dataset, split, image_size)
 
-    def train(self, request: TrainRequest, context: WorkflowContext) -> BackendExecution:
+    def train(self, request: ResolvedTrainRequest, context: WorkflowContext) -> BackendExecution:
         started = time.perf_counter()
         torch, timm, _ = _torch_components()
         dataset, train_set = self._dataset(request, "train")
         _, val_set = self._dataset(request, "val")
         image_size = train_set.image_size
-        queries = int(request.options.get("num_queries", max(8, max((len(sample.annotations) for sample in dataset.samples), default=1) + 4)))
+        requested_queries = int(request.options.get("num_queries", 0))
+        queries = requested_queries or max(8, max((len(sample.annotations) for sample in dataset.samples), default=1) + 4)
         variant = str(request.options.get("backbone", "mobilenetv4_conv_small.e3600_r256_in1k"))
         seed_everything(torch, request.seed, request.deterministic)
         device = torch.device("cuda" if request.device == "auto" and torch.cuda.is_available() else request.device if request.device != "auto" else "cpu")
@@ -285,7 +285,7 @@ class TimmDetectionBackend(ModelBackend):
                 scores.extend(torch.softmax(logits, -1)[..., :class_count].max(-1).values.mean(-1).cpu().tolist())
         return {"images": len(scores), "mean_score": sum(scores) / max(1, len(scores))}
 
-    def export(self, request: ExportRequest, context: WorkflowContext) -> BackendExecution:
+    def export(self, request: ResolvedExportRequest, context: WorkflowContext) -> BackendExecution:
         torch, _, _ = _torch_components()
         model, classes, checkpoint = self._load(request.checkpoint, torch.device("cpu"))
         output = request.output.expanduser().resolve()
@@ -305,7 +305,7 @@ class TimmDetectionBackend(ModelBackend):
         set_onnx_metadata(output, metadata_for_contract(contract))
         return Execution((artifact(output, "onnx"),), {}, contract, validate_onnx(output, contract))
 
-    def validate(self, request: ValidateRequest, context: WorkflowContext) -> BackendExecution:
+    def validate(self, request: ResolvedValidateRequest, context: WorkflowContext) -> BackendExecution:
         if request.target.suffix.casefold() == ".onnx":
             checks = validate_onnx(request.target, detection_contract([]))
             return Execution((artifact(request.target, "onnx"),), {}, detection_contract([]), checks)
@@ -313,7 +313,7 @@ class TimmDetectionBackend(ModelBackend):
         self._load(request.target, torch.device("cpu"))
         return Execution((artifact(request.target, "checkpoint"),), {}, {}, (({"name": "checkpoint_load", "status": "passed"}),))
 
-    def test(self, request: TestRequest, context: WorkflowContext) -> BackendExecution:
+    def test(self, request: ResolvedTestRequest, context: WorkflowContext) -> BackendExecution:
         torch, _, _ = _torch_components()
         dataset, test_set = self._dataset(request, request.split)
         model, _, _ = self._load(request.target, torch.device("cpu"))

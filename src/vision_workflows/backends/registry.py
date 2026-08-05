@@ -1,40 +1,190 @@
 from __future__ import annotations
 
+from ..domain.datasets import DatasetFormat, TaskKind
 from ..domain.errors import ConfigurationError
-from ..domain.models import BackendCapability, BackendDescriptor, ModelRef
-from .base import ModelBackend
+from ..domain.models import (
+    DatasetRequirement,
+    ModelInfo,
+    ModelSelection,
+    Operation,
+    ParameterOrigin,
+    ParameterSchema,
+    ParameterSpec,
+    ProviderDescriptor,
+    StaticModelCatalog,
+)
+from ..workflows.context import optional_import
+from .base import FrameworkTaskPlugin, OperationHandler
 from .libreyolo import LibreYoloBackend
 from .timm_classification import TimmClassificationBackend
 from .timm_detection import TimmDetectionBackend
 from .ultralytics import UltralyticsBackend
 
 
-_BACKENDS: tuple[ModelBackend, ...] = (
-    TimmClassificationBackend(),
-    TimmDetectionBackend(),
-    UltralyticsBackend(),
-    UltralyticsBackend("classification"),
-    LibreYoloBackend("yolov9", ("t", "s", "m", "c")),
-    LibreYoloBackend("picodet", ("s", "m", "l")),
-)
+def _schema(*parameters: ParameterSpec) -> ParameterSchema:
+    return ParameterSchema(parameters)
 
 
-def descriptors() -> tuple[BackendDescriptor, ...]:
-    return tuple(backend.descriptor for backend in _BACKENDS)
+def _training(image_size: int | None) -> ParameterSchema:
+    return _schema(
+        ParameterSpec("epochs", int, "number of training epochs", 100, minimum=1),
+        ParameterSpec("batch", int, "training batch size", 16, minimum=1),
+        ParameterSpec("image_size", int, "square input image size", image_size, allow_none=image_size is None, minimum=1),
+        ParameterSpec("learning_rate", float, "initial learning rate", 1e-3, minimum=0.0),
+        ParameterSpec("workers", int, "data-loader worker processes", 0, minimum=0),
+        ParameterSpec("patience", int, "early-stopping patience", 20, minimum=0),
+        ParameterSpec("seed", int, "random seed", 42, minimum=0),
+        ParameterSpec("device", str, "training device", "auto"),
+        ParameterSpec("pretrained", bool, "start from pretrained weights", True),
+        ParameterSpec("deterministic", bool, "request deterministic training", True),
+    )
 
 
-def backends() -> tuple[ModelBackend, ...]:
-    return _BACKENDS
+def _export(image_size: int, *, nms_configurable: bool = False) -> ParameterSchema:
+    base = _schema(
+        ParameterSpec("image_size", int, "square export image size", image_size, minimum=1),
+        ParameterSpec("opset", int, "ONNX operator-set version", 18, minimum=7),
+        ParameterSpec("simplify", bool, "simplify the exported ONNX graph", True),
+        ParameterSpec("device", str, "export device", "auto"),
+    )
+    if not nms_configurable:
+        return base
+    return base.compose(_schema(ParameterSpec("nms_required", bool, "mark post-export NMS as required", False)).with_origin(ParameterOrigin.TASK))
 
 
-def backend_for(model: ModelRef) -> ModelBackend:
-    for backend in _BACKENDS:
-        descriptor = backend.descriptor
-        if descriptor.backend == model.backend and descriptor.family == model.family:
-            if "*" in descriptor.variants or model.variant in descriptor.variants:
-                return backend
-    raise ConfigurationError(f"unsupported model: {model}")
+def _evaluation(device: str) -> ParameterSchema:
+    return _schema(ParameterSpec("device", str, "evaluation device", device))
 
 
-def list_models() -> tuple[BackendDescriptor, ...]:
-    return descriptors()
+def _timm_train(_: ModelInfo) -> ParameterSchema:
+    framework = _schema(
+        ParameterSpec("validate_every", int, "run validation every N epochs", 1, minimum=1),
+        ParameterSpec("prefetch_factor", int, "batches prefetched per worker", None, allow_none=True, minimum=1),
+        ParameterSpec("persistent_workers", bool, "keep workers alive between epochs", False),
+        ParameterSpec("pin_memory", bool, "pin data-loader memory", False),
+        ParameterSpec("amp", bool, "use automatic mixed precision", False),
+        ParameterSpec("amp_dtype", str, "AMP data type", None, choices=("float16", "bfloat16"), allow_none=True),
+        ParameterSpec("compile", bool, "compile the model with torch.compile", False),
+    ).with_origin(ParameterOrigin.FRAMEWORK)
+    return _training(None).compose(framework)
+
+
+def _query_train(_: ModelInfo) -> ParameterSchema:
+    model = _schema(
+        ParameterSpec("backbone", str, "timm feature-extractor model", "mobilenetv4_conv_small.e3600_r256_in1k"),
+        ParameterSpec("num_queries", int, "detector query count; zero chooses from the dataset", 0, minimum=0),
+        ParameterSpec("validate_every", int, "run validation every N epochs", 1, minimum=1),
+        ParameterSpec("prefetch_factor", int, "batches prefetched per worker", None, allow_none=True, minimum=1),
+        ParameterSpec("persistent_workers", bool, "keep workers alive between epochs", False),
+        ParameterSpec("pin_memory", bool, "pin data-loader memory", False),
+        ParameterSpec("amp", bool, "use automatic mixed precision", False),
+        ParameterSpec("amp_dtype", str, "AMP data type", None, choices=("float16", "bfloat16"), allow_none=True),
+        ParameterSpec("compile", bool, "compile the model with torch.compile", False),
+    ).with_origin(ParameterOrigin.MODEL)
+    return _training(640).compose(model)
+
+
+def _ultralytics_train(task: TaskKind):
+    def factory(_: ModelInfo) -> ParameterSchema:
+        task_schema = (
+            _schema(ParameterSpec("dropout", float, "classifier dropout", 0.0, minimum=0.0, maximum=1.0))
+            if task is TaskKind.CLASSIFICATION
+            else _schema(ParameterSpec("mosaic", float, "mosaic augmentation probability", 1.0, minimum=0.0, maximum=1.0))
+        ).with_origin(ParameterOrigin.TASK)
+        framework = _schema(
+            ParameterSpec("amp", bool, "use automatic mixed precision", True),
+            ParameterSpec("compile", bool, "compile the model", False),
+        ).with_origin(ParameterOrigin.FRAMEWORK)
+        return _training(224 if task is TaskKind.CLASSIFICATION else 640).compose(framework, task_schema)
+    return factory
+
+
+def _libre_train(_: ModelInfo) -> ParameterSchema:
+    return _training(640)
+
+
+def _all_handlers(backend, train_schema, export_size: int, dataset: DatasetRequirement, *, nms_configurable: bool = False):
+    return {
+        Operation.TRAIN: OperationHandler(train_schema, backend.train, dataset),
+        Operation.EXPORT: OperationHandler(lambda _: _export(export_size, nms_configurable=nms_configurable), backend.export),
+        Operation.VALIDATE: OperationHandler(lambda _: _evaluation("cpu"), backend.validate),
+        Operation.TEST: OperationHandler(lambda _: _evaluation("auto"), backend.test, dataset),
+    }
+
+
+class TimmCatalog:
+    def list(self, pattern: str | None = None) -> tuple[ModelInfo, ...]:
+        timm = optional_import("timm")
+        query = pattern or "*"
+        return tuple(ModelInfo(name, name) for name in timm.list_models(filter=query))
+
+    def resolve(self, model: str) -> ModelInfo:
+        if model not in {item.id for item in self.list(model)}:
+            raise ConfigurationError(f"unknown timm model: {model}")
+        return ModelInfo(model, model)
+
+
+def _plugins() -> tuple[FrameworkTaskPlugin, ...]:
+    classification_data = DatasetRequirement((DatasetFormat.IMAGE_FOLDER,), ("train", "val"))
+    yolo_data = DatasetRequirement((DatasetFormat.YOLO,), ("train", "val"))
+    coco_data = DatasetRequirement((DatasetFormat.COCO,), ("train", "val"))
+
+    timm_backend = TimmClassificationBackend()
+    query_backend = TimmDetectionBackend()
+    ultralytics_cls = UltralyticsBackend("classification")
+    ultralytics_det = UltralyticsBackend("detection")
+    yolo26 = tuple(ModelInfo(f"yolo26{size}", f"yolo26{size}.pt", metadata={"variant": size}) for size in "nsmlx")
+    yolo26_cls = tuple(ModelInfo(item.id, f"{item.id}-cls.pt", metadata=item.metadata) for item in yolo26)
+    libre_models = tuple(
+        ModelInfo(f"{family}{size}", f"{family}{size}", metadata={"family": family, "variant": size})
+        for family, sizes in (("yolov9", "tsmc"), ("picodet", "sml")) for size in sizes
+    )
+
+    def libre_backend(operation: Operation):
+        def execute(request, context):
+            backend = LibreYoloBackend(str(request.model.metadata["family"]), (request.model.variant,))
+            return getattr(backend, operation.value)(request, context)
+
+        return execute
+
+    libre_handlers = {
+        operation: OperationHandler(schema, libre_backend(operation), yolo_data if operation in {Operation.TRAIN, Operation.TEST} else None)
+        for operation, schema in (
+            (Operation.TRAIN, _libre_train),
+            (Operation.EXPORT, lambda _: _export(640, nms_configurable=True)),
+            (Operation.VALIDATE, lambda _: _evaluation("cpu")),
+            (Operation.TEST, lambda _: _evaluation("auto")),
+        )
+    }
+    return (
+        FrameworkTaskPlugin(ProviderDescriptor("timm", TaskKind.CLASSIFICATION, frozenset(Operation), "timm image classifier", "timm"), TimmCatalog(), _all_handlers(timm_backend, _timm_train, 224, classification_data)),
+        FrameworkTaskPlugin(ProviderDescriptor("pytorch", TaskKind.OBJECT_DETECTION, frozenset(Operation), "PyTorch learned-query detector", "torch,timm,torchvision"), StaticModelCatalog((ModelInfo("query-detector", "query-detector"),)), _all_handlers(query_backend, _query_train, 640, coco_data)),
+        FrameworkTaskPlugin(ProviderDescriptor("ultralytics", TaskKind.CLASSIFICATION, frozenset(Operation), "Ultralytics classifier", "ultralytics"), StaticModelCatalog(yolo26_cls), _all_handlers(ultralytics_cls, _ultralytics_train(TaskKind.CLASSIFICATION), 224, classification_data)),
+        FrameworkTaskPlugin(ProviderDescriptor("ultralytics", TaskKind.OBJECT_DETECTION, frozenset(Operation), "Ultralytics detector", "ultralytics"), StaticModelCatalog(yolo26), _all_handlers(ultralytics_det, _ultralytics_train(TaskKind.OBJECT_DETECTION), 640, yolo_data, nms_configurable=True)),
+        FrameworkTaskPlugin(ProviderDescriptor("libreyolo", TaskKind.OBJECT_DETECTION, frozenset(Operation), "LibreYOLO detector", "libreyolo"), StaticModelCatalog(libre_models), libre_handlers),
+    )
+
+
+_PLUGINS = _plugins()
+
+
+def plugins() -> tuple[FrameworkTaskPlugin, ...]:
+    return _PLUGINS
+
+
+def plugin_for(selection: ModelSelection) -> FrameworkTaskPlugin:
+    for plugin in _PLUGINS:
+        if plugin.descriptor.framework == selection.framework and plugin.descriptor.task is selection.task:
+            return plugin
+    raise ConfigurationError(f"unsupported framework/task: {selection.framework}/{selection.task.value}")
+
+
+def frameworks() -> tuple[ProviderDescriptor, ...]:
+    return tuple(plugin.descriptor for plugin in _PLUGINS)
+
+
+def models_for(task: TaskKind, framework: str, pattern: str | None = None) -> tuple[ModelInfo, ...]:
+    plugin = next((item for item in _PLUGINS if item.descriptor.framework == framework and item.descriptor.task is task), None)
+    if plugin is None:
+        raise ConfigurationError(f"unsupported framework/task: {framework}/{task.value}")
+    return plugin.catalog.list(pattern)

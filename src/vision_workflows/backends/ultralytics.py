@@ -5,12 +5,11 @@ from pathlib import Path
 from typing import Any
 
 from ..domain.errors import ConfigurationError
-from ..domain.models import BackendCapability, BackendDescriptor
 from ..domain.results import ArtifactRef
 from ..workflows.context import WorkflowContext, optional_import
-from ..workflows.requests import ExportRequest, TestRequest, TrainRequest, ValidateRequest
+from ..workflows.requests import ResolvedExportRequest, ResolvedTestRequest, ResolvedTrainRequest, ResolvedValidateRequest
 from ..workflows.runs import artifact
-from .base import BackendExecution, ModelBackend
+from .base import BackendExecution
 from .common import (
     artifacts_for,
     class_names_from_model,
@@ -35,23 +34,15 @@ class Execution(BackendExecution):
         object.__setattr__(self, "contract", self.contract or {})
 
 
-class UltralyticsBackend(ModelBackend):
+class UltralyticsBackend:
     def __init__(self, task: str = "detection"):
         if task not in {"classification", "detection"}:
             raise ValueError(f"unsupported Ultralytics task: {task}")
-        family = "yolo26-cls" if task == "classification" else "yolo26"
-        description = "Ultralytics YOLO26 classifier" if task == "classification" else "Ultralytics YOLO26 detector"
         self._task = task
-        self._descriptor = BackendDescriptor(
-            "ultralytics", family, task, ("n", "s", "m", "l", "x"),
-            frozenset(BackendCapability), description, "ultralytics",
-        )
 
-    @property
-    def descriptor(self) -> BackendDescriptor:
-        return self._descriptor
-
-    def _data(self, request: TrainRequest | ValidateRequest | TestRequest) -> Path:
+    def _data(self, request: ResolvedTrainRequest | ResolvedValidateRequest | ResolvedTestRequest) -> Path:
+        if request.data is None:
+            raise ConfigurationError("this operation requires a dataset")
         data = request.data.expanduser().resolve()
         if self._task == "classification":
             if not data.is_dir():
@@ -59,15 +50,14 @@ class UltralyticsBackend(ModelBackend):
             return data
         return require_file(data, "YOLO dataset YAML")
 
-    def _model(self, request: TrainRequest | ExportRequest | ValidateRequest | TestRequest):
+    def _model(self, request: ResolvedTrainRequest | ResolvedExportRequest | ResolvedValidateRequest | ResolvedTestRequest):
         module = optional_import("ultralytics")
         checkpoint = getattr(request, "weights", None) or getattr(request, "checkpoint", None) or getattr(request, "target", None)
         if checkpoint is None:
-            suffix = "-cls" if self._task == "classification" else ""
-            checkpoint = Path(f"yolo26{request.model.variant}{suffix}.pt")
+            checkpoint = Path(request.model.native_id)
         return module.YOLO(str(checkpoint))
 
-    def train(self, request: TrainRequest, context: WorkflowContext) -> BackendExecution:
+    def train(self, request: ResolvedTrainRequest, context: WorkflowContext) -> BackendExecution:
         data = self._data(request)
         model = self._model(request)
         options: dict[str, Any] = {
@@ -76,25 +66,27 @@ class UltralyticsBackend(ModelBackend):
             "batch": request.batch, "lr0": request.learning_rate, "workers": max(0, request.workers),
             "patience": request.patience, "seed": request.seed, "project": str(context.run_dir.parent),
             "name": context.run_dir.name, "exist_ok": True, "resume": request.resume,
+            "pretrained": request.pretrained, "deterministic": request.deterministic,
+            "amp": request.amp, "compile": request.compile,
         }
         if request.device != "auto":
             options["device"] = request.device
-        # This is a vision-workflows scheduler option consumed by the timm
-        # trainers; Ultralytics rejects unknown model.train overrides.
-        options.update({key: value for key, value in request.options.items() if key != "validate_every"})
-        context.emit("backend_train_started", {"backend": str(self.descriptor.model_prefix), "task": self._task, "data": str(data)})
+        if self._task == "classification":
+            options["dropout"] = request.dropout
+        else:
+            options["mosaic"] = request.mosaic
+        context.emit("backend_train_started", {"framework": "ultralytics", "task": self._task, "data": str(data)})
         model.train(**options)
         weights = context.run_dir / "weights"
         best, last = weights / "best.pt", weights / "last.pt"
         return Execution(artifacts_for([(best, "checkpoint"), (last, "checkpoint")]))
 
-    def export(self, request: ExportRequest, context: WorkflowContext) -> BackendExecution:
+    def export(self, request: ResolvedExportRequest, context: WorkflowContext) -> BackendExecution:
         checkpoint = require_file(request.checkpoint, "checkpoint")
         model = self._model(request)
         options: dict[str, Any] = {"format": "onnx", "imgsz": request.image_size, "opset": request.opset, "simplify": request.simplify}
         if request.device != "auto":
             options["device"] = request.device
-        options.update(request.options)
         exported = Path(model.export(**options))
         output = request.output.expanduser().resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -112,7 +104,7 @@ class UltralyticsBackend(ModelBackend):
         checks = validate_onnx(output, contract)
         return Execution((artifact(output, "onnx"),), {}, contract, checks)
 
-    def validate(self, request: ValidateRequest, context: WorkflowContext) -> BackendExecution:
+    def validate(self, request: ResolvedValidateRequest, context: WorkflowContext) -> BackendExecution:
         target = require_file(request.target, "model artifact")
         if target.suffix.casefold() == ".onnx":
             contract = classification_contract([]) if self._task == "classification" else detection_contract([])
@@ -126,7 +118,7 @@ class UltralyticsBackend(ModelBackend):
             metrics = {}
         return Execution((artifact(target, "checkpoint"),), metrics, {}, (({"name": "native_validation", "status": "passed"}),))
 
-    def test(self, request: TestRequest, context: WorkflowContext) -> BackendExecution:
+    def test(self, request: ResolvedTestRequest, context: WorkflowContext) -> BackendExecution:
         model = self._model(request)
         values = model.val(data=str(self._data(request)), split=request.split, device=request.device)
         return Execution((artifact(require_file(request.target, "model artifact"), "model"),), getattr(values, "results_dict", {}), {}, ())

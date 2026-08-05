@@ -8,8 +8,7 @@ from typing import Iterable
 
 class TaskKind(StrEnum):
     CLASSIFICATION = "classification"
-    DETECTION = "detection"
-    SEGMENTATION = "segmentation"
+    OBJECT_DETECTION = "object-detection"
 
 
 class DatasetFormat(StrEnum):
@@ -139,7 +138,7 @@ class DetectionDataset:
 
     @property
     def task(self) -> TaskKind:
-        return TaskKind.DETECTION
+        return TaskKind.OBJECT_DETECTION
 
 
 @dataclass(frozen=True)

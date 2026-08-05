@@ -1,3 +1,3 @@
-from .registry import backend_for, descriptors, list_models
+from .registry import frameworks, models_for, plugin_for, plugins
 
-__all__ = ("backend_for", "descriptors", "list_models")
+__all__ = ("frameworks", "models_for", "plugin_for", "plugins")

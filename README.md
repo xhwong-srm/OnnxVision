@@ -7,7 +7,8 @@ from classification and rectangular detection to segmentation and other vision
 tasks without coupling the core services to a particular interface.
 
 ```powershell
-uv run vision-workflows model list
+uv run vision-workflows framework list
+uv run vision-workflows model list --task classification --framework ultralytics
 uv run vision-workflows dataset --help
 uv run vision-workflows train --help
 uv run vision-workflows export --help
@@ -30,20 +31,37 @@ result = DatasetService().convert(ConvertDatasetRequest(
 print(result.output)
 ```
 
-Model backends are imported lazily. Install only the backend extras needed by
+Framework integrations are imported lazily. Install only the extras needed by
 the host, for example `uv sync --extra test --extra timm`.
+
+Models are selected explicitly by task, framework, and canonical model ID. The
+framework/task plugin resolves that ID to its native checkpoint or architecture:
+
+```powershell
+uv run vision-workflows train --task classification --framework ultralytics `
+  --model yolo26n --data images/seal_pocket_v1 `
+  --output runs/ultralytics/yolo26-cls-n-v1
+```
+
+Operation parameters are generated from the selected plugin. Use all three
+selectors with `--help` to see only the flags accepted by that operation:
+
+```powershell
+uv run vision-workflows train --task classification --framework ultralytics --model yolo26n --help
+uv run vision-workflows model describe --task classification --framework ultralytics --model yolo26n --operation train
+```
 
 Timm classification and detection training support DataLoader and AMP options:
 
 ```powershell
-uv run vision-workflows train --model timm/classification/resnet18 `
+uv run vision-workflows train --task classification --framework timm --model resnet18 `
   --data data --output run --workers 4 --prefetch-factor 2 `
   --persistent-workers --pin-memory --amp --amp-dtype float16
 ```
 
 `prefetch_factor` and `persistent_workers` require a positive `--workers` value.
-The same settings can be supplied through `TrainRequest.options` when using the
-Python API.
+The same settings can be supplied through `TrainRequest.parameters` when using
+the Python API. Unknown parameters are rejected before a run starts.
 
 ONNX exports are self-describing. Classification artifacts use the
 `onnx-vision-classification` contract, while object-detection artifacts use

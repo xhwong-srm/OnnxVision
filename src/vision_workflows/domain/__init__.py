@@ -24,7 +24,16 @@ from .errors import (
     VisionWorkflowError,
     ValidationFailedError,
 )
-from .models import BackendCapability, BackendDescriptor, ModelRef
+from .models import (
+    DatasetRequirement,
+    ModelInfo,
+    ModelSelection,
+    Operation,
+    ParameterOrigin,
+    ParameterSchema,
+    ParameterSpec,
+    ProviderDescriptor,
+)
 from .results import (
     ArtifactRef,
     ConversionResult,
@@ -41,8 +50,6 @@ from .results import (
 __all__ = (
     "ArtifactError",
     "ArtifactRef",
-    "BackendCapability",
-    "BackendDescriptor",
     "BackendUnavailableError",
     "BalanceMode",
     "BoundingBox",
@@ -62,7 +69,14 @@ __all__ = (
     "ImageRef",
     "MaterializationMode",
     "MergeResult",
-    "ModelRef",
+    "DatasetRequirement",
+    "ModelInfo",
+    "ModelSelection",
+    "Operation",
+    "ParameterOrigin",
+    "ParameterSchema",
+    "ParameterSpec",
+    "ProviderDescriptor",
     "RunManifest",
     "RunStatus",
     "VisionWorkflowError",

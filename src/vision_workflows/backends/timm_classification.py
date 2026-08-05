@@ -8,12 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..domain.models import BackendCapability, BackendDescriptor
 from ..domain.results import ArtifactRef
 from ..workflows.context import WorkflowContext, optional_import
-from ..workflows.requests import ExportRequest, TestRequest, TrainRequest, ValidateRequest
+from ..workflows.requests import ResolvedExportRequest, ResolvedTestRequest, ResolvedTrainRequest, ResolvedValidateRequest
 from ..workflows.runs import artifact
-from .base import BackendExecution, ModelBackend
+from .base import BackendExecution
 from .common import classification_contract, metadata_for_contract, require_file, set_onnx_metadata, validate_onnx
 from .timm_training import (
     TimmTrainingOptions,
@@ -55,11 +54,7 @@ class Execution(BackendExecution):
         object.__setattr__(self, "contract", self.contract or {})
 
 
-class TimmClassificationBackend(ModelBackend):
-    descriptor = BackendDescriptor(
-        "timm", "classification", "classification", ("*",),
-        frozenset(BackendCapability), "timm image-folder classifier", "timm",
-    )
+class TimmClassificationBackend:
 
     @staticmethod
     def _imports():
@@ -100,7 +95,7 @@ class TimmClassificationBackend(ModelBackend):
         except (AttributeError, KeyError, TypeError):
             return dict(getattr(model, "pretrained_cfg", {}) or getattr(model, "default_cfg", {}) or {})
 
-    def train(self, request: TrainRequest, context: WorkflowContext) -> BackendExecution:
+    def train(self, request: ResolvedTrainRequest, context: WorkflowContext) -> BackendExecution:
         started = time.perf_counter()
         logger.info(
             "Training parameters: model=%s data=%s output=%s device=%s epochs=%d batch=%d image_size=%s learning_rate=%g workers=%d seed=%d pretrained=%s resume=%s patience=%d deterministic=%s weights=%s options=%s",
@@ -279,7 +274,7 @@ class TimmClassificationBackend(ModelBackend):
         model.eval()
         return model, classes, value
 
-    def export(self, request: ExportRequest, context: WorkflowContext) -> BackendExecution:
+    def export(self, request: ResolvedExportRequest, context: WorkflowContext) -> BackendExecution:
         _, torch, _ = self._imports()
         model, classes, value = self._load(request.checkpoint, request.device)
         size = int(request.image_size or value.get("data_config", {}).get("input_size", [3, 224, 224])[-1])
@@ -293,11 +288,13 @@ class TimmClassificationBackend(ModelBackend):
         checks = validate_onnx(output, contract)
         return Execution((artifact(output, "onnx"),), {}, contract, checks)
 
-    def _evaluate(self, request: ValidateRequest | TestRequest):
+    def _evaluate(self, request: ResolvedValidateRequest | ResolvedTestRequest):
         _, torch, _ = self._imports()
         model, classes, value = self._load(request.target, request.device)
         data = request.data
         split = request.split
+        if data is None:
+            raise ValueError("evaluation requires a classification dataset")
         _, _, torchvision = self._imports()
         data_config = value.get("data_config", {})
         transform_ops = torchvision.transforms.Compose([
@@ -316,12 +313,12 @@ class TimmClassificationBackend(ModelBackend):
                 total += len(labels)
         return {"accuracy": correct / max(1, total), "images": total}
 
-    def validate(self, request: ValidateRequest, context: WorkflowContext) -> BackendExecution:
+    def validate(self, request: ResolvedValidateRequest, context: WorkflowContext) -> BackendExecution:
         if request.target.suffix.casefold() == ".onnx":
             contract = classification_contract([])
             return Execution((artifact(require_file(request.target, "ONNX artifact"), "onnx"),), {}, contract, validate_onnx(request.target, contract))
         metrics = self._evaluate(request) if request.data else {}
         return Execution((artifact(require_file(request.target, "checkpoint"), "checkpoint"),), metrics, {}, (({"name": "native_validation", "status": "passed"}),))
 
-    def test(self, request: TestRequest, context: WorkflowContext) -> BackendExecution:
+    def test(self, request: ResolvedTestRequest, context: WorkflowContext) -> BackendExecution:
         return Execution((artifact(require_file(request.target, "checkpoint"), "checkpoint"),), self._evaluate(request), {}, ())
