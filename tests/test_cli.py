@@ -26,3 +26,16 @@ def test_cli_uses_model_image_size_when_training_size_is_omitted() -> None:
     ])
     assert args.image_size is None
     assert args.workers == 4
+
+
+def test_cli_exposes_timm_loader_and_amp_options() -> None:
+    args = build_parser().parse_args([
+        "train", "--model", "timm/classification/resnet18", "--data", "data", "--output", "run",
+        "--workers", "4", "--prefetch-factor", "3", "--persistent-workers", "--pin-memory",
+        "--amp", "--amp-dtype", "bfloat16",
+    ])
+    assert args.prefetch_factor == 3
+    assert args.persistent_workers is True
+    assert args.pin_memory is True
+    assert args.amp is True
+    assert args.amp_dtype == "bfloat16"

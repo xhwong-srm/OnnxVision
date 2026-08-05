@@ -17,6 +17,7 @@ from ..workflows.requests import ExportRequest, TestRequest, TrainRequest, Valid
 from ..workflows.runs import artifact
 from .base import BackendExecution, ModelBackend
 from .common import classification_contract, metadata_for_contract, require_file, set_onnx_metadata, validate_onnx
+from .timm_training import TimmTrainingOptions
 
 
 logger = logging.getLogger(__name__)
@@ -198,13 +199,16 @@ class TimmClassificationBackend(ModelBackend):
         model.to(device)
         requested_workers = max(0, request.workers)
         workers = requested_workers
+        training_options = TimmTrainingOptions.from_mapping(request.options)
         loader_generator = torch.Generator().manual_seed(request.seed)
         worker_init_fn = _worker_seed if workers > 0 else None
-        loader = torch.utils.data.DataLoader(train_set, batch_size=request.batch, shuffle=True, num_workers=workers, generator=loader_generator, worker_init_fn=worker_init_fn)
-        val_loader = torch.utils.data.DataLoader(val_set, batch_size=request.batch, shuffle=False, num_workers=workers, worker_init_fn=worker_init_fn)
+        loader_options = training_options.data_loader_kwargs(workers)
+        loader = torch.utils.data.DataLoader(train_set, batch_size=request.batch, shuffle=True, generator=loader_generator, worker_init_fn=worker_init_fn, **loader_options)
+        val_loader = torch.utils.data.DataLoader(val_set, batch_size=request.batch, shuffle=False, worker_init_fn=worker_init_fn, **loader_options)
         logger.info("DataLoaders ready: batch=%d requested_workers=%d effective_workers=%d", request.batch, requested_workers, workers)
         optimizer = torch.optim.AdamW(model.parameters(), lr=request.learning_rate)
         criterion = torch.nn.CrossEntropyLoss()
+        scaler = training_options.grad_scaler(torch, device)
         start_epoch = 1
         best_accuracy = -1.0
         best_epoch = 0
@@ -242,11 +246,12 @@ class TimmClassificationBackend(ModelBackend):
             train_loss = 0.0
             with tqdm(loader, desc=f"Epoch {epoch}/{request.epochs} train", unit="batch", leave=False) as progress:
                 for images, labels in progress:
-                    images, labels = images.to(device), labels.to(device)
+                    images = images.to(device, non_blocking=training_options.pin_memory)
+                    labels = labels.to(device, non_blocking=training_options.pin_memory)
                     optimizer.zero_grad(set_to_none=True)
-                    loss = criterion(model(images), labels)
-                    loss.backward()
-                    optimizer.step()
+                    with training_options.autocast(torch, device):
+                        loss = criterion(model(images), labels)
+                    training_options.backward_step(loss, optimizer, scaler)
                     train_loss += float(loss.detach().cpu())
                     progress.set_postfix(loss=f"{train_loss / max(1, progress.n):.4f}")
             model.eval()
@@ -254,7 +259,8 @@ class TimmClassificationBackend(ModelBackend):
             with torch.inference_mode():
                 with tqdm(val_loader, desc=f"Epoch {epoch}/{request.epochs} val", unit="batch", leave=False) as progress:
                     for images, labels in progress:
-                        predictions = model(images.to(device)).argmax(1).cpu()
+                        with training_options.autocast(torch, device):
+                            predictions = model(images.to(device, non_blocking=training_options.pin_memory)).argmax(1).cpu()
                         correct += int((predictions == labels).sum())
                         total += len(labels)
             accuracy = correct / max(1, total)

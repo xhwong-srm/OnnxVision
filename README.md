@@ -33,6 +33,18 @@ print(result.output)
 Model backends are imported lazily. Install only the backend extras needed by
 the host, for example `uv sync --extra test --extra timm`.
 
+Timm classification and detection training support DataLoader and AMP options:
+
+```powershell
+uv run vision-workflows train --model timm/classification/resnet18 `
+  --data data --output run --workers 4 --prefetch-factor 2 `
+  --persistent-workers --pin-memory --amp --amp-dtype float16
+```
+
+`prefetch_factor` and `persistent_workers` require a positive `--workers` value.
+The same settings can be supplied through `TrainRequest.options` when using the
+Python API.
+
 ONNX exports are self-describing. Classification artifacts use the
 `onnx-vision-classification` contract, while object-detection artifacts use
 `onnx-vision-object-detection`. Each artifact embeds `vision_task`,

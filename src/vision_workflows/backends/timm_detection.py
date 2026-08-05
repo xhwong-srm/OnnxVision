@@ -15,6 +15,7 @@ from ..workflows.requests import ExportRequest, TestRequest, TrainRequest, Valid
 from ..workflows.runs import artifact
 from .base import BackendExecution, ModelBackend
 from .common import detection_contract, metadata_for_contract, require_file, set_onnx_metadata, validate_onnx
+from .timm_training import TimmTrainingOptions
 
 
 @dataclass(frozen=True)
@@ -129,34 +130,38 @@ class TimmDetectionBackend(ModelBackend):
         device = torch.device("cuda" if request.device == "auto" and torch.cuda.is_available() else request.device if request.device != "auto" else "cpu")
         model = _model_class(torch, timm, len(dataset.classes), variant, queries, request.pretrained)()
         model.to(device)
-        loader = torch.utils.data.DataLoader(train_set, request.batch, shuffle=True, collate_fn=_collate, num_workers=max(0, request.workers))
-        val_loader = torch.utils.data.DataLoader(val_set, request.batch, shuffle=False, collate_fn=_collate, num_workers=max(0, request.workers))
+        workers = max(0, request.workers)
+        training_options = TimmTrainingOptions.from_mapping(request.options)
+        loader_options = training_options.data_loader_kwargs(workers)
+        loader = torch.utils.data.DataLoader(train_set, request.batch, shuffle=True, collate_fn=_collate, **loader_options)
+        val_loader = torch.utils.data.DataLoader(val_set, request.batch, shuffle=False, collate_fn=_collate, **loader_options)
         optimizer = torch.optim.AdamW(model.parameters(), lr=request.learning_rate)
         criterion = torch.nn.CrossEntropyLoss()
+        scaler = training_options.grad_scaler(torch, device)
         best = -1.0
         history = []
         for epoch in range(1, request.epochs + 1):
             model.train()
             loss_total = 0.0
             for images, boxes, labels in loader:
-                images = images.to(device)
-                logits, predicted_boxes = model(images)
-                target_classes = torch.full(logits.shape[:2], len(dataset.classes), dtype=torch.long, device=device)
-                target_boxes = torch.zeros_like(predicted_boxes)
-                for index, (sample_boxes, sample_labels) in enumerate(zip(boxes, labels)):
-                    count = min(queries, len(sample_labels))
-                    if count:
-                        target_classes[index, :count] = sample_labels[:count].to(device)
-                        target_boxes[index, :count] = sample_boxes[:count].to(device)
-                loss = criterion(logits.reshape(-1, logits.shape[-1]), target_classes.reshape(-1))
-                positive = target_classes != len(dataset.classes)
-                if positive.any():
-                    loss = loss + torch.nn.functional.l1_loss(predicted_boxes[positive], target_boxes[positive])
+                images = images.to(device, non_blocking=training_options.pin_memory)
+                with training_options.autocast(torch, device):
+                    logits, predicted_boxes = model(images)
+                    target_classes = torch.full(logits.shape[:2], len(dataset.classes), dtype=torch.long, device=device)
+                    target_boxes = torch.zeros_like(predicted_boxes)
+                    for index, (sample_boxes, sample_labels) in enumerate(zip(boxes, labels)):
+                        count = min(queries, len(sample_labels))
+                        if count:
+                            target_classes[index, :count] = sample_labels[:count].to(device, non_blocking=training_options.pin_memory)
+                            target_boxes[index, :count] = sample_boxes[:count].to(device, non_blocking=training_options.pin_memory)
+                    loss = criterion(logits.reshape(-1, logits.shape[-1]), target_classes.reshape(-1))
+                    positive = target_classes != len(dataset.classes)
+                    if positive.any():
+                        loss = loss + torch.nn.functional.l1_loss(predicted_boxes[positive], target_boxes[positive])
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+                training_options.backward_step(loss, optimizer, scaler)
                 loss_total += float(loss.detach().cpu())
-            metrics = self._evaluate(model, val_loader, device, len(dataset.classes))
+            metrics = self._evaluate(model, val_loader, device, len(dataset.classes), training_options)
             row = {"epoch": epoch, "loss": loss_total / max(1, len(loader)), **metrics}
             history.append(row)
             payload = {"task": "detection", "architecture": "query", "model_name": variant, "classes": list(dataset.classes), "num_queries": queries, "image_size": image_size, "model_state_dict": model.state_dict(), "metrics": row}
@@ -177,13 +182,15 @@ class TimmDetectionBackend(ModelBackend):
         return model, classes, checkpoint
 
     @staticmethod
-    def _evaluate(model, loader, device, class_count):
+    def _evaluate(model, loader, device, class_count, training_options=None):
         torch = __import__("torch")
+        training_options = training_options or TimmTrainingOptions()
         model.eval()
         scores = []
         with torch.inference_mode():
             for images, _, _ in loader:
-                logits, _ = model(images.to(device))
+                with training_options.autocast(torch, device):
+                    logits, _ = model(images.to(device, non_blocking=training_options.pin_memory))
                 scores.extend(torch.softmax(logits, -1)[..., :class_count].max(-1).values.mean(-1).cpu().tolist())
         return {"images": len(scores), "mean_score": sum(scores) / max(1, len(scores))}
 
