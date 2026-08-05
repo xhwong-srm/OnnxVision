@@ -30,6 +30,19 @@ _DEFAULT_MEAN = (0.485, 0.456, 0.406)
 _DEFAULT_STD = (0.229, 0.224, 0.225)
 
 
+def _positive_int_option(options: dict[str, Any], name: str, default: int) -> int:
+    value = options.get(name, default)
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer")
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a positive integer") from error
+    if result <= 0 or str(value).strip() != str(result):
+        raise ValueError(f"{name} must be a positive integer")
+    return result
+
+
 @dataclass(frozen=True)
 class Execution(BackendExecution):
     artifacts: tuple[ArtifactRef, ...] = ()
@@ -143,18 +156,10 @@ class TimmClassificationBackend(ModelBackend):
         loader_generator = torch.Generator().manual_seed(request.seed)
         worker_init_fn = worker_seed if workers > 0 else None
         loader_options = training_options.data_loader_kwargs(workers)
-        eval_batch = request.options.get("eval_batch", request.batch)
-        if isinstance(eval_batch, bool):
-            raise ValueError("eval_batch must be a positive integer")
-        try:
-            eval_batch = int(eval_batch)
-        except (TypeError, ValueError) as error:
-            raise ValueError("eval_batch must be a positive integer") from error
-        if eval_batch <= 0:
-            raise ValueError("eval_batch must be a positive integer")
+        validation_interval = _positive_int_option(dict(request.options), "validate_every", 1)
         loader = torch.utils.data.DataLoader(train_set, batch_size=request.batch, shuffle=True, generator=loader_generator, worker_init_fn=worker_init_fn, **loader_options)
-        val_loader = torch.utils.data.DataLoader(val_set, batch_size=eval_batch, shuffle=False, worker_init_fn=worker_init_fn, **loader_options)
-        logger.info("DataLoaders ready: batch=%d eval_batch=%d requested_workers=%d effective_workers=%d", request.batch, eval_batch, requested_workers, workers)
+        val_loader = torch.utils.data.DataLoader(val_set, batch_size=request.batch, shuffle=False, worker_init_fn=worker_init_fn, **loader_options)
+        logger.info("DataLoaders ready: batch=%d requested_workers=%d effective_workers=%d validate_every=%d", request.batch, requested_workers, workers, validation_interval)
         optimizer = torch.optim.AdamW(model.parameters(), lr=request.learning_rate)
         criterion = torch.nn.CrossEntropyLoss()
         scaler = training_options.grad_scaler(torch, device)
@@ -206,25 +211,29 @@ class TimmClassificationBackend(ModelBackend):
                     train_loss_total.add_(loss.detach().float())
             train_loss = float(train_loss_total.cpu()) / max(1, len(loader))
             model.eval()
-            correct = torch.zeros((), device=device, dtype=torch.int64)
-            total = torch.zeros((), device=device, dtype=torch.int64)
-            with torch.inference_mode():
-                with tqdm(val_loader, desc=f"Epoch {epoch}/{request.epochs} val", unit="batch", leave=False) as progress:
-                    for images, labels in progress:
-                        with training_options.autocast(torch, device):
-                            predictions = model(images.to(device, non_blocking=training_options.pin_memory)).argmax(1)
-                        labels = labels.to(device, non_blocking=training_options.pin_memory)
-                        correct.add_((predictions == labels).sum())
-                        total.add_(labels.numel())
-            accuracy = correct.float().div(total.clamp_min(1)).item()
-            row = {"epoch": epoch, "train_loss": train_loss, "val_accuracy": accuracy}
+            validate = epoch == start_epoch or epoch == request.epochs or (epoch - start_epoch) % validation_interval == 0
+            if validate:
+                correct = torch.zeros((), device=device, dtype=torch.int64)
+                total = torch.zeros((), device=device, dtype=torch.int64)
+                with torch.inference_mode():
+                    with tqdm(val_loader, desc=f"Epoch {epoch}/{request.epochs} val", unit="batch", leave=False) as progress:
+                        for images, labels in progress:
+                            with training_options.autocast(torch, device):
+                                predictions = model(images.to(device, non_blocking=training_options.pin_memory)).argmax(1)
+                            labels = labels.to(device, non_blocking=training_options.pin_memory)
+                            correct.add_((predictions == labels).sum())
+                            total.add_(labels.numel())
+                accuracy = correct.float().div(total.clamp_min(1)).item()
+            else:
+                accuracy = best_accuracy
+            row = {"epoch": epoch, "train_loss": train_loss, "val_accuracy": accuracy, "validated": validate}
             history.append(row)
-            improved = accuracy > best_accuracy
+            improved = validate and accuracy > best_accuracy
             if improved:
                 best_accuracy = accuracy
                 best_epoch = epoch
                 stale_epochs = 0
-            else:
+            elif validate:
                 stale_epochs += 1
             payload = {
                 "task": "classification", "model_name": request.model.variant, "classes": train_set.classes,
