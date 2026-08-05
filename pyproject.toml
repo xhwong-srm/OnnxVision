@@ -41,6 +41,10 @@ gui = [
     "opencv-python>=4.12",
     "pyside6>=6.8",
 ]
+gpu = [
+    "triton-windows>=3.7.1.post27",
+    "xformers>=0.0.35",
+]
 
 [project.scripts]
 vision-workflows = "vision_workflows.cli.app:main"
