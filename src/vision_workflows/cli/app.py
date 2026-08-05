@@ -109,6 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--output", type=_path, required=True)
     train.add_argument("--epochs", type=int, default=100)
     train.add_argument("--batch", type=int, default=16)
+    train.add_argument("--eval-batch", type=int, help="validation batch size; defaults to --batch")
     train.add_argument("--image-size", type=int, help="override the model's suggested training image size")
     train.add_argument("--learning-rate", type=float, default=1e-3)
     train.add_argument("--workers", "--worker", dest="workers", type=int, default=-1)
@@ -181,7 +182,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "train":
         options = {"allow_experimental": True} if args.allow_experimental else {}
-        for name in ("prefetch_factor", "persistent_workers", "pin_memory", "amp", "amp_dtype"):
+        for name in ("eval_batch", "prefetch_factor", "persistent_workers", "pin_memory", "amp", "amp_dtype"):
             value = getattr(args, name)
             if value is not None:
                 options[name] = value

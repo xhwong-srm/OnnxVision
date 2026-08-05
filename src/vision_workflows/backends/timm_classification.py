@@ -143,9 +143,18 @@ class TimmClassificationBackend(ModelBackend):
         loader_generator = torch.Generator().manual_seed(request.seed)
         worker_init_fn = worker_seed if workers > 0 else None
         loader_options = training_options.data_loader_kwargs(workers)
+        eval_batch = request.options.get("eval_batch", request.batch)
+        if isinstance(eval_batch, bool):
+            raise ValueError("eval_batch must be a positive integer")
+        try:
+            eval_batch = int(eval_batch)
+        except (TypeError, ValueError) as error:
+            raise ValueError("eval_batch must be a positive integer") from error
+        if eval_batch <= 0:
+            raise ValueError("eval_batch must be a positive integer")
         loader = torch.utils.data.DataLoader(train_set, batch_size=request.batch, shuffle=True, generator=loader_generator, worker_init_fn=worker_init_fn, **loader_options)
-        val_loader = torch.utils.data.DataLoader(val_set, batch_size=request.batch, shuffle=False, worker_init_fn=worker_init_fn, **loader_options)
-        logger.info("DataLoaders ready: batch=%d requested_workers=%d effective_workers=%d", request.batch, requested_workers, workers)
+        val_loader = torch.utils.data.DataLoader(val_set, batch_size=eval_batch, shuffle=False, worker_init_fn=worker_init_fn, **loader_options)
+        logger.info("DataLoaders ready: batch=%d eval_batch=%d requested_workers=%d effective_workers=%d", request.batch, eval_batch, requested_workers, workers)
         optimizer = torch.optim.AdamW(model.parameters(), lr=request.learning_rate)
         criterion = torch.nn.CrossEntropyLoss()
         scaler = training_options.grad_scaler(torch, device)
