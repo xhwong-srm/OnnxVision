@@ -191,10 +191,16 @@ class TimmClassificationBackend(ModelBackend):
             if scaler is not None and resume_state.get("scaler_state_dict") is not None:
                 scaler.load_state_dict(resume_state["scaler_state_dict"])
             logger.info("Resume state: start_epoch=%d best_epoch=%d best_val_accuracy=%.4f stale_epochs=%d", start_epoch, best_epoch, best_accuracy, stale_epochs)
+        training_model = model
+        if training_options.compile:
+            if device.type != "cuda":
+                raise ValueError("compile requires a CUDA device")
+            logger.info("Compiling timm classification model")
+            training_model = torch.compile(model)
         for epoch in range(start_epoch, request.epochs + 1):
             epoch_started = time.perf_counter()
             logger.info("Epoch %d/%d started", epoch, request.epochs)
-            model.train()
+            training_model.train()
             if request.batch == 1:
                 for layer in model.modules():
                     if isinstance(layer, torch.nn.modules.batchnorm._BatchNorm):
@@ -206,11 +212,11 @@ class TimmClassificationBackend(ModelBackend):
                     labels = labels.to(device, non_blocking=training_options.pin_memory)
                     optimizer.zero_grad(set_to_none=True)
                     with training_options.autocast(torch, device):
-                        loss = criterion(model(images), labels)
+                        loss = criterion(training_model(images), labels)
                     training_options.backward_step(loss, optimizer, scaler)
                     train_loss_total.add_(loss.detach().float())
             train_loss = float(train_loss_total.cpu()) / max(1, len(loader))
-            model.eval()
+            training_model.eval()
             validate = epoch == start_epoch or epoch == request.epochs or (epoch - start_epoch) % validation_interval == 0
             if validate:
                 correct = torch.zeros((), device=device, dtype=torch.int64)
@@ -219,7 +225,7 @@ class TimmClassificationBackend(ModelBackend):
                     with tqdm(val_loader, desc=f"Epoch {epoch}/{request.epochs} val", unit="batch", leave=False) as progress:
                         for images, labels in progress:
                             with training_options.autocast(torch, device):
-                                predictions = model(images.to(device, non_blocking=training_options.pin_memory)).argmax(1)
+                                predictions = training_model(images.to(device, non_blocking=training_options.pin_memory)).argmax(1)
                             labels = labels.to(device, non_blocking=training_options.pin_memory)
                             correct.add_((predictions == labels).sum())
                             total.add_(labels.numel())

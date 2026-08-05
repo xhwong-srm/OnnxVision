@@ -127,6 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=None)
     train.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
     train.add_argument("--amp-dtype", choices=("float16", "bfloat16"))
+    train.add_argument("--compile", action=argparse.BooleanOptionalAction, default=None)
 
     export = commands.add_parser("export")
     export.add_argument("--model", type=_model, required=True)
@@ -183,7 +184,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "train":
         options = {"allow_experimental": True} if args.allow_experimental else {}
         options["validate_every"] = args.validate_every
-        for name in ("prefetch_factor", "persistent_workers", "pin_memory", "amp", "amp_dtype"):
+        for name in ("prefetch_factor", "persistent_workers", "pin_memory", "amp", "amp_dtype", "compile"):
             value = getattr(args, name)
             if value is not None:
                 options[name] = value

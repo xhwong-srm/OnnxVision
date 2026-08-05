@@ -123,6 +123,7 @@ class TimmTrainingOptions:
     pin_memory: bool = False
     amp: bool = False
     amp_dtype: str | None = None
+    compile: bool = False
 
     @classmethod
     def from_mapping(cls, options: Mapping[str, Any]) -> TimmTrainingOptions:
@@ -132,6 +133,7 @@ class TimmTrainingOptions:
             pin_memory=_bool_option(options, "pin_memory", False),
             amp=_bool_option(options, "amp", False),
             amp_dtype=_amp_dtype(options),
+            compile=_bool_option(options, "compile", False),
         )
 
     def data_loader_kwargs(self, workers: int) -> dict[str, Any]:
