@@ -13,6 +13,7 @@ def test_cli_has_separate_dataset_and_workflow_commands() -> None:
 def test_cli_exposes_explicit_experimental_training_opt_in() -> None:
     args = build_parser().parse_args([
         "train", "--model", "libreyolo/picodet/s", "--data", "data.yaml", "--output", "run",
-        "--allow-experimental",
+        "--allow-experimental", "--overwrite",
     ])
     assert args.allow_experimental is True
+    assert args.overwrite is True

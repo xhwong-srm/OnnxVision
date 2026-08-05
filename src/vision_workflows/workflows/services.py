@@ -20,7 +20,7 @@ class TrainService:
         backend = backend_for(request.model)
         config = _request_config(request)
         store = RunStore(request.output.parent)
-        context, run_id = store.start("train", config, device=request.device, run_dir=request.output)
+        context, run_id = store.start("train", config, device=request.device, run_dir=request.output, overwrite=request.overwrite)
         try:
             execution = backend.train(request, context)
         except Exception as error:

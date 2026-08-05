@@ -24,6 +24,7 @@ class TrainRequest:
     resume: bool = False
     pretrained: bool = True
     deterministic: bool = True
+    overwrite: bool = False
     options: Mapping[str, Any] = field(default_factory=dict)
 
 

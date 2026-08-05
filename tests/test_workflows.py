@@ -102,3 +102,23 @@ def test_run_store_creates_unique_immutable_run_directories(tmp_path: Path) -> N
     assert first.run_dir != second.run_dir
     assert first_context.run_dir == first.run_dir
     assert second_context.run_dir == second.run_dir
+
+
+def test_run_store_overwrite_removes_existing_requested_run_directory(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "old-artifact.pt").write_bytes(b"old")
+    store = RunStore(tmp_path / "runs")
+
+    context, run_id = store.start("train", {}, run_dir=run_dir, overwrite=True)
+
+    assert context.run_dir == run_dir.resolve()
+    assert not (run_dir / "old-artifact.pt").exists()
+    assert (run_dir / "manifest.json").is_file()
+
+
+def test_run_store_refuses_overwriting_current_directory(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "runs")
+
+    with pytest.raises(ValueError, match="current directory"):
+        store.start("train", {}, run_dir=Path.cwd(), overwrite=True)
