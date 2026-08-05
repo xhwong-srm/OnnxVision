@@ -119,7 +119,8 @@ class TimmCatalog:
         return tuple(ModelInfo(name, name) for name in timm.list_models(filter=query))
 
     def resolve(self, model: str) -> ModelInfo:
-        if model not in {item.id for item in self.list(model)}:
+        timm = optional_import("timm")
+        if model not in {item.id for item in self.list(model)} and model not in timm.list_models(filter=model, pretrained=True):
             raise ConfigurationError(f"unknown timm model: {model}")
         return ModelInfo(model, model)
 

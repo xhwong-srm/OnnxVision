@@ -55,3 +55,13 @@ def test_cli_exposes_timm_loader_and_amp_options() -> None:
     assert args.pin_memory is True
     assert args.amp is True
     assert args.amp_dtype == "bfloat16"
+
+
+def test_cli_accepts_timm_pretrained_configuration_name() -> None:
+    model = "mobilenetv4_conv_small_050.e3000_r224_in1k"
+    argv = [
+        "train", "--task", "classification", "--framework", "timm",
+        "--model", model, "--data", "data", "--output", "run",
+    ]
+    args = _parse(argv)
+    assert args.model == model
