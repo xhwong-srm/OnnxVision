@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from vision_workflows.backends.base import BackendExecution, ModelBackend
+from vision_workflows.backends.libreyolo import LibreYoloBackend
 from vision_workflows.backends.registry import descriptors
 from vision_workflows.domain.models import BackendCapability, BackendDescriptor, ModelRef
 from vision_workflows.domain.results import ArtifactRef, RunStatus
@@ -35,6 +36,29 @@ def test_model_ref_requires_three_components() -> None:
 def test_optional_import_does_not_eagerly_load_optional_exports() -> None:
     libreyolo = optional_import("libreyolo")
     assert libreyolo.LibrePICODET is not None
+
+
+def test_libreyolo_training_clamps_auto_worker_sentinel(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeModel:
+        def train(self, **options):
+            captured.update(options)
+            return {}
+
+    class FakeModule:
+        LibrePICODET = lambda *args, **kwargs: FakeModel()
+
+    import vision_workflows.backends.libreyolo as backend_module
+    monkeypatch.setattr(backend_module, "optional_import", lambda _: FakeModule())
+    data = tmp_path / "data.yaml"
+    data.write_text("names: [seal]\n", encoding="utf-8")
+    request = TrainRequest(ModelRef("libreyolo", "picodet", "s"), data, tmp_path / "run", workers=-1)
+    context = type("Context", (), {"run_dir": tmp_path / "run"})()
+
+    LibreYoloBackend("picodet", ("s",)).train(request, context)
+
+    assert captured["workers"] == 0
 
 
 def test_train_service_writes_typed_run_manifest(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

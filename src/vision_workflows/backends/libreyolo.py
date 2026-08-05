@@ -58,7 +58,7 @@ class LibreYoloBackend(ModelBackend):
     def train(self, request: TrainRequest, context: WorkflowContext) -> BackendExecution:
         data = require_file(request.data, "YOLO dataset YAML")
         model = self._model(request)
-        options: dict[str, Any] = {"data": str(data), "epochs": request.epochs, "batch": request.batch, "imgsz": request.image_size, "lr0": request.learning_rate, "device": request.device, "workers": request.workers, "seed": request.seed, "project": str(context.run_dir.parent), "name": context.run_dir.name, "exist_ok": True, "resume": request.resume, "pretrained": request.pretrained}
+        options: dict[str, Any] = {"data": str(data), "epochs": request.epochs, "batch": request.batch, "imgsz": request.image_size, "lr0": request.learning_rate, "device": request.device, "workers": max(0, request.workers), "seed": request.seed, "project": str(context.run_dir.parent), "name": context.run_dir.name, "exist_ok": True, "resume": request.resume, "pretrained": request.pretrained}
         options.update(request.options)
         results = model.train(**options)
         best = Path(results.get("best_checkpoint", context.run_dir / "weights" / "best.pt"))
