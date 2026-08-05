@@ -13,6 +13,7 @@ _BACKENDS: tuple[ModelBackend, ...] = (
     TimmClassificationBackend(),
     TimmDetectionBackend(),
     UltralyticsBackend(),
+    UltralyticsBackend("classification"),
     LibreYoloBackend("yolov9", ("t", "s", "m", "c")),
     LibreYoloBackend("picodet", ("s", "m", "l")),
 )

@@ -7,6 +7,7 @@ import pytest
 from vision_workflows.backends.base import BackendExecution, ModelBackend
 from vision_workflows.backends.libreyolo import LibreYoloBackend
 from vision_workflows.backends.registry import descriptors
+from vision_workflows.backends.ultralytics import UltralyticsBackend
 from vision_workflows.domain.models import BackendCapability, BackendDescriptor, ModelRef
 from vision_workflows.domain.results import ArtifactRef, RunStatus
 from vision_workflows.workflows.requests import TrainRequest
@@ -21,6 +22,7 @@ def test_registry_exposes_all_active_backend_families() -> None:
         ("timm", "classification"),
         ("timm", "detection"),
         ("ultralytics", "yolo26"),
+        ("ultralytics", "yolo26-cls"),
         ("libreyolo", "yolov9"),
         ("libreyolo", "picodet"),
     }
@@ -59,6 +61,45 @@ def test_libreyolo_training_clamps_auto_worker_sentinel(monkeypatch: pytest.Monk
     LibreYoloBackend("picodet", ("s",)).train(request, context)
 
     assert captured["workers"] == 0
+
+
+def test_ultralytics_classification_training_uses_image_folder_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+    events: list[tuple[str, dict[str, object]]] = []
+
+    class FakeModel:
+        def __init__(self, checkpoint: str):
+            captured["checkpoint"] = checkpoint
+
+        def train(self, **options):
+            captured.update(options)
+            weights = Path(options["project"]) / options["name"] / "weights"
+            weights.mkdir(parents=True)
+            (weights / "best.pt").write_bytes(b"best")
+            (weights / "last.pt").write_bytes(b"last")
+
+    class FakeModule:
+        YOLO = FakeModel
+
+    import vision_workflows.backends.ultralytics as backend_module
+    monkeypatch.setattr(backend_module, "optional_import", lambda _: FakeModule())
+    data = tmp_path / "classification"
+    (data / "train" / "seal").mkdir(parents=True)
+    (data / "val" / "seal").mkdir(parents=True)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    context = type("Context", (), {"run_dir": run_dir, "emit": lambda _, name, value: events.append((name, value))})()
+    request = TrainRequest(ModelRef("ultralytics", "yolo26-cls", "n"), data, run_dir, workers=2)
+
+    result = UltralyticsBackend("classification").train(request, context)
+
+    assert captured["checkpoint"] == "yolo26n-cls.pt"
+    assert captured["data"] == str(data.resolve())
+    assert captured["imgsz"] == 224
+    assert captured["workers"] == 2
+    assert "device" not in captured
+    assert {item.name for item in result.artifacts} == {"best.pt", "last.pt"}
+    assert events == [("backend_train_started", {"backend": "ultralytics/yolo26-cls", "task": "classification", "data": str(data.resolve())})]
 
 
 def test_train_service_writes_typed_run_manifest(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
