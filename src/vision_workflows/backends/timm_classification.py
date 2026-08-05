@@ -185,7 +185,7 @@ class TimmClassificationBackend(ModelBackend):
                 for layer in model.modules():
                     if isinstance(layer, torch.nn.modules.batchnorm._BatchNorm):
                         layer.eval()
-            train_loss = 0.0
+            train_loss_total = torch.zeros((), device=device, dtype=torch.float32)
             with tqdm(loader, desc=f"Epoch {epoch}/{request.epochs} train", unit="batch", leave=False) as progress:
                 for images, labels in progress:
                     images = images.to(device, non_blocking=training_options.pin_memory)
@@ -194,19 +194,21 @@ class TimmClassificationBackend(ModelBackend):
                     with training_options.autocast(torch, device):
                         loss = criterion(model(images), labels)
                     training_options.backward_step(loss, optimizer, scaler)
-                    train_loss += float(loss.detach().cpu())
-                    progress.set_postfix(loss=f"{train_loss / max(1, progress.n):.4f}")
+                    train_loss_total.add_(loss.detach().float())
+            train_loss = float(train_loss_total.cpu()) / max(1, len(loader))
             model.eval()
-            correct = total = 0
+            correct = torch.zeros((), device=device, dtype=torch.int64)
+            total = torch.zeros((), device=device, dtype=torch.int64)
             with torch.inference_mode():
                 with tqdm(val_loader, desc=f"Epoch {epoch}/{request.epochs} val", unit="batch", leave=False) as progress:
                     for images, labels in progress:
                         with training_options.autocast(torch, device):
-                            predictions = model(images.to(device, non_blocking=training_options.pin_memory)).argmax(1).cpu()
-                        correct += int((predictions == labels).sum())
-                        total += len(labels)
-            accuracy = correct / max(1, total)
-            row = {"epoch": epoch, "train_loss": train_loss / max(1, len(loader)), "val_accuracy": accuracy}
+                            predictions = model(images.to(device, non_blocking=training_options.pin_memory)).argmax(1)
+                        labels = labels.to(device, non_blocking=training_options.pin_memory)
+                        correct.add_((predictions == labels).sum())
+                        total.add_(labels.numel())
+            accuracy = correct.float().div(total.clamp_min(1)).item()
+            row = {"epoch": epoch, "train_loss": train_loss, "val_accuracy": accuracy}
             history.append(row)
             improved = accuracy > best_accuracy
             if improved:
