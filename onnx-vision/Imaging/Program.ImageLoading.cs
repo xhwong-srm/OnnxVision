@@ -36,16 +36,17 @@ namespace OnnxVision
         }
 
         private static List<LoadedImageBatch> BuildInferenceBatches(
-            IReadOnlyList<LoadedImage> images, int batchSize)
+            IReadOnlyList<LoadedImage> images, int batchSize, bool padFinalBatch)
         {
             var batches = new List<LoadedImageBatch>();
             for (int offset = 0; offset < images.Count; offset += batchSize)
             {
                 int logicalCount = Math.Min(batchSize, images.Count - offset);
-                var physicalImages = new List<LoadedImage>(batchSize);
+                int physicalCount = padFinalBatch ? batchSize : logicalCount;
+                var physicalImages = new List<LoadedImage>(physicalCount);
                 for (int index = 0; index < logicalCount; index++)
                     physicalImages.Add(images[offset + index]);
-                while (physicalImages.Count < batchSize)
+                while (physicalImages.Count < physicalCount)
                     physicalImages.Add(physicalImages[physicalImages.Count - 1]);
                 batches.Add(new LoadedImageBatch(physicalImages, logicalCount));
             }

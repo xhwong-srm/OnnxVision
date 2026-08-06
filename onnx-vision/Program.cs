@@ -93,7 +93,7 @@ namespace OnnxVision
                 return UsageError(json,
                     "Usage: OnnxVisionCLI.exe <model.onnx> <image-file|image-directory|dataset> " +
                     "[provider] [repeats] [roi-x roi-y roi-width roi-height] " +
-                    "[-dataset] [-validate] [-set train|val|test]");
+                    "[-batch-size N] [-dataset] [-validate] [-set train|val|test]");
             }
 
             ClassificationInput input;
@@ -131,8 +131,15 @@ namespace OnnxVision
                     var samplesByPath = input.Samples.ToDictionary(item => item.Path,
                         StringComparer.OrdinalIgnoreCase);
                     int labeledImageCount = input.Samples.Count(item => item.ExpectedClassName != null);
-                    int physicalBatchSize = classifier.FixedBatchSize ?? 1;
-                    List<LoadedImageBatch> inferenceBatches = BuildInferenceBatches(images, physicalBatchSize);
+                    if (inputOptions.BatchSize.HasValue && classifier.FixedBatchSize.HasValue)
+                    {
+                        return UsageError(json, string.Format(CultureInfo.InvariantCulture,
+                            "-batch-size is only supported for dynamic-batch models; this model requires batch size {0}.",
+                            classifier.FixedBatchSize.Value));
+                    }
+                    int physicalBatchSize = classifier.FixedBatchSize ?? inputOptions.BatchSize ?? 1;
+                    List<LoadedImageBatch> inferenceBatches = BuildInferenceBatches(images, physicalBatchSize,
+                        classifier.FixedBatchSize.HasValue);
                     int warmups = Math.Min(DefaultWarmups, inferenceBatches.Count);
                     long warmupModelCallTicks = 0;
                     for (int index = 0; index < warmups; index++)
@@ -247,6 +254,8 @@ namespace OnnxVision
                             correct, flippedCorrect, flippedTotal, normalCorrect, normalTotal,
                             truePositives, falsePositives, falseNegatives, trueNegatives,
                             rocScores, predictions, errors);
+                        report["batch_size"] = physicalBatchSize;
+                        report["batch_mode"] = classifier.SupportsDynamicBatch ? "dynamic" : "fixed";
                         if (validation != null)
                             report["validation"] = validation.ToReport();
                         PrintJson(report);
@@ -254,6 +263,7 @@ namespace OnnxVision
                     else
                     {
                         PrintClassificationInformation(classifier, imagePaths.Length, roi, providers,
+                            physicalBatchSize,
                             input.IsDataset, input.DatasetFormat, input.DatasetSplit);
                         if (validation != null)
                             PrintClassificationValidation(validation);
@@ -296,7 +306,7 @@ namespace OnnxVision
                 return UsageError(json,
                     "Usage: OnnxVisionCLI.exe <model.onnx> <image-file|image-directory|COCO-dataset> " +
                     "[confidence] [repeats] [provider] [-dataset] [-validate] " +
-                    "[-set train|val|test]");
+                    "[-batch-size N] [-set train|val|test]");
             }
 
             DetectionInput input;
@@ -332,8 +342,15 @@ namespace OnnxVision
                         : null;
                     var samplesByPath = input.Samples.ToDictionary(item => item.Path,
                         StringComparer.OrdinalIgnoreCase);
-                    int physicalBatchSize = detector.FixedBatchSize ?? 1;
-                    List<LoadedImageBatch> inferenceBatches = BuildInferenceBatches(images, physicalBatchSize);
+                    if (inputOptions.BatchSize.HasValue && detector.FixedBatchSize.HasValue)
+                    {
+                        return UsageError(json, string.Format(CultureInfo.InvariantCulture,
+                            "-batch-size is only supported for dynamic-batch models; this model requires batch size {0}.",
+                            detector.FixedBatchSize.Value));
+                    }
+                    int physicalBatchSize = detector.FixedBatchSize ?? inputOptions.BatchSize ?? 1;
+                    List<LoadedImageBatch> inferenceBatches = BuildInferenceBatches(images, physicalBatchSize,
+                        detector.FixedBatchSize.HasValue);
                     int warmups = Math.Min(DefaultWarmups, inferenceBatches.Count);
                     long warmupModelCallTicks = 0;
                     for (int index = 0; index < warmups; index++)
@@ -400,6 +417,8 @@ namespace OnnxVision
                         report["repeats"] = repeats;
                         report["executions"] = executions;
                         report["warmups"] = warmups;
+                        report["batch_size"] = physicalBatchSize;
+                        report["batch_mode"] = detector.SupportsDynamicBatch ? "dynamic" : "fixed";
                         report["detections"] = detectionCount;
                         report["confidence_sum"] = confidenceSum;
                         report["class_counts"] = classCounts;
@@ -413,7 +432,7 @@ namespace OnnxVision
                     }
                     else
                     {
-                        PrintDetectionInformation(detector, providers, input.IsDataset,
+                        PrintDetectionInformation(detector, providers, physicalBatchSize, input.IsDataset,
                             input.DatasetFormat, input.DatasetSplit);
                         if (validation != null)
                             PrintDetectionValidation(validation);

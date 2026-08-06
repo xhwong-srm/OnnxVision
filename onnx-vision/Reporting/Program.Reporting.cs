@@ -157,7 +157,7 @@ namespace OnnxVision
 
         private static void PrintClassificationInformation(
             OnnxClassificationModel classifier, int imageCount,
-            RoiPlacement roi, OnnxExecutionProvider[] providers,
+            RoiPlacement roi, OnnxExecutionProvider[] providers, int batchSize,
             bool isDataset, string datasetFormat, string datasetSplit)
         {
             Console.WriteLine("Provider: {0}", classifier.ActualProvider);
@@ -169,10 +169,12 @@ namespace OnnxVision
                 Console.WriteLine("Dataset: {0}; set: {1}", datasetFormat, datasetSplit);
             Console.WriteLine("Class names: " + string.Join(", ", classifier.ClassNames));
             Console.WriteLine("Input region: " + (roi == null ? "full image" : roi.ToString()));
+            Console.WriteLine("Batch size: {0} ({1})", batchSize,
+                classifier.SupportsDynamicBatch ? "dynamic" : "fixed");
         }
 
         private static void PrintDetectionInformation(
-            OnnxObjectDetectionModel detector, OnnxExecutionProvider[] providers,
+            OnnxObjectDetectionModel detector, OnnxExecutionProvider[] providers, int batchSize,
             bool isDataset, string datasetFormat, string datasetSplit)
         {
             Console.WriteLine("Detection contract: {0} {1}",
@@ -180,6 +182,8 @@ namespace OnnxVision
             Console.WriteLine("Provider: {0}", detector.ActualProvider);
             Console.WriteLine("Requested providers: {0}", FormatProviders(providers));
             Console.WriteLine("Input contract: " + detector.InputDescription);
+            Console.WriteLine("Batch size: {0} ({1})", batchSize,
+                detector.SupportsDynamicBatch ? "dynamic" : "fixed");
             Console.WriteLine("NMS required: {0}", detector.NmsRequired);
             if (isDataset)
                 Console.WriteLine("Dataset: {0}; set: {1}", datasetFormat, datasetSplit);
@@ -327,6 +331,8 @@ namespace OnnxVision
             Console.WriteLine("  OnnxVisionCLI.exe <model.onnx> <image-file|image-directory|dataset> [task options]");
             Console.WriteLine("  Classification options: [provider] [repeats] [roi-x roi-y roi-width roi-height]");
             Console.WriteLine("  Detection options: [confidence] [repeats] [provider]");
+            Console.WriteLine("  Dynamic-batch models: [-batch-size N] (default: 1)");
+            Console.WriteLine("  Fixed-batch models always use the batch size declared by the model.");
             Console.WriteLine("  Dataset options: [-dataset] [-validate] [-set train|val|test] [--json]");
             Console.WriteLine("  ImageNet classification datasets use train/val/test/<class>/image files.");
             Console.WriteLine("  COCO detection datasets use annotations/instances_<set>.json or " +

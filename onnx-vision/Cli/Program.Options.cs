@@ -35,7 +35,7 @@ namespace OnnxVision
                     continue;
                 }
 
-                if (args.Length - index == 4 && TryParseRoi(args, index, out roi))
+                if (args.Length - index >= 4 && TryParseRoi(args, index, out roi))
                 {
                     index += 4;
                     continue;
@@ -118,6 +118,33 @@ namespace OnnxVision
             InputOptions inputOptions)
         {
             string value = args[index];
+            string batchSizeValue;
+            if (TryParseInlineOption(value, "batch-size", out batchSizeValue))
+            {
+                int batchSize;
+                if (inputOptions.BatchSize.HasValue ||
+                    !TryParsePositiveInteger(batchSizeValue, out batchSize))
+                {
+                    return false;
+                }
+                inputOptions.BatchSize = batchSize;
+                index++;
+                return true;
+            }
+
+            if (IsFlag(value, "batch-size"))
+            {
+                int batchSize;
+                if (inputOptions.BatchSize.HasValue || index + 1 >= args.Length ||
+                    !TryParsePositiveInteger(args[index + 1], out batchSize))
+                {
+                    return false;
+                }
+                inputOptions.BatchSize = batchSize;
+                index += 2;
+                return true;
+            }
+
             if (IsFlag(value, "validate"))
             {
                 inputOptions.Validate = true;
@@ -261,6 +288,7 @@ namespace OnnxVision
             public bool Validate { get; set; }
             public bool ForceDataset { get; set; }
             public string Set { get; set; }
+            public int? BatchSize { get; set; }
         }
 
         private sealed class RoiPlacement

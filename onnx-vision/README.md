@@ -82,7 +82,7 @@ Show usage:
 .\onnx-vision\bin\Release\net461\win7-x64\OnnxVisionCLI.exe --help
 ```
 
-The CLI identifies classification versus object detection from the required ONNX metadata contract. Classification models use `onnx-vision-classification`; object-detection models use `onnx-vision-object-detection`. Consumers accept valid `2.x.y` versions, validate every known serialized field and tensor, and permit additive unknown metadata; incompatible semantics require a new major version. Each artifact is a single embedded-preprocessing variant: BW8 uses `uint8[B,1,H,W]` NCHW and C24 uses `uint8[B,H,W,3]` raw-BGR NHWC. Batch may be dynamic or fixed. Classification outputs are categorical probabilities in `float32[B,C]`, with finite `[0,1]` rows summing to 1. Detection outputs are normalized ordered `xyxy` `boxes[B,Q,4]`, `[0,1]` `scores[B,Q]`, and `class_ids[B,Q]`; score-zero rows are padding and ignored before box/class validation. Provider-owned exports use confidence `0` and IoU `0.7`; class-aware consumer NMS at IoU `0.7` is applied only when `nms_required=true`. The CLI preloads images, runs warmup calls, repeats the measured pass as requested, and reports session construction, image loading, warmup calls, shared model calls, measured wall time, end-to-end time, and logical-image throughput. For fixed-batch models it requires the model batch internally, pads only the final batch by duplicating its last image, and discards padded results. `repeats` defaults to `1`.
+The CLI identifies classification versus object detection from the required ONNX metadata contract. Classification models use `onnx-vision-classification`; object-detection models use `onnx-vision-object-detection`. Consumers accept valid `2.x.y` versions, validate every known serialized field and tensor, and permit additive unknown metadata; incompatible semantics require a new major version. Each artifact is a single embedded-preprocessing variant: BW8 uses `uint8[B,1,H,W]` NCHW and C24 uses `uint8[B,H,W,3]` raw-BGR NHWC. Batch may be dynamic or fixed. Classification outputs are categorical probabilities in `float32[B,C]`, with finite `[0,1]` rows summing to 1. Detection outputs are normalized ordered `xyxy` `boxes[B,Q,4]`, `[0,1]` `scores[B,Q]`, and `class_ids[B,Q]`; score-zero rows are padding and ignored before box/class validation. Provider-owned exports use confidence `0` and IoU `0.7`; class-aware consumer NMS at IoU `0.7` is applied only when `nms_required=true`. The CLI preloads images, runs warmup calls, repeats the measured pass as requested, and reports session construction, image loading, warmup calls, shared model calls, measured wall time, end-to-end time, and logical-image throughput. Dynamic-batch models use batch `1` by default; pass `-batch-size N` (or `--batch-size N`) to choose any positive batch size. Fixed-batch models always use the model-declared batch and reject `-batch-size`. For fixed-batch models it requires the model batch internally, pads only the final batch by duplicating its last image, and discards padded results. `repeats` defaults to `1`.
 
 Both tasks accept a single image, a directory of images, or a labeled dataset. A
 single image and a flat image directory are inference-only inputs. Add `-dataset`
@@ -107,6 +107,7 @@ classification-dataset/
 ```powershell
 OnnxVisionCLI.exe model.onnx image.bmp cpu
 OnnxVisionCLI.exe model.onnx image-directory cpu --json
+OnnxVisionCLI.exe model.onnx image-directory --batch-size 8
 OnnxVisionCLI.exe model.onnx classification-dataset cpu -set val -validate
 OnnxVisionCLI.exe model.onnx classification-dataset cpu -set test -validate --json
 OnnxVisionCLI.exe model.onnx classification-dataset cpu 1 10 20 224 224 -set val -validate
@@ -161,7 +162,10 @@ Use `ClassifyBatch` or `DetectBatch` with images that share the same dimensions
 and pixel format. Dynamic models accept any positive batch; fixed models require
 exactly `FixedBatchSize`. Single-image methods reject fixed batches greater than
 one. The returned results preserve input order; detection postprocessing and NMS
-are applied independently per image.
+are applied independently per image. The CLI's `-batch-size N` option controls
+the batch used for dynamic models only; it does not override a fixed model. The
+last dynamic batch may contain fewer images, while a fixed model's final batch
+is padded to its required size.
 
 ## Runtime deployment
 
