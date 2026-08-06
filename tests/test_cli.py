@@ -32,6 +32,17 @@ def test_cli_generates_ultralytics_classification_parameters() -> None:
     assert args.amp is False
 
 
+def test_cli_exposes_libreyolo_amp_and_cache_options() -> None:
+    argv = [
+        "train", "--task", "object-detection", "--framework", "libreyolo",
+        "--model", "yolov9t", "--data", "data.yaml", "--output", "run",
+        "--no-amp", "--cache", "ram",
+    ]
+    args = _parse(argv)
+    assert args.amp is False
+    assert args.cache == "ram"
+
+
 def test_cli_does_not_expose_timm_parameters_to_ultralytics() -> None:
     argv = [
         "train", "--task", "classification", "--framework", "ultralytics",

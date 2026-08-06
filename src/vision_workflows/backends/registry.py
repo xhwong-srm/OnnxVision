@@ -107,7 +107,17 @@ def _ultralytics_train(task: TaskKind):
 
 
 def _libre_train(_: ModelInfo) -> ParameterSchema:
-    return _training(640)
+    framework = _schema(
+        ParameterSpec("amp", bool, "use automatic mixed precision", True),
+        ParameterSpec(
+            "cache",
+            str,
+            "decoded image cache mode",
+            "none",
+            choices=("none", "ram", "disk"),
+        ),
+    ).with_origin(ParameterOrigin.FRAMEWORK)
+    return _training(640).compose(framework)
 
 
 def _all_handlers(backend, train_schema, export_size: int, dataset: DatasetRequirement, *, nms_configurable: bool = False):

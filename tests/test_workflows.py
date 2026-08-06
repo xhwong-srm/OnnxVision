@@ -101,6 +101,44 @@ def test_ultralytics_classification_translates_only_its_supported_parameters(mon
     assert "validate_every" not in captured
 
 
+def test_libreyolo_translates_amp_and_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeModel:
+        def __init__(self, *args, **kwargs):
+            captured["model_kwargs"] = kwargs
+
+        def train(self, **options):
+            captured.update(options)
+            weights = Path(options["project"]) / str(options["name"]) / "weights"
+            weights.mkdir(parents=True)
+            (weights / "best.pt").write_bytes(b"best")
+            (weights / "last.pt").write_bytes(b"last")
+            return {}
+
+    import vision_workflows.backends.libreyolo as integration
+    monkeypatch.setattr(
+        integration,
+        "optional_import",
+        lambda _: type("Module", (), {"LibreYOLO9": FakeModel, "LibrePICODET": FakeModel})(),
+    )
+    data = tmp_path / "data.yaml"
+    data.write_text("names: [seal]\n", encoding="utf-8")
+    selection = ModelSelection(TaskKind.OBJECT_DETECTION, "libreyolo", "yolov9t")
+
+    TrainService().run(
+        TrainRequest(
+            selection,
+            data,
+            tmp_path / "run",
+            parameters={"amp": False, "cache": "disk"},
+        )
+    )
+
+    assert captured["amp"] is False
+    assert captured["cache"] == "disk"
+
+
 def test_optional_import_does_not_eagerly_load_optional_exports() -> None:
     libreyolo = optional_import("libreyolo")
     assert libreyolo.LibrePICODET is not None
