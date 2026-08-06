@@ -69,7 +69,12 @@ def detection_contract(
         "task": "object_detection",
         "inputs": embedded_input_contract(),
         "outputs": {
-            "boxes": {"dtype": "float32", "shape": ["B", "Q", 4]},
+            "boxes": {
+                "dtype": "float32",
+                "shape": ["B", "Q", 4],
+                "coordinate_format": "xyxy",
+                "coordinate_space": "normalized_0_1",
+            },
             "scores": {"dtype": "float32", "shape": ["B", "Q"]},
             "class_ids": {"dtype": "int64", "shape": ["B", "Q"]},
         },
@@ -274,9 +279,11 @@ def embedded_output_paths(output: Path) -> dict[str, Path]:
     }
 
 
-def standardize_detection_core(core: Path, output: Path) -> Path:
+def standardize_detection_core(core: Path, output: Path, *, image_size: int) -> Path:
     """Convert a supported end-to-end detector output to the shared contract."""
     onnx = optional_module("onnx")
+    if image_size <= 0:
+        raise ValueError("image_size must be positive")
     model = onnx.load(str(require_file(core, "ONNX core artifact")))
     graph = model.graph
     if len(graph.output) == 3 and {value.name for value in graph.output} == {
@@ -314,13 +321,22 @@ def standardize_detection_core(core: Path, output: Path) -> Path:
         helper.make_tensor("contract/score_ends", TensorProto.INT64, [1], [5]),
         helper.make_tensor("contract/class_ends", TensorProto.INT64, [1], [6]),
         helper.make_tensor("contract/squeeze_axes", TensorProto.INT64, [1], [2]),
+        helper.make_tensor(
+            "contract/box_scale", TensorProto.FLOAT, [1, 1, 4], [float(image_size)] * 4
+        ),
     ])
     graph.node.extend([
         helper.make_node(
             "Slice",
             [raw.name, "contract/slice_starts", "contract/boxes_ends", "contract/slice_axes"],
-            ["boxes"],
+            ["contract/boxes_pixels"],
             name="contract/boxes",
+        ),
+        helper.make_node(
+            "Div",
+            ["contract/boxes_pixels", "contract/box_scale"],
+            ["boxes"],
+            name="contract/boxes_normalized",
         ),
         helper.make_node(
             "Slice",

@@ -98,7 +98,11 @@ class UltralyticsBackend:
         if not names:
             raise ValueError(f"the exported {self._task} model does not expose class names")
         if self._task == "detection":
-            exported = standardize_detection_core(exported, context.run_dir / "core-detection-contract.onnx")
+            exported = standardize_detection_core(
+                exported,
+                context.run_dir / "core-detection-contract.onnx",
+                image_size=request.image_size,
+            )
         outputs = embedded_output_paths(request.output)
         paths = wrap_embedded_variants(
             exported,

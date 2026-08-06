@@ -76,7 +76,11 @@ class LibreYoloBackend:
         names = class_names_from_model(model)
         if not names:
             raise ValueError("the exported detection model does not expose class names")
-        exported = standardize_detection_core(exported, context.run_dir / "core-detection-contract.onnx")
+        exported = standardize_detection_core(
+            exported,
+            context.run_dir / "core-detection-contract.onnx",
+            image_size=request.image_size,
+        )
         outputs = embedded_output_paths(request.output)
         paths = wrap_embedded_variants(
             exported,

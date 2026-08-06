@@ -50,7 +50,12 @@ def test_detection_metadata_includes_nms_contract_fields() -> None:
         "nms_required": True,
     }
     assert contract["outputs"] == {
-        "boxes": {"dtype": "float32", "shape": ["B", "Q", 4]},
+        "boxes": {
+            "dtype": "float32",
+            "shape": ["B", "Q", 4],
+            "coordinate_format": "xyxy",
+            "coordinate_space": "normalized_0_1",
+        },
         "scores": {"dtype": "float32", "shape": ["B", "Q"]},
         "class_ids": {"dtype": "int64", "shape": ["B", "Q"]},
     }
@@ -90,8 +95,17 @@ def test_standardize_detection_core_splits_end_to_end_batch_output(tmp_path) -> 
     target = tmp_path / "standardized.onnx"
     onnx.save(model, source)
 
-    standardize_detection_core(source, target)
+    standardize_detection_core(source, target, image_size=8)
     standardized = onnx.load(target)
 
     assert [value.name for value in standardized.graph.output] == ["boxes", "scores", "class_ids"]
     assert [len(value.type.tensor_type.shape.dim) for value in standardized.graph.output] == [3, 2, 2]
+
+    ort = pytest.importorskip("onnxruntime")
+    np = pytest.importorskip("numpy")
+    session = ort.InferenceSession(str(target), providers=["CPUExecutionProvider"])
+    values = np.asarray([[[0.0, 0.0, 8.0, 8.0, 0.75, 1.0], [1.0, 2.0, 4.0, 6.0, 0.25, 0.0]]], dtype=np.float32)
+    boxes, scores, class_ids = session.run(None, {"images": values})
+    assert boxes.tolist() == [[[0.0, 0.0, 1.0, 1.0], [0.125, 0.25, 0.5, 0.75]]]
+    assert scores.tolist() == [[0.75, 0.25]]
+    assert class_ids.tolist() == [[1, 0]]
