@@ -4,10 +4,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
-using System.Runtime.Serialization;
-using System.Runtime.Serialization.Json;
-using System.Text;
-using System.Text.RegularExpressions;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using OnnxVision.Imaging;
@@ -21,7 +17,6 @@ namespace OnnxVision.Detection
     /// </summary>
     public sealed class OnnxObjectDetectionModel : IDisposable
     {
-        private const string Contract = OnnxVisionContract.ObjectDetectionName;
         private const string BoxesOutputName = "boxes";
         private const string ScoresOutputName = "scores";
         private const string ClassIdsOutputName = "class_ids";
@@ -58,10 +53,13 @@ namespace OnnxVision.Detection
 
             try
             {
-                nmsRequired = ValidateContract();
+                OnnxContractMetadata contract = OnnxContractMetadata.Read(
+                    session, OnnxVisionContract.ObjectDetectionTask,
+                    OnnxVisionContract.ObjectDetectionName);
+                nmsRequired = contract.NmsRequired;
 
                 var explicitClassNames = classNames == null ? null : classNames.ToArray();
-                var embeddedClassNames = ReadEmbeddedClassNames(session.ModelMetadata.CustomMetadataMap);
+                var embeddedClassNames = contract.ClassNames;
                 ValidateClassNames(explicitClassNames, "classNames");
                 ValidateClassNames(embeddedClassNames, "model metadata");
                 if (explicitClassNames != null && embeddedClassNames != null &&
@@ -93,11 +91,9 @@ namespace OnnxVision.Detection
                 else
                 {
                     throw new NotSupportedException(
-                        "ONNX object detection requires embedded preprocessing with dynamic-batch uint8 [B,1,H,W] BW8 NCHW or uint8 [B,H,W,3] C24 NHWC BGR input.");
+                        "ONNX object detection requires embedded preprocessing with uint8 [B,1,H,W] BW8 NCHW or uint8 [B,H,W,3] C24 NHWC BGR input.");
                 }
                 inputBatchDimension = dimensions[0];
-                if (inputBatchDimension > 0)
-                    throw new NotSupportedException("ONNX object detection requires a dynamic batch dimension.");
             }
             catch
             {
@@ -115,6 +111,7 @@ namespace OnnxVision.Detection
         public int InputWidth { get { return inputWidth; } }
         public int InputHeight { get { return inputHeight; } }
         public bool SupportsDynamicBatch { get { return inputBatchDimension <= 0; } }
+        public int? FixedBatchSize { get { return inputBatchDimension > 0 ? (int?)inputBatchDimension : null; } }
         public bool RequiresColorInput { get { return requiredPixelFormat == OnnxPixelFormat.Bgr24; } }
         public bool NmsRequired { get { return nmsRequired; } }
 
@@ -129,9 +126,13 @@ namespace OnnxVision.Detection
         }
 
         public IReadOnlyList<OnnxDetection> Detect(OnnxImageBuffer image,
-            float confidenceThreshold = 0.5f, float nmsIouThreshold = 1.0f)
+            float confidenceThreshold = 0.5f, float nmsIouThreshold = 0.7f)
         {
             ThrowIfDisposed();
+            if (inputBatchDimension > 1)
+                throw new InvalidOperationException(string.Format(
+                    "This model requires batch size {0}; use DetectBatch with exactly that many images.",
+                    inputBatchDimension));
             ValidateImage(image);
             ValidateThresholds(confidenceThreshold, nmsIouThreshold);
 
@@ -173,7 +174,7 @@ namespace OnnxVision.Detection
 
         public IReadOnlyList<IReadOnlyList<OnnxDetection>> DetectBatch(
             IReadOnlyList<OnnxImageBuffer> images,
-            float confidenceThreshold = 0.5f, float nmsIouThreshold = 1.0f)
+            float confidenceThreshold = 0.5f, float nmsIouThreshold = 0.7f)
         {
             ThrowIfDisposed();
             ValidateThresholds(confidenceThreshold, nmsIouThreshold);
@@ -237,6 +238,10 @@ namespace OnnxVision.Detection
                     {
                         int scoreIndex = batchIndex * queryCount + queryIndex;
                         float score = scores[scoreIndex];
+                        if (float.IsNaN(score) || float.IsInfinity(score) || score < 0 || score > 1)
+                            throw new InvalidOperationException("Model returned a non-finite or out-of-range detection score.");
+                        if (score <= 0)
+                            continue;
                         if (score < confidenceThreshold)
                             continue;
 
@@ -245,14 +250,23 @@ namespace OnnxVision.Detection
                             throw new InvalidOperationException("Model returned an out-of-range class ID.");
                         int classIndex = (int)classId;
                         int boxIndex = scoreIndex * 4;
+                        float x1 = boxes[boxIndex];
+                        float y1 = boxes[boxIndex + 1];
+                        float x2 = boxes[boxIndex + 2];
+                        float y2 = boxes[boxIndex + 3];
+                        if (!IsNormalizedCoordinate(x1) || !IsNormalizedCoordinate(y1) ||
+                            !IsNormalizedCoordinate(x2) || !IsNormalizedCoordinate(y2) ||
+                            x2 < x1 || y2 < y1)
+                        {
+                            throw new InvalidOperationException(
+                                "Model returned an invalid normalized xyxy detection box.");
+                        }
                         candidates.Add(new OnnxDetection(
                             classNames[classIndex], classIndex, score,
-                            Clamp(boxes[boxIndex] * image.Width, 0, image.Width),
-                            Clamp(boxes[boxIndex + 1] * image.Height, 0, image.Height),
-                            Clamp(boxes[boxIndex + 2] * image.Width, 0, image.Width),
-                            Clamp(boxes[boxIndex + 3] * image.Height, 0, image.Height)));
+                            x1 * image.Width, y1 * image.Height,
+                            x2 * image.Width, y2 * image.Height));
                     }
-                    detections.Add(!nmsRequired || nmsIouThreshold >= 1.0f
+                    detections.Add(!nmsRequired
                         ? candidates
                         : ApplyClassAwareNms(candidates, nmsIouThreshold));
                 }
@@ -289,64 +303,6 @@ namespace OnnxVision.Detection
             while (workspaces.TryTake(out workspace))
                 workspace.Dispose();
             session.Dispose();
-        }
-
-        private bool ValidateContract()
-        {
-            var metadata = session.ModelMetadata.CustomMetadataMap;
-            string task;
-            string contractName;
-            string contractVersion;
-            if (!metadata.TryGetValue("vision_task", out task) ||
-                task != OnnxVisionContract.ObjectDetectionTask ||
-                !metadata.TryGetValue("contract_name", out contractName) ||
-                contractName != Contract ||
-                !metadata.TryGetValue("contract_version", out contractVersion) ||
-                contractVersion != OnnxVisionContract.Version ||
-                !metadata.ContainsKey("inputs") ||
-                !metadata.ContainsKey("outputs"))
-            {
-                throw new NotSupportedException(
-                    "Expected the " + Contract + " " + OnnxVisionContract.Version + " object-detection metadata contract.");
-            }
-
-            string nmsRequiredValue;
-            if (!metadata.TryGetValue("nms_required", out nmsRequiredValue) ||
-                !bool.TryParse(nmsRequiredValue, out bool parsedNmsRequired))
-            {
-                throw new NotSupportedException(
-                    "Expected boolean nms_required metadata in the object-detection model.");
-            }
-
-            RequireOutput(BoxesOutputName, typeof(float), 3);
-            RequireOutput(ScoresOutputName, typeof(float), 2);
-            RequireOutput(ClassIdsOutputName, typeof(long), 2);
-            RequireDynamicBatch(BoxesOutputName);
-            RequireDynamicBatch(ScoresOutputName);
-            RequireDynamicBatch(ClassIdsOutputName);
-            return parsedNmsRequired;
-        }
-
-        private void RequireOutput(string name, Type elementType, int rank)
-        {
-            NodeMetadata metadata;
-            if (!session.OutputMetadata.TryGetValue(name, out metadata) ||
-                metadata.ElementType != elementType || metadata.Dimensions.Length != rank)
-            {
-                throw new NotSupportedException(string.Format(
-                    "Expected output {0} with element type {1} and rank {2}.",
-                    name, elementType.Name, rank));
-            }
-        }
-
-        private void RequireDynamicBatch(string name)
-        {
-            NodeMetadata metadata = session.OutputMetadata[name];
-            if (metadata.Dimensions.Length == 0 || metadata.Dimensions[0] > 0)
-            {
-                throw new NotSupportedException(
-                    "Expected dynamic batch dimension on detection output " + name + ".");
-            }
         }
 
         private void ValidateImage(OnnxImageBuffer image)
@@ -477,57 +433,6 @@ namespace OnnxVision.Detection
             return union <= 0 ? 0 : intersection / union;
         }
 
-        private static string[] ReadEmbeddedClassNames(IReadOnlyDictionary<string, string> metadata)
-        {
-            string serialized;
-            if (!metadata.TryGetValue("names", out serialized) || string.IsNullOrWhiteSpace(serialized))
-                return null;
-
-            try
-            {
-                var serializer = new DataContractJsonSerializer(
-                    typeof(Dictionary<string, string>),
-                    new DataContractJsonSerializerSettings { UseSimpleDictionaryFormat = true });
-                using (var stream = new MemoryStream(Encoding.UTF8.GetBytes(serialized)))
-                {
-                    return BuildClassNames((Dictionary<string, string>)serializer.ReadObject(stream));
-                }
-            }
-            catch (SerializationException)
-            {
-                var matches = Regex.Matches(serialized,
-                    "(?<index>\\d+)\\s*:\\s*['\"](?<name>[^'\"]*)['\"]");
-                if (matches.Count == 0)
-                    throw new InvalidOperationException("The names metadata is not a valid class mapping.");
-
-                var values = new Dictionary<string, string>();
-                foreach (Match match in matches)
-                    values.Add(match.Groups["index"].Value, match.Groups["name"].Value);
-                return BuildClassNames(values);
-            }
-        }
-
-        private static string[] BuildClassNames(IDictionary<string, string> mapping)
-        {
-            if (mapping == null || mapping.Count == 0)
-                throw new InvalidOperationException("The names metadata must contain at least one class.");
-
-            var names = new string[mapping.Count];
-            foreach (var item in mapping)
-            {
-                int index;
-                if (!int.TryParse(item.Key, out index) || index < 0 || index >= names.Length ||
-                    names[index] != null)
-                {
-                    throw new InvalidOperationException(
-                        "Class indices must be unique and contiguous from zero.");
-                }
-                names[index] = item.Value;
-            }
-            ValidateClassNames(names, "model metadata");
-            return names;
-        }
-
         private static void ValidateClassNames(string[] names, string source)
         {
             if (names != null && (names.Length == 0 || names.Any(string.IsNullOrWhiteSpace)))
@@ -542,9 +447,9 @@ namespace OnnxVision.Detection
                 throw new ArgumentOutOfRangeException("nmsIouThreshold");
         }
 
-        private static float Clamp(float value, float minimum, float maximum)
+        private static bool IsNormalizedCoordinate(float value)
         {
-            return Math.Max(minimum, Math.Min(maximum, value));
+            return !float.IsNaN(value) && !float.IsInfinity(value) && value >= 0 && value <= 1;
         }
 
         private void ThrowIfDisposed()

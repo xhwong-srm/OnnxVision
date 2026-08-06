@@ -18,10 +18,18 @@ CLASSIFICATION_CONTRACT_NAME = "onnx-vision-classification"
 CONTRACT_VERSION = "2.0.0"
 
 
-def embedded_input_contract() -> dict[str, Any]:
+def batch_contract(batch_size: int | None = None) -> dict[str, Any]:
+    if batch_size is None:
+        return {"axis": 0, "mode": "dynamic", "minimum": 1}
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    return {"axis": 0, "mode": "fixed", "size": batch_size}
+
+
+def embedded_input_contract(batch_size: int | None = None) -> dict[str, Any]:
     """Return the shared raw-image input contract used by both ONNX tasks."""
     return {
-        "batch": {"axis": 0, "minimum": 1, "dynamic": True},
+        "batch": batch_contract(batch_size),
         "variants": {
             "bw8": {
                 "name": "images_bw8_uint8_nchw",
@@ -62,12 +70,13 @@ def detection_contract(
     *,
     nms_required: bool = False,
     input_variant: str | None = None,
+    batch_size: int | None = None,
 ) -> dict[str, Any]:
     contract = {
         "name": DETECTION_CONTRACT_NAME,
         "version": CONTRACT_VERSION,
         "task": "object_detection",
-        "inputs": embedded_input_contract(),
+        "inputs": embedded_input_contract(batch_size),
         "outputs": {
             "boxes": {
                 "dtype": "float32",
@@ -75,7 +84,13 @@ def detection_contract(
                 "coordinate_format": "xyxy",
                 "coordinate_space": "normalized_0_1",
             },
-            "scores": {"dtype": "float32", "shape": ["B", "Q"]},
+            "scores": {
+                "dtype": "float32",
+                "shape": ["B", "Q"],
+                "range": [0.0, 1.0],
+                "padding_value": 0.0,
+                "valid_when": "score_gt_0",
+            },
             "class_ids": {"dtype": "int64", "shape": ["B", "Q"]},
         },
         "names": {str(index): name for index, name in enumerate(names)},
@@ -88,14 +103,23 @@ def detection_contract(
 
 
 def classification_contract(
-    names: list[str] | tuple[str, ...], *, input_variant: str | None = None
+    names: list[str] | tuple[str, ...], *, input_variant: str | None = None,
+    batch_size: int | None = None,
 ) -> dict[str, Any]:
     contract = {
         "name": CLASSIFICATION_CONTRACT_NAME,
         "version": CONTRACT_VERSION,
         "task": "classification",
-        "inputs": embedded_input_contract(),
-        "outputs": {"probabilities": {"dtype": "float32", "shape": ["B", "C"]}},
+        "inputs": embedded_input_contract(batch_size),
+        "outputs": {
+            "probabilities": {
+                "dtype": "float32",
+                "shape": ["B", "C"],
+                "semantics": "categorical_probabilities",
+                "range": [0.0, 1.0],
+                "row_sum": 1.0,
+            }
+        },
         "names": {str(index): name for index, name in enumerate(names)},
     }
     if input_variant is not None:
@@ -111,7 +135,7 @@ def _validate_input_variant(value: str) -> None:
 
 def metadata_for_contract(contract: dict[str, Any]) -> dict[str, Any]:
     version = str(contract["version"])
-    if not CONTRACT_VERSION_PATTERN.fullmatch(version):
+    if not is_compatible_contract_version(version):
         raise ValueError(f"contract version must use major.minor.micro format: {version}")
 
     metadata = {
@@ -127,6 +151,22 @@ def metadata_for_contract(contract: dict[str, Any]) -> dict[str, Any]:
     if contract["task"] == "object_detection":
         metadata["nms_required"] = bool(contract["nms_required"])
     return metadata
+
+
+def is_compatible_contract_version(version: str) -> bool:
+    if not CONTRACT_VERSION_PATTERN.fullmatch(version):
+        return False
+    major, _, _ = (int(item) for item in version.split("."))
+    return major == int(CONTRACT_VERSION.split(".", 1)[0])
+
+
+def _contains_contract(actual: Any, expected: Any) -> bool:
+    if isinstance(expected, dict):
+        return isinstance(actual, dict) and all(
+            key in actual and _contains_contract(actual[key], value)
+            for key, value in expected.items()
+        )
+    return actual == expected
 
 
 def class_names_from_model(model: Any) -> tuple[str, ...]:
@@ -146,8 +186,20 @@ def validate_onnx(path: Path, contract: dict[str, Any]) -> tuple[dict[str, Any],
     onnx.checker.check_model(model)
     metadata = {item.key: item.value for item in model.metadata_props}
     checks = [{"name": "onnx_checker", "status": "passed"}]
+    contract = _resolved_validation_contract(contract, metadata)
     expected = metadata_for_contract(contract)
-    for key in ("vision_task", "contract_name", "contract_version", "input_variant"):
+    actual_variant = metadata.get("input_variant")
+    expected_variant = expected.get("input_variant")
+    if actual_variant not in {"bw8", "c24"}:
+        checks.append({
+            "name": "input_variant",
+            "status": "failed",
+            "expected": expected_variant or ("bw8", "c24"),
+            "actual": actual_variant,
+        })
+    elif expected_variant is not None and actual_variant != expected_variant:
+        checks.append({"name": "input_variant", "status": "failed", "expected": expected_variant, "actual": actual_variant})
+    for key in ("vision_task", "contract_name"):
         if key not in expected:
             continue
         if metadata.get(key) != expected[key]:
@@ -158,13 +210,18 @@ def validate_onnx(path: Path, contract: dict[str, Any]) -> tuple[dict[str, Any],
             actual_value = json.loads(metadata.get(key, ""))
         except json.JSONDecodeError:
             actual_value = None
-        if actual_value != expected[key]:
+        if not _contains_contract(actual_value, expected[key]):
             checks.append({"name": key, "status": "failed", "expected": expected[key], "actual": actual_value})
+
+    version = metadata.get("contract_version", "")
+    if not is_compatible_contract_version(version):
+        checks.append({"name": "contract_version", "status": "failed", "expected": "compatible 2.x.y", "actual": version})
 
     if contract["task"] == "object_detection":
         nms_required = metadata.get("nms_required")
-        if nms_required not in {"true", "false"}:
-            checks.append({"name": "nms_required", "status": "failed", "expected": "true or false", "actual": nms_required})
+        expected_nms = str(bool(contract["nms_required"])).lower()
+        if nms_required != expected_nms:
+            checks.append({"name": "nms_required", "status": "failed", "expected": expected_nms, "actual": nms_required})
 
     expected_names = contract.get("names") or {}
     try:
@@ -177,7 +234,44 @@ def validate_onnx(path: Path, contract: dict[str, Any]) -> tuple[dict[str, Any],
         checks.append({"name": "names", "status": "failed", "expected": expected_names, "actual": actual_names})
 
     _append_tensor_checks(checks, model, contract, metadata)
+    if not any(check.get("status") == "failed" for check in checks):
+        _append_runtime_checks(checks, path, contract)
     return tuple(checks)
+
+
+def _resolved_validation_contract(
+    requested: dict[str, Any], metadata: dict[str, str]
+) -> dict[str, Any]:
+    if requested.get("names"):
+        return requested
+    try:
+        names_mapping = json.loads(metadata.get("names", ""))
+        inputs = json.loads(metadata.get("inputs", ""))
+    except json.JSONDecodeError:
+        return requested
+    if not isinstance(names_mapping, dict) or not isinstance(inputs, dict):
+        return requested
+    try:
+        names = [names_mapping[str(index)] for index in range(len(names_mapping))]
+    except (KeyError, TypeError):
+        return requested
+    batch = inputs.get("batch", {})
+    if batch.get("mode") == "fixed" and isinstance(batch.get("size"), int):
+        batch_size = int(batch["size"])
+    else:
+        batch_size = None
+    input_variant = metadata.get("input_variant")
+    if requested.get("task") == "classification":
+        return classification_contract(
+            names, input_variant=input_variant, batch_size=batch_size
+        )
+    nms_value = metadata.get("nms_required", "false").casefold() == "true"
+    return detection_contract(
+        names,
+        nms_required=nms_value,
+        input_variant=input_variant,
+        batch_size=batch_size,
+    )
 
 
 def _append_tensor_checks(
@@ -199,10 +293,81 @@ def _append_tensor_checks(
             checks.append({"name": "input_tensor", "status": "failed", "expected": candidates, "actual": _tensor_description(actual_input)})
 
     output_by_name = {value.name: value for value in graph.output}
+    if set(output_by_name) != set(contract["outputs"]):
+        checks.append({
+            "name": "output_tensors",
+            "status": "failed",
+            "expected": tuple(contract["outputs"]),
+            "actual": tuple(output_by_name),
+        })
     for name, specification in contract["outputs"].items():
         actual_output = output_by_name.get(name)
         if actual_output is None or not _output_matches(actual_output, specification, contract, name):
             checks.append({"name": f"output_tensor:{name}", "status": "failed", "expected": specification, "actual": _tensor_description(actual_output) if actual_output else None})
+
+
+def _append_runtime_checks(
+    checks: list[dict[str, Any]], path: Path, contract: dict[str, Any]
+) -> None:
+    try:
+        ort = optional_module("onnxruntime")
+        np = optional_module("numpy")
+        session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+        input_info = session.get_inputs()[0]
+        batch = contract["inputs"]["batch"]
+        batches = (1, 2) if batch["mode"] == "dynamic" else (int(batch["size"]),)
+        variant = contract["input_variant"]
+        for batch_size in batches:
+            shape = (
+                (batch_size, 1, 8, 8)
+                if variant == "bw8"
+                else (batch_size, 8, 8, 3)
+            )
+            value = np.zeros(shape, dtype=np.uint8)
+            outputs = session.run(None, {input_info.name: value})
+            _validate_runtime_outputs(outputs, contract, batch_size, np)
+        checks.append({"name": "onnxruntime_contract", "status": "passed"})
+    except Exception as error:
+        checks.append({
+            "name": "onnxruntime_contract",
+            "status": "failed",
+            "actual": str(error),
+        })
+
+
+def _validate_runtime_outputs(
+    outputs: list[Any], contract: dict[str, Any], batch_size: int, np: Any
+) -> None:
+    if contract["task"] == "classification":
+        probabilities = outputs[0]
+        if probabilities.shape != (batch_size, len(contract["names"])):
+            raise ValueError(f"classification output shape mismatch: {probabilities.shape}")
+        if not np.isfinite(probabilities).all() or (probabilities < 0).any() or (probabilities > 1).any():
+            raise ValueError("classification probabilities must be finite and within [0,1]")
+        if not np.allclose(probabilities.sum(axis=1), 1.0, atol=0.001, rtol=0.0):
+            raise ValueError("classification probability rows must sum to one")
+        return
+
+    boxes, scores, class_ids = outputs
+    if boxes.ndim != 3 or scores.ndim != 2 or class_ids.ndim != 2:
+        raise ValueError("detection output ranks are invalid")
+    if boxes.shape[:2] != scores.shape or class_ids.shape != scores.shape or boxes.shape[0] != batch_size:
+        raise ValueError("detection output shapes do not agree")
+    if not np.isfinite(scores).all() or (scores < 0).any() or (scores > 1).any():
+        raise ValueError("detection scores must be finite and within [0,1]")
+    valid = scores > 0
+    valid_boxes = boxes[valid]
+    valid_ids = class_ids[valid]
+    if valid_boxes.size and (
+        not np.isfinite(valid_boxes).all()
+        or (valid_boxes < 0).any()
+        or (valid_boxes > 1).any()
+        or (valid_boxes[:, 0] > valid_boxes[:, 2]).any()
+        or (valid_boxes[:, 1] > valid_boxes[:, 3]).any()
+    ):
+        raise ValueError("valid detection boxes must be ordered normalized XYXY values")
+    if valid_ids.size and ((valid_ids < 0).any() or (valid_ids >= len(contract["names"])).any()):
+        raise ValueError("valid detection class IDs are outside the class mapping")
 
 
 def _tensor_description(value: Any) -> dict[str, Any] | None:
@@ -239,6 +404,16 @@ def _dimension_matches(actual: Any, expected: Any, *, dynamic: bool = False) -> 
     return True
 
 
+def _batch_dimension_matches(actual: Any, batch: dict[str, Any]) -> bool:
+    mode = batch.get("mode")
+    if mode == "dynamic":
+        return not actual.HasField("dim_value") and batch.get("minimum") == 1
+    if mode == "fixed":
+        size = batch.get("size")
+        return isinstance(size, int) and size > 0 and _dimension_matches(actual, size)
+    return False
+
+
 def _input_matches(value: Any, variant: dict[str, Any], batch: dict[str, Any]) -> bool:
     tensor = value.type.tensor_type
     expected_shape = variant["shape"]
@@ -247,7 +422,10 @@ def _input_matches(value: Any, variant: dict[str, Any], batch: dict[str, Any]) -
     if len(tensor.shape.dim) != len(expected_shape):
         return False
     for index, expected in enumerate(expected_shape):
-        if not _dimension_matches(tensor.shape.dim[index], expected, dynamic=index == batch["axis"] and batch["dynamic"]):
+        if index == batch.get("axis"):
+            if not _batch_dimension_matches(tensor.shape.dim[index], batch):
+                return False
+        elif not _dimension_matches(tensor.shape.dim[index], expected):
             return False
     return True
 
@@ -259,7 +437,7 @@ def _output_matches(value: Any, specification: dict[str, Any], contract: dict[st
         return False
     for index, expected in enumerate(expected_shape):
         if expected == "B":
-            if not _dimension_matches(tensor.shape.dim[index], expected, dynamic=True):
+            if not _batch_dimension_matches(tensor.shape.dim[index], contract["inputs"]["batch"]):
                 return False
         elif expected == "C" and contract["names"]:
             if not _dimension_matches(tensor.shape.dim[index], len(contract["names"])):
@@ -279,65 +457,74 @@ def embedded_output_paths(output: Path) -> dict[str, Path]:
     }
 
 
-def standardize_detection_core(core: Path, output: Path, *, image_size: int) -> Path:
-    """Convert a supported end-to-end detector output to the shared contract."""
+def standardize_detection_core(
+    core: Path,
+    output: Path,
+    *,
+    image_size: int,
+    source_box_format: str,
+    source_box_space: str,
+) -> Path:
+    """Convert declared provider outputs to normalized XYXY contract tensors."""
     onnx = optional_module("onnx")
     if image_size <= 0:
         raise ValueError("image_size must be positive")
+    if source_box_format not in {"xyxy", "cxcywh"}:
+        raise ValueError("source_box_format must be xyxy or cxcywh")
+    if source_box_space not in {"pixels", "normalized_0_1"}:
+        raise ValueError("source_box_space must be pixels or normalized_0_1")
     model = onnx.load(str(require_file(core, "ONNX core artifact")))
     graph = model.graph
+    from onnx import TensorProto, helper
+
     if len(graph.output) == 3 and {value.name for value in graph.output} == {
         "boxes", "scores", "class_ids"
     }:
-        output_path = output.expanduser().resolve()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        onnx.checker.check_model(model)
-        onnx.save(model, str(output_path))
-        return output_path
-
-    if len(graph.output) not in {1, 2}:
-        raise ConfigurationError(
-            "detection ONNX export must emit boxes/scores/class_ids or an end-to-end [B,Q,6] tensor first"
-        )
-    raw = graph.output[0]
-    raw_type = raw.type.tensor_type
-    raw_shape = raw_type.shape.dim
-    if len(raw_shape) != 3 or not raw_shape[2].HasField("dim_value") or int(raw_shape[2].dim_value) != 6:
-        raise ConfigurationError(
-            "unsupported detection ONNX output; expected an end-to-end [B,Q,6] tensor first "
-            "or explicit boxes/scores/class_ids outputs"
-        )
-    if raw_type.elem_type != onnx.TensorProto.FLOAT:
-        raise ConfigurationError("end-to-end detection output must use float32 values")
-
-    from onnx import TensorProto, helper
-
-    graph.initializer.extend([
-        helper.make_tensor("contract/slice_starts", TensorProto.INT64, [1], [0]),
-        helper.make_tensor("contract/boxes_ends", TensorProto.INT64, [1], [4]),
-        helper.make_tensor("contract/score_starts", TensorProto.INT64, [1], [4]),
-        helper.make_tensor("contract/class_starts", TensorProto.INT64, [1], [5]),
-        helper.make_tensor("contract/slice_axes", TensorProto.INT64, [1], [2]),
-        helper.make_tensor("contract/score_ends", TensorProto.INT64, [1], [5]),
-        helper.make_tensor("contract/class_ends", TensorProto.INT64, [1], [6]),
-        helper.make_tensor("contract/squeeze_axes", TensorProto.INT64, [1], [2]),
-        helper.make_tensor(
-            "contract/box_scale", TensorProto.FLOAT, [1, 1, 4], [float(image_size)] * 4
-        ),
-    ])
-    graph.node.extend([
-        helper.make_node(
-            "Slice",
-            [raw.name, "contract/slice_starts", "contract/boxes_ends", "contract/slice_axes"],
-            ["contract/boxes_pixels"],
-            name="contract/boxes",
-        ),
-        helper.make_node(
-            "Div",
-            ["contract/boxes_pixels", "contract/box_scale"],
-            ["boxes"],
-            name="contract/boxes_normalized",
-        ),
+        output_by_name = {value.name: value for value in graph.output}
+        source_boxes = output_by_name["boxes"]
+        source_scores = output_by_name["scores"]
+        source_class_ids = output_by_name["class_ids"]
+        _rename_graph_value(graph, "boxes", "contract/source_boxes")
+        boxes_name = "contract/source_boxes"
+        scores_name = source_scores.name
+        class_ids_name = source_class_ids.name
+        batch_dimension = _dimension_value(source_boxes.type.tensor_type.shape.dim[0], "B")
+        query_dimension = _dimension_value(source_boxes.type.tensor_type.shape.dim[1], "Q")
+    else:
+        if len(graph.output) not in {1, 2}:
+            raise ConfigurationError(
+                "detection ONNX export must emit boxes/scores/class_ids or an end-to-end [B,Q,6] tensor first"
+            )
+        raw = graph.output[0]
+        raw_type = raw.type.tensor_type
+        raw_shape = raw_type.shape.dim
+        if len(raw_shape) != 3 or not raw_shape[2].HasField("dim_value") or int(raw_shape[2].dim_value) != 6:
+            raise ConfigurationError(
+                "unsupported detection ONNX output; expected an end-to-end [B,Q,6] tensor first "
+                "or explicit boxes/scores/class_ids outputs"
+            )
+        if raw_type.elem_type != onnx.TensorProto.FLOAT:
+            raise ConfigurationError("end-to-end detection output must use float32 values")
+        graph.initializer.extend([
+            helper.make_tensor("contract/slice_starts", TensorProto.INT64, [1], [0]),
+            helper.make_tensor("contract/boxes_ends", TensorProto.INT64, [1], [4]),
+            helper.make_tensor("contract/score_starts", TensorProto.INT64, [1], [4]),
+            helper.make_tensor("contract/class_starts", TensorProto.INT64, [1], [5]),
+            helper.make_tensor("contract/slice_axes", TensorProto.INT64, [1], [2]),
+            helper.make_tensor("contract/score_ends", TensorProto.INT64, [1], [5]),
+            helper.make_tensor("contract/class_ends", TensorProto.INT64, [1], [6]),
+            helper.make_tensor("contract/squeeze_axes", TensorProto.INT64, [1], [2]),
+        ])
+        boxes_name = "contract/source_boxes"
+        scores_name = "scores"
+        class_ids_name = "class_ids"
+        graph.node.extend([
+            helper.make_node(
+                "Slice",
+                [raw.name, "contract/slice_starts", "contract/boxes_ends", "contract/slice_axes"],
+                [boxes_name],
+                name="contract/boxes_slice",
+            ),
         helper.make_node(
             "Slice",
             [raw.name, "contract/score_starts", "contract/score_ends", "contract/slice_axes"],
@@ -347,7 +534,7 @@ def standardize_detection_core(core: Path, output: Path, *, image_size: int) -> 
         helper.make_node(
             "Squeeze",
             ["contract/scores_column", "contract/squeeze_axes"],
-            ["scores"],
+            [scores_name],
             name="contract/scores",
         ),
         helper.make_node(
@@ -365,31 +552,96 @@ def standardize_detection_core(core: Path, output: Path, *, image_size: int) -> 
         helper.make_node(
             "Cast",
             ["contract/class_values"],
-            ["class_ids"],
+            [class_ids_name],
             to=TensorProto.INT64,
             name="contract/class_ids",
+            ),
+        ])
+        batch_dimension = _dimension_value(raw_shape[0], "B")
+        query_dimension = _dimension_value(raw_shape[1], "Q")
+
+    normalized_boxes, box_nodes = _box_conversion_nodes(
+        helper,
+        boxes_name,
+        source_box_format=source_box_format,
+        source_box_space=source_box_space,
+    )
+    graph.initializer.extend([
+        helper.make_tensor("contract/half", TensorProto.FLOAT, [1], [0.5]),
+        helper.make_tensor(
+            "contract/box_scale", TensorProto.FLOAT, [1, 1, 4], [float(image_size)] * 4
         ),
+        helper.make_tensor("contract/clip_min", TensorProto.FLOAT, [], [0.0]),
+        helper.make_tensor("contract/clip_max", TensorProto.FLOAT, [], [1.0]),
     ])
-    batch_dimension = _dimension_value(raw_shape[0], "B")
-    query_dimension = _dimension_value(raw_shape[1], "Q")
+    graph.node.extend(box_nodes)
+    graph.node.append(helper.make_node(
+        "Clip",
+        [normalized_boxes, "contract/clip_min", "contract/clip_max"],
+        ["boxes"],
+        name="contract/boxes_clip",
+    ))
     del graph.output[:]
     graph.output.extend([
         helper.make_tensor_value_info(
             "boxes", TensorProto.FLOAT, [batch_dimension, query_dimension, 4]
         ),
         helper.make_tensor_value_info(
-            "scores", TensorProto.FLOAT, [batch_dimension, query_dimension]
+            scores_name, TensorProto.FLOAT, [batch_dimension, query_dimension]
         ),
         helper.make_tensor_value_info(
-            "class_ids", TensorProto.INT64, [batch_dimension, query_dimension]
+            class_ids_name, TensorProto.INT64, [batch_dimension, query_dimension]
         ),
     ])
-    graph.doc_string = "Standardized end-to-end detection output with dynamic batch."
+    graph.doc_string = "Standardized end-to-end detection outputs."
     output_path = output.expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     onnx.checker.check_model(model)
     onnx.save(model, str(output_path))
     return output_path
+
+
+def _rename_graph_value(graph: Any, old: str, new: str) -> None:
+    for node in graph.node:
+        for values in (node.input, node.output):
+            for index, value in enumerate(values):
+                if value == old:
+                    values[index] = new
+    for collection in (graph.input, graph.output, graph.value_info):
+        for value in collection:
+            if value.name == old:
+                value.name = new
+
+
+def _box_conversion_nodes(
+    helper: Any,
+    boxes: str,
+    *,
+    source_box_format: str,
+    source_box_space: str,
+) -> tuple[str, list[Any]]:
+    nodes: list[Any] = []
+    converted = boxes
+    if source_box_format == "cxcywh":
+        nodes.extend([
+            helper.make_node("Split", [converted], [
+                "contract/cx", "contract/cy", "contract/width", "contract/height"
+            ], axis=2, num_outputs=4, name="contract/split_cxcywh"),
+            helper.make_node("Mul", ["contract/width", "contract/half"], ["contract/half_width"], name="contract/half_width"),
+            helper.make_node("Mul", ["contract/height", "contract/half"], ["contract/half_height"], name="contract/half_height"),
+            helper.make_node("Sub", ["contract/cx", "contract/half_width"], ["contract/x1"], name="contract/x1"),
+            helper.make_node("Sub", ["contract/cy", "contract/half_height"], ["contract/y1"], name="contract/y1"),
+            helper.make_node("Add", ["contract/cx", "contract/half_width"], ["contract/x2"], name="contract/x2"),
+            helper.make_node("Add", ["contract/cy", "contract/half_height"], ["contract/y2"], name="contract/y2"),
+            helper.make_node("Concat", ["contract/x1", "contract/y1", "contract/x2", "contract/y2"], ["contract/boxes_xyxy"], axis=2, name="contract/boxes_xyxy"),
+        ])
+        converted = "contract/boxes_xyxy"
+    if source_box_space == "pixels":
+        nodes.append(helper.make_node(
+            "Div", [converted, "contract/box_scale"], ["contract/boxes_normalized"], name="contract/boxes_normalized"
+        ))
+        converted = "contract/boxes_normalized"
+    return converted, nodes
 
 
 def _dimension_value(dimension: Any, fallback: str) -> int | str | None:
@@ -407,10 +659,11 @@ def wrap_embedded_variants(
     image_size: int,
     mean: tuple[float, float, float],
     std: tuple[float, float, float],
+    batch_size: int | None = None,
     apply_softmax: bool = False,
     output_names: tuple[str, ...] | None = None,
 ) -> tuple[Path, ...]:
-    """Wrap a float RGB NCHW ONNX core with dynamic-batch BW8 and C24 inputs."""
+    """Wrap a float RGB NCHW ONNX core with batch-aware BW8 and C24 inputs."""
     onnx = optional_module("onnx")
     np = optional_module("numpy")
     core_model = require_file(core, "ONNX core artifact")
@@ -440,6 +693,7 @@ def wrap_embedded_variants(
             image_size,
             mean,
             std,
+            batch_size,
         )
         postprocessing: list[Any] = []
         if output_names is not None and len(output_names) != len(core_graph.graph.output):
@@ -456,7 +710,8 @@ def wrap_embedded_variants(
                 postprocessing.append(onnx.helper.make_node("Identity", [original_output], [public_output], name=f"contract/{public_output}"))
             output_value.name = public_output
         core_graph.graph.node.extend(preprocessing + original_nodes + postprocessing)
-        core_graph.graph.doc_string = f"Embedded {variant} preprocessing with dynamic batch."
+        mode = "dynamic" if batch_size is None else f"fixed batch {batch_size}"
+        core_graph.graph.doc_string = f"Embedded {variant} preprocessing with {mode}."
         output_path = output.expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         onnx.checker.check_model(core_graph)
@@ -473,18 +728,21 @@ def _embedded_preprocessing_nodes(
     image_size: int,
     mean: tuple[float, float, float],
     std: tuple[float, float, float],
+    batch_size: int | None,
 ) -> list[Any]:
     from onnx import TensorProto, helper, numpy_helper
 
     if variant == "bw8":
         input_name = "images_bw8_uint8_nchw"
-        model.graph.input.append(helper.make_tensor_value_info(input_name, TensorProto.UINT8, ["B", 1, "H", "W"]))
+        batch_dimension = "B" if batch_size is None else batch_size
+        model.graph.input.append(helper.make_tensor_value_info(input_name, TensorProto.UINT8, [batch_dimension, 1, "H", "W"]))
         resized_source = input_name
         input_channels = 1
         nodes: list[Any] = []
     else:
         input_name = "images_c24_uint8_nhwc_bgr"
-        model.graph.input.append(helper.make_tensor_value_info(input_name, TensorProto.UINT8, ["B", "H", "W", 3]))
+        batch_dimension = "B" if batch_size is None else batch_size
+        model.graph.input.append(helper.make_tensor_value_info(input_name, TensorProto.UINT8, [batch_dimension, "H", "W", 3]))
         nodes = [
             helper.make_node("Transpose", [input_name], ["preprocess/bgr_nchw"], perm=[0, 3, 1, 2], name="preprocess/transpose"),
             helper.make_node(

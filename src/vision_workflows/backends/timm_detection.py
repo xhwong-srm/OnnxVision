@@ -20,6 +20,7 @@ from .common import (
     metadata_for_contract,
     require_file,
     set_onnx_metadata,
+    standardize_detection_core,
     validate_onnx,
     wrap_embedded_variants,
 )
@@ -297,7 +298,8 @@ class TimmDetectionBackend:
         torch, _, _ = _torch_components()
         model, classes, checkpoint = self._load(request.checkpoint, torch.device("cpu"))
         core = context.run_dir / "core-float32.onnx"
-        batch = torch.export.Dim("batch", min=1)
+        export_batch = request.batch_size or 1
+        batch = torch.export.Dim("batch", min=1) if request.batch_size is None else None
         class ExportWrapper(torch.nn.Module):
             def __init__(self, detector):
                 super().__init__()
@@ -310,18 +312,25 @@ class TimmDetectionBackend:
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             torch.onnx.export(
                 wrapper,
-                (torch.zeros(1, 3, request.image_size, request.image_size),),
+                (torch.zeros(export_batch, 3, request.image_size, request.image_size),),
                 core,
                 input_names=["images"],
                 output_names=["boxes", "scores", "class_ids"],
                 opset_version=request.opset,
                 dynamo=True,
-                dynamic_shapes=({0: batch},),
+                dynamic_shapes=({0: batch},) if batch is not None else None,
                 external_data=False,
                 optimize=True,
                 verify=True,
                 verbose=False,
             )
+        core = standardize_detection_core(
+            core,
+            context.run_dir / "core-detection-contract.onnx",
+            image_size=request.image_size,
+            source_box_format="xyxy",
+            source_box_space="normalized_0_1",
+        )
         outputs = embedded_output_paths(request.output)
         paths = wrap_embedded_variants(
             core,
@@ -329,11 +338,19 @@ class TimmDetectionBackend:
             image_size=request.image_size,
             mean=(0.485, 0.456, 0.406),
             std=(0.229, 0.224, 0.225),
+            batch_size=request.batch_size,
         )
-        contract = detection_contract(classes, nms_required=False)
+        contract = detection_contract(
+            classes, nms_required=False, batch_size=request.batch_size
+        )
         checks: list[dict[str, Any]] = []
         for variant, path in outputs.items():
-            variant_contract = detection_contract(classes, nms_required=False, input_variant=variant)
+            variant_contract = detection_contract(
+                classes,
+                nms_required=False,
+                input_variant=variant,
+                batch_size=request.batch_size,
+            )
             set_onnx_metadata(path, metadata_for_contract(variant_contract))
             checks.extend({**check, "variant": variant} for check in validate_onnx(path, variant_contract))
         return Execution(tuple(artifact(path, "onnx") for path in paths), {}, contract, tuple(checks))

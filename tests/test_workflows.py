@@ -63,6 +63,18 @@ def test_ultralytics_defaults_workers_to_zero() -> None:
         schema.resolve({"workers": -1}, context)
 
 
+def test_export_schema_defaults_to_dynamic_and_rejects_nonpositive_fixed_batch() -> None:
+    selection = ModelSelection(TaskKind.CLASSIFICATION, "timm", "mobilenetv4_conv_small_050.e3000_r224_in1k")
+    plugin = plugin_for(selection)
+    model = plugin.catalog.resolve(selection.model)
+    schema = plugin.handlers[Operation.EXPORT].schema(model)
+    context = type("Context", (), {"selection": selection, "model": model, "request": None})()
+    assert schema.resolve({}, context)["batch_size"] is None
+    assert schema.resolve({"batch_size": 4}, context)["batch_size"] == 4
+    with pytest.raises(ConfigurationError, match="batch_size must be at least 1"):
+        schema.resolve({"batch_size": 0}, context)
+
+
 def test_ultralytics_classification_translates_only_its_supported_parameters(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured: dict[str, object] = {}
 

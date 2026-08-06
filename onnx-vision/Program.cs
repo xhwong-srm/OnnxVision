@@ -131,12 +131,14 @@ namespace OnnxVision
                     var samplesByPath = input.Samples.ToDictionary(item => item.Path,
                         StringComparer.OrdinalIgnoreCase);
                     int labeledImageCount = input.Samples.Count(item => item.ExpectedClassName != null);
-                    int warmups = Math.Min(DefaultWarmups, images.Count);
+                    int physicalBatchSize = classifier.FixedBatchSize ?? 1;
+                    List<LoadedImageBatch> inferenceBatches = BuildInferenceBatches(images, physicalBatchSize);
+                    int warmups = Math.Min(DefaultWarmups, inferenceBatches.Count);
                     long warmupModelCallTicks = 0;
                     for (int index = 0; index < warmups; index++)
                     {
                         long callStarted = Stopwatch.GetTimestamp();
-                        images[index].Classify(classifier, roi);
+                        inferenceBatches[index].Classify(classifier, roi);
                         warmupModelCallTicks += Stopwatch.GetTimestamp() - callStarted;
                     }
 
@@ -160,73 +162,75 @@ namespace OnnxVision
 
                     for (int repeat = 0; repeat < repeats; repeat++)
                     {
-                        foreach (LoadedImage image in images)
+                        foreach (LoadedImageBatch batch in inferenceBatches)
                         {
-                            ClassificationSample sample = samplesByPath[image.Path];
-                            string expected = sample.ExpectedClassName;
                             long callStarted = Stopwatch.GetTimestamp();
-                            OnnxClassification prediction = image.Classify(classifier, roi);
+                            IReadOnlyList<OnnxClassification> batchPredictions = batch.Classify(classifier, roi);
                             modelCallTicks += Stopwatch.GetTimestamp() - callStarted;
-                            onnxInferenceMilliseconds += prediction.InferenceMilliseconds;
-
-                            if (repeat != 0)
-                                continue;
-
-                            bool hasExpected = !string.IsNullOrWhiteSpace(expected);
-                            bool isCorrect = hasExpected && string.Equals(expected, prediction.ClassName,
-                                StringComparison.OrdinalIgnoreCase);
-                            if (hasExpected)
+                            if (batchPredictions.Count > 0)
+                                onnxInferenceMilliseconds += batchPredictions[0].InferenceMilliseconds;
+                            for (int batchIndex = 0; batchIndex < batch.LogicalCount; batchIndex++)
                             {
-                                if (isCorrect)
-                                    correct++;
-                                else
-                                    errors.Add(string.Format(CultureInfo.InvariantCulture,
-                                        "{0} -> {1} ({2:P2})",
-                                        image.Path, prediction.ClassName, prediction.Confidence));
+                                LoadedImage image = batch.Images[batchIndex];
+                                OnnxClassification prediction = batchPredictions[batchIndex];
+                                if (repeat != 0)
+                                    continue;
 
-                                if (string.Equals(expected, "flipped", StringComparison.OrdinalIgnoreCase))
+                                ClassificationSample sample = samplesByPath[image.Path];
+                                string expected = sample.ExpectedClassName;
+                                bool hasExpected = !string.IsNullOrWhiteSpace(expected);
+                                bool isCorrect = hasExpected && string.Equals(expected, prediction.ClassName,
+                                    StringComparison.OrdinalIgnoreCase);
+                                if (hasExpected)
                                 {
-                                    flippedTotal++;
                                     if (isCorrect)
-                                        flippedCorrect++;
+                                        correct++;
+                                    else
+                                        errors.Add(string.Format(CultureInfo.InvariantCulture,
+                                            "{0} -> {1} ({2:P2})",
+                                            image.Path, prediction.ClassName, prediction.Confidence));
+
+                                    if (string.Equals(expected, "flipped", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        flippedTotal++;
+                                        if (isCorrect)
+                                            flippedCorrect++;
+                                    }
+                                    else if (string.Equals(expected, "normal", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        normalTotal++;
+                                        if (isCorrect)
+                                            normalCorrect++;
+                                    }
+
+                                    bool actualPositive = string.Equals(expected, "flipped", StringComparison.OrdinalIgnoreCase);
+                                    bool predictedPositive = string.Equals(prediction.ClassName, "flipped", StringComparison.OrdinalIgnoreCase);
+                                    if (actualPositive && predictedPositive)
+                                        truePositives++;
+                                    else if (!actualPositive && predictedPositive)
+                                        falsePositives++;
+                                    else if (actualPositive)
+                                        falseNegatives++;
+                                    else
+                                        trueNegatives++;
+
+                                    if (flippedIndex >= 0 && prediction.Probabilities != null &&
+                                        prediction.Probabilities.Count > flippedIndex)
+                                        rocScores.Add(new RocPoint(actualPositive, prediction.Probabilities[flippedIndex]));
+                                    if (validation != null)
+                                        validation.Add(expected, prediction);
                                 }
-                                else if (string.Equals(expected, "normal", StringComparison.OrdinalIgnoreCase))
+
+                                predictions.Add(new Dictionary<string, object>
                                 {
-                                    normalTotal++;
-                                    if (isCorrect)
-                                        normalCorrect++;
-                                }
-
-                                bool actualPositive = string.Equals(expected, "flipped", StringComparison.OrdinalIgnoreCase);
-                                bool predictedPositive = string.Equals(prediction.ClassName, "flipped", StringComparison.OrdinalIgnoreCase);
-                                if (actualPositive && predictedPositive)
-                                    truePositives++;
-                                else if (!actualPositive && predictedPositive)
-                                    falsePositives++;
-                                else if (actualPositive)
-                                    falseNegatives++;
-                                else
-                                    trueNegatives++;
-
-                                if (flippedIndex >= 0 && prediction.Probabilities != null &&
-                                    prediction.Probabilities.Count > flippedIndex)
-                                {
-                                    rocScores.Add(new RocPoint(actualPositive, prediction.Probabilities[flippedIndex]));
-                                }
-
-                                if (validation != null)
-                                    validation.Add(expected, prediction);
+                                    { "path", image.Path },
+                                    { "expected", expected },
+                                    { "class_name", prediction.ClassName },
+                                    { "class_index", prediction.ClassIndex },
+                                    { "confidence", prediction.Confidence },
+                                    { "probabilities", prediction.Probabilities }
+                                });
                             }
-
-                            predictions.Add(new Dictionary<string, object>
-                            {
-                                { "path", image.Path },
-                                { "expected", expected },
-                                { "class_name", prediction.ClassName },
-                                { "class_index", prediction.ClassIndex },
-                                { "confidence", prediction.Confidence },
-                                { "probabilities", prediction.Probabilities }
-                            });
                         }
                     }
                     measuredWall.Stop();
@@ -328,12 +332,14 @@ namespace OnnxVision
                         : null;
                     var samplesByPath = input.Samples.ToDictionary(item => item.Path,
                         StringComparer.OrdinalIgnoreCase);
-                    int warmups = Math.Min(DefaultWarmups, images.Count);
+                    int physicalBatchSize = detector.FixedBatchSize ?? 1;
+                    List<LoadedImageBatch> inferenceBatches = BuildInferenceBatches(images, physicalBatchSize);
+                    int warmups = Math.Min(DefaultWarmups, inferenceBatches.Count);
                     long warmupModelCallTicks = 0;
                     for (int index = 0; index < warmups; index++)
                     {
                         long callStarted = Stopwatch.GetTimestamp();
-                        images[index].Detect(detector, threshold, DetectionNmsIouThreshold);
+                        inferenceBatches[index].Detect(detector, threshold, DetectionNmsIouThreshold);
                         warmupModelCallTicks += Stopwatch.GetTimestamp() - callStarted;
                     }
 
@@ -346,32 +352,37 @@ namespace OnnxVision
                     var measuredWall = Stopwatch.StartNew();
                     for (int repeat = 0; repeat < repeats; repeat++)
                     {
-                        foreach (LoadedImage image in images)
+                        foreach (LoadedImageBatch batch in inferenceBatches)
                         {
                             long callStarted = Stopwatch.GetTimestamp();
-                            IReadOnlyList<OnnxDetection> detections = image.Detect(
+                            IReadOnlyList<IReadOnlyList<OnnxDetection>> batchDetections = batch.Detect(
                                 detector, threshold, DetectionNmsIouThreshold);
                             modelCallTicks += Stopwatch.GetTimestamp() - callStarted;
-                            detectionCount += detections.Count;
-                            foreach (OnnxDetection detection in detections)
+                            for (int batchIndex = 0; batchIndex < batch.LogicalCount; batchIndex++)
                             {
-                                classCounts[detection.ClassName]++;
-                                confidenceSum += detection.Confidence;
-                            }
-
-                            if (repeat == 0)
-                            {
-                                results.Add(BuildDetectionImageResult(image.Path, detections));
-                                if (validation != null)
-                                    validation.Add(image.Path, samplesByPath[image.Path].GroundTruths, detections);
-                                if (!json)
+                                LoadedImage image = batch.Images[batchIndex];
+                                IReadOnlyList<OnnxDetection> detections = batchDetections[batchIndex];
+                                detectionCount += detections.Count;
+                                foreach (OnnxDetection detection in detections)
                                 {
-                                    Console.WriteLine("{0}: {1} detection(s)", image.Path, detections.Count);
-                                    foreach (OnnxDetection detection in detections)
+                                    classCounts[detection.ClassName]++;
+                                    confidenceSum += detection.Confidence;
+                                }
+
+                                if (repeat == 0)
+                                {
+                                    results.Add(BuildDetectionImageResult(image.Path, detections));
+                                    if (validation != null)
+                                        validation.Add(image.Path, samplesByPath[image.Path].GroundTruths, detections);
+                                    if (!json)
                                     {
-                                        Console.WriteLine("  {0} {1:F4} [{2:F1}, {3:F1}, {4:F1}, {5:F1}]",
-                                            detection.ClassName, detection.Confidence,
-                                            detection.X1, detection.Y1, detection.X2, detection.Y2);
+                                        Console.WriteLine("{0}: {1} detection(s)", image.Path, detections.Count);
+                                        foreach (OnnxDetection detection in detections)
+                                        {
+                                            Console.WriteLine("  {0} {1:F4} [{2:F1}, {3:F1}, {4:F1}, {5:F1}]",
+                                                detection.ClassName, detection.Confidence,
+                                                detection.X1, detection.Y1, detection.X2, detection.Y2);
+                                        }
                                     }
                                 }
                             }

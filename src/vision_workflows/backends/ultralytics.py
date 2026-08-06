@@ -88,9 +88,24 @@ class UltralyticsBackend:
         checkpoint = require_file(request.checkpoint, "checkpoint")
         model = self._model(request)
         nms_required = bool(request.options.get("nms_required", False))
-        options: dict[str, Any] = {"format": "onnx", "imgsz": request.image_size, "opset": request.opset, "simplify": request.simplify, "dynamic": True}
+        if self._task == "detection" and nms_required:
+            raise ConfigurationError(
+                "Ultralytics raw detection output is not the contract's [B,Q,6] "
+                "candidate layout; export with embedded NMS (nms_required=false)"
+            )
+        options: dict[str, Any] = {
+            "format": "onnx",
+            "imgsz": request.image_size,
+            "opset": request.opset,
+            "simplify": request.simplify,
+            "dynamic": request.batch_size is None,
+            "batch": request.batch_size or 1,
+        }
         if self._task == "detection":
             options["nms"] = not nms_required
+            if not nms_required:
+                options["conf"] = 0.0
+                options["iou"] = 0.7
         if request.device != "auto":
             options["device"] = request.device
         exported = Path(model.export(**options))
@@ -102,6 +117,8 @@ class UltralyticsBackend:
                 exported,
                 context.run_dir / "core-detection-contract.onnx",
                 image_size=request.image_size,
+                source_box_format="xyxy",
+                source_box_space="pixels",
             )
         outputs = embedded_output_paths(request.output)
         paths = wrap_embedded_variants(
@@ -110,20 +127,30 @@ class UltralyticsBackend:
             image_size=request.image_size,
             mean=(0.0, 0.0, 0.0),
             std=(1.0, 1.0, 1.0),
+            batch_size=request.batch_size,
             apply_softmax=self._task == "classification",
             output_names=("probabilities",) if self._task == "classification" else None,
         )
         contract = (
-            classification_contract(names)
+            classification_contract(names, batch_size=request.batch_size)
             if self._task == "classification"
-            else detection_contract(names, nms_required=nms_required)
+            else detection_contract(
+                names, nms_required=nms_required, batch_size=request.batch_size
+            )
         )
         checks: list[dict[str, Any]] = []
         for variant, path in outputs.items():
             variant_contract = (
-                classification_contract(names, input_variant=variant)
+                classification_contract(
+                    names, input_variant=variant, batch_size=request.batch_size
+                )
                 if self._task == "classification"
-                else detection_contract(names, nms_required=nms_required, input_variant=variant)
+                else detection_contract(
+                    names,
+                    nms_required=nms_required,
+                    input_variant=variant,
+                    batch_size=request.batch_size,
+                )
             )
             set_onnx_metadata(path, metadata_for_contract(variant_contract))
             checks.extend({**check, "variant": variant} for check in validate_onnx(path, variant_contract))

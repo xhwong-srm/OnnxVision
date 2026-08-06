@@ -19,6 +19,7 @@ timm = [
     "tqdm>=4.65.0",
     "numpy>=2.0",
     "onnx>=1.22.0",
+    "onnxruntime>=1.27.0",
     "onnxscript>=0.5",
     "torch>=2.11.0",
     "torchvision>=0.26.0",

@@ -35,17 +35,18 @@ namespace OnnxVision.Runtime
                 if (string.Equals(task, OnnxVisionContract.ObjectDetectionTask,
                     StringComparison.Ordinal))
                 {
-                    ValidateContractMetadata(metadata, OnnxVisionContract.ObjectDetectionName);
-                    ValidateNamesMetadata(metadata);
-                    ValidateNmsMetadata(metadata);
+                    OnnxContractMetadata.Read(session,
+                        OnnxVisionContract.ObjectDetectionTask,
+                        OnnxVisionContract.ObjectDetectionName);
                     return OnnxVisionTask.ObjectDetection;
                 }
 
                 if (string.Equals(task, OnnxVisionContract.ClassificationTask,
                     StringComparison.Ordinal))
                 {
-                    ValidateContractMetadata(metadata, OnnxVisionContract.ClassificationName);
-                    ValidateNamesMetadata(metadata);
+                    OnnxContractMetadata.Read(session,
+                        OnnxVisionContract.ClassificationTask,
+                        OnnxVisionContract.ClassificationName);
                     return OnnxVisionTask.Classification;
                 }
 
@@ -54,55 +55,5 @@ namespace OnnxVision.Runtime
             }
         }
 
-        private static void ValidateContractMetadata(
-            IReadOnlyDictionary<string, string> metadata, string expectedName)
-        {
-            string actualName;
-            if (!metadata.TryGetValue("contract_name", out actualName) ||
-                !string.Equals(actualName, expectedName, StringComparison.Ordinal))
-            {
-                throw new NotSupportedException(
-                    "Expected contract_name metadata '" + expectedName + "'.");
-            }
-
-            string inputs;
-            string outputs;
-            if (!metadata.TryGetValue("inputs", out inputs) || string.IsNullOrWhiteSpace(inputs) ||
-                !metadata.TryGetValue("outputs", out outputs) || string.IsNullOrWhiteSpace(outputs))
-            {
-                throw new NotSupportedException(
-                    "The ONNX model is missing inputs or outputs contract metadata.");
-            }
-
-            string version;
-            if (!metadata.TryGetValue("contract_version", out version) ||
-                !string.Equals(version, OnnxVisionContract.Version, StringComparison.Ordinal))
-            {
-                throw new NotSupportedException(
-                    "Expected contract_version metadata '" + OnnxVisionContract.Version + "'.");
-            }
-        }
-
-        private static void ValidateNamesMetadata(IReadOnlyDictionary<string, string> metadata)
-        {
-            string names;
-            if (!metadata.TryGetValue("names", out names) || string.IsNullOrWhiteSpace(names))
-            {
-                throw new NotSupportedException(
-                    "The ONNX model must contain names metadata.");
-            }
-        }
-
-        private static void ValidateNmsMetadata(IReadOnlyDictionary<string, string> metadata)
-        {
-            string nmsRequired;
-            bool parsedNmsRequired;
-            if (!metadata.TryGetValue("nms_required", out nmsRequired) ||
-                !bool.TryParse(nmsRequired, out parsedNmsRequired))
-            {
-                throw new NotSupportedException(
-                    "Expected boolean nms_required metadata in the object-detection model.");
-            }
-        }
     }
 }

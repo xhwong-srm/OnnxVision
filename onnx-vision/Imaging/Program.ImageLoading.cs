@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Euresys.Open_eVision_22_12;
 using OnnxVision.Classification;
 using OnnxVision.Detection;
 using OnnxVision.Euresys;
+using OnnxVision.Imaging;
 
 namespace OnnxVision
 {
@@ -31,6 +33,48 @@ namespace OnnxVision
                 return;
             foreach (LoadedImage image in images)
                 image.Dispose();
+        }
+
+        private static List<LoadedImageBatch> BuildInferenceBatches(
+            IReadOnlyList<LoadedImage> images, int batchSize)
+        {
+            var batches = new List<LoadedImageBatch>();
+            for (int offset = 0; offset < images.Count; offset += batchSize)
+            {
+                int logicalCount = Math.Min(batchSize, images.Count - offset);
+                var physicalImages = new List<LoadedImage>(batchSize);
+                for (int index = 0; index < logicalCount; index++)
+                    physicalImages.Add(images[offset + index]);
+                while (physicalImages.Count < batchSize)
+                    physicalImages.Add(physicalImages[physicalImages.Count - 1]);
+                batches.Add(new LoadedImageBatch(physicalImages, logicalCount));
+            }
+            return batches;
+        }
+
+        private sealed class LoadedImageBatch
+        {
+            public LoadedImageBatch(IReadOnlyList<LoadedImage> images, int logicalCount)
+            {
+                Images = images;
+                LogicalCount = logicalCount;
+            }
+
+            public IReadOnlyList<LoadedImage> Images { get; private set; }
+            public int LogicalCount { get; private set; }
+
+            public IReadOnlyList<OnnxClassification> Classify(
+                OnnxClassificationModel model, RoiPlacement roi)
+            {
+                return model.ClassifyBatch(Images.Select(image => image.CreateBuffer(roi)).ToArray());
+            }
+
+            public IReadOnlyList<IReadOnlyList<OnnxDetection>> Detect(
+                OnnxObjectDetectionModel model, float confidenceThreshold, float nmsIouThreshold)
+            {
+                return model.DetectBatch(Images.Select(image => image.CreateBuffer(null)).ToArray(),
+                    confidenceThreshold, nmsIouThreshold);
+            }
         }
 
         private sealed class LoadedImage : IDisposable
@@ -81,6 +125,21 @@ namespace OnnxVision
                 if (C24 != null)
                     return roi == null ? model.Classify(C24) : model.Classify(C24, roi.ToRectangle());
                 return roi == null ? model.Classify(Bw8) : model.Classify(Bw8, roi.ToRectangle());
+            }
+
+            public OnnxImageBuffer CreateBuffer(RoiPlacement roi)
+            {
+                if (C24 != null)
+                {
+                    return roi == null
+                        ? EuresysOnnxExtensions.CreateImageBuffer(C24,
+                            new System.Drawing.Rectangle(0, 0, C24.Width, C24.Height))
+                        : EuresysOnnxExtensions.CreateImageBuffer(C24, roi.ToRectangle());
+                }
+                return roi == null
+                    ? EuresysOnnxExtensions.CreateImageBuffer(Bw8,
+                        new System.Drawing.Rectangle(0, 0, Bw8.Width, Bw8.Height))
+                    : EuresysOnnxExtensions.CreateImageBuffer(Bw8, roi.ToRectangle());
             }
 
             public IReadOnlyList<OnnxDetection> Detect(

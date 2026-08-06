@@ -290,8 +290,9 @@ class TimmClassificationBackend:
         mean = tuple(float(item) for item in data_config.get("mean", _DEFAULT_MEAN))
         std = tuple(float(item) for item in data_config.get("std", _DEFAULT_STD))
         core = context.run_dir / "core-float32.onnx"
-        tensor = torch.zeros(1, 3, size, size)
-        batch = torch.export.Dim("batch", min=1)
+        export_batch = request.batch_size or 1
+        tensor = torch.zeros(export_batch, 3, size, size)
+        batch = torch.export.Dim("batch", min=1) if request.batch_size is None else None
 
         class ProbabilityModel(torch.nn.Module):
             def __init__(self, classifier):
@@ -310,18 +311,23 @@ class TimmClassificationBackend:
                 output_names=["probabilities"],
                 opset_version=request.opset,
                 dynamo=True,
-                dynamic_shapes=({0: batch},),
+                dynamic_shapes=({0: batch},) if batch is not None else None,
                 external_data=False,
                 optimize=True,
                 verify=True,
                 verbose=False,
             )
         outputs = embedded_output_paths(request.output)
-        paths = wrap_embedded_variants(core, outputs, image_size=size, mean=mean, std=std)
-        contract = classification_contract(classes)
+        paths = wrap_embedded_variants(
+            core, outputs, image_size=size, mean=mean, std=std,
+            batch_size=request.batch_size,
+        )
+        contract = classification_contract(classes, batch_size=request.batch_size)
         checks: list[dict[str, Any]] = []
         for variant, path in outputs.items():
-            variant_contract = classification_contract(classes, input_variant=variant)
+            variant_contract = classification_contract(
+                classes, input_variant=variant, batch_size=request.batch_size
+            )
             set_onnx_metadata(path, metadata_for_contract(variant_contract))
             checks.extend({**check, "variant": variant} for check in validate_onnx(path, variant_contract))
         return Execution(tuple(artifact(path, "onnx") for path in paths), {}, contract, tuple(checks))

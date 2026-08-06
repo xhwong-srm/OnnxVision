@@ -1839,6 +1839,7 @@ test = [
 timm = [
     { name = "numpy" },
     { name = "onnx" },
+    { name = "onnxruntime" },
     { name = "onnxscript" },
     { name = "timm" },
     { name = "torch" },
@@ -1863,6 +1864,7 @@ requires-dist = [
     { name = "onnx", marker = "extra == 'timm'", specifier = ">=1.22.0" },
     { name = "onnx", marker = "extra == 'ultralytics'", specifier = ">=1.22.0" },
     { name = "onnxruntime", marker = "extra == 'libreyolo'", specifier = ">=1.27.0" },
+    { name = "onnxruntime", marker = "extra == 'timm'", specifier = ">=1.27.0" },
     { name = "onnxruntime", marker = "extra == 'ultralytics'", specifier = ">=1.27.0" },
     { name = "onnxscript", marker = "extra == 'libreyolo'", specifier = ">=0.5" },
     { name = "onnxscript", marker = "extra == 'timm'", specifier = ">=0.5" },

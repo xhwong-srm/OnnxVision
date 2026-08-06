@@ -65,3 +65,13 @@ def test_cli_accepts_timm_pretrained_configuration_name() -> None:
     ]
     args = _parse(argv)
     assert args.model == model
+
+
+def test_export_batch_size_is_optional_and_positive() -> None:
+    base = [
+        "export", "--task", "classification", "--framework", "timm",
+        "--model", "mobilenetv4_conv_small_050.e3000_r224_in1k",
+        "--checkpoint", "model.pt", "--output", "model.onnx",
+    ]
+    assert getattr(_parse(base), "batch_size", None) is None
+    assert _parse(base + ["--batch-size", "4"]).batch_size == 4

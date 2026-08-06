@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..domain.errors import ConfigurationError
 from ..domain.results import ArtifactRef
 from ..workflows.context import WorkflowContext, optional_import
 from ..workflows.requests import ResolvedExportRequest, ResolvedTestRequest, ResolvedTrainRequest, ResolvedValidateRequest
@@ -72,7 +73,28 @@ class LibreYoloBackend:
         checkpoint = require_file(request.checkpoint, "checkpoint")
         model = self._model(request)
         nms_required = bool(request.options.get("nms_required", False))
-        exported = Path(model.export(format="onnx", imgsz=request.image_size, opset=request.opset, simplify=request.simplify, dynamic=True, nms=not nms_required, device=request.device))
+        if nms_required:
+            raise ConfigurationError(
+                "LibreYOLO raw detection output is provider-specific and cannot be "
+                "serialized as contract candidates; use embedded NMS (nms_required=false)"
+            )
+        if not nms_required and request.batch_size != 1:
+            raise ValueError(
+                "LibreYOLO embedded NMS supports only fixed batch 1; use "
+                "--batch-size 1 or request consumer-side NMS"
+            )
+        exported = Path(model.export(
+            format="onnx",
+            imgsz=request.image_size,
+            opset=request.opset,
+            simplify=request.simplify,
+            dynamic=request.batch_size is None,
+            batch=request.batch_size or 1,
+            nms=not nms_required,
+            conf=0.0,
+            iou=0.7,
+            device=request.device,
+        ))
         names = class_names_from_model(model)
         if not names:
             raise ValueError("the exported detection model does not expose class names")
@@ -80,6 +102,8 @@ class LibreYoloBackend:
             exported,
             context.run_dir / "core-detection-contract.onnx",
             image_size=request.image_size,
+            source_box_format="xyxy",
+            source_box_space="pixels",
         )
         outputs = embedded_output_paths(request.output)
         paths = wrap_embedded_variants(
@@ -88,11 +112,19 @@ class LibreYoloBackend:
             image_size=request.image_size,
             mean=(0.0, 0.0, 0.0),
             std=(1.0, 1.0, 1.0),
+            batch_size=request.batch_size,
         )
-        contract = detection_contract(names, nms_required=nms_required)
+        contract = detection_contract(
+            names, nms_required=nms_required, batch_size=request.batch_size
+        )
         checks: list[dict[str, Any]] = []
         for variant, path in outputs.items():
-            variant_contract = detection_contract(names, nms_required=nms_required, input_variant=variant)
+            variant_contract = detection_contract(
+                names,
+                nms_required=nms_required,
+                input_variant=variant,
+                batch_size=request.batch_size,
+            )
             set_onnx_metadata(path, metadata_for_contract(variant_contract))
             checks.extend({**check, "variant": variant} for check in validate_onnx(path, variant_contract))
         return Execution(tuple(artifact(path, "onnx") for path in paths), {}, contract, tuple(checks))

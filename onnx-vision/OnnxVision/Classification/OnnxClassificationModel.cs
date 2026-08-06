@@ -45,7 +45,10 @@ namespace OnnxVision.Classification
             session = CreateSession(modelPath, providers, out OnnxExecutionProvider actualProvider);
             ActualProvider = actualProvider;
 
-            ValidateContract(session.ModelMetadata.CustomMetadataMap);
+            OnnxContractMetadata contract = OnnxContractMetadata.Read(
+                session,
+                OnnxVisionContract.ClassificationTask,
+                OnnxVisionContract.ClassificationName);
 
             var input = session.InputMetadata.Single();
             inputName = input.Key;
@@ -66,22 +69,16 @@ namespace OnnxVision.Classification
             {
                 session.Dispose();
                 throw new NotSupportedException(
-                    "ONNX classification requires embedded preprocessing with dynamic-batch uint8 [B,1,H,W] BW8 NCHW or uint8 [B,H,W,3] C24 NHWC BGR input.");
+                    "ONNX classification requires embedded preprocessing with uint8 [B,1,H,W] BW8 NCHW or uint8 [B,H,W,3] C24 NHWC BGR input.");
             }
             inputBatchDimension = dimensions[0];
-            if (inputBatchDimension > 0)
-                throw new NotSupportedException("ONNX classification requires a dynamic batch dimension.");
 
             try
             {
-                classNames = ReadEmbeddedClassNames(session);
-                if (classNames == null || classNames.Length == 0)
-                    throw new InvalidOperationException("The ONNX model must contain contiguous class names in the 'names' metadata.");
-
-                if (session.OutputNames.Count() != 1)
-                    throw new NotSupportedException("ONNX classification requires exactly one output tensor.");
-                outputName = session.OutputNames[0];
-                classCount = ResolveClassCount(session.OutputMetadata[outputName], classNames.Length);
+                classNames = contract.ClassNames;
+                outputName = "probabilities";
+                classCount = ResolveClassCount(
+                    session.OutputMetadata[outputName], classNames.Length, inputBatchDimension);
                 inputNames = new[] { inputName };
                 outputNames = new[] { outputName };
             }
@@ -99,11 +96,16 @@ namespace OnnxVision.Classification
         public int InputWidth { get { return inputWidth; } }
         public int InputHeight { get { return inputHeight; } }
         public bool SupportsDynamicBatch { get { return inputBatchDimension <= 0; } }
+        public int? FixedBatchSize { get { return SupportsDynamicBatch ? (int?)null : inputBatchDimension; } }
         public bool RequiresColorInput { get { return requiredPixelFormat == OnnxPixelFormat.Bgr24; } }
 
         public OnnxClassification Classify(OnnxImageBuffer image)
         {
             ThrowIfDisposed();
+            if (!SupportsDynamicBatch && inputBatchDimension != 1)
+                throw new NotSupportedException(string.Format(
+                    "This model requires batch size {0}; use ClassifyBatch with exactly that many images.",
+                    inputBatchDimension));
             ValidateImage(image);
 
             InputWorkspace workspace;
@@ -219,7 +221,7 @@ namespace OnnxVision.Classification
         {
             if (images == null || images.Count == 0)
                 throw new ArgumentException("At least one image is required.", "images");
-            if (inputBatchDimension > 0 && images.Count != inputBatchDimension)
+            if (!SupportsDynamicBatch && images.Count != inputBatchDimension)
                 throw new ArgumentException(string.Format(
                     "The model requires batch size {0}, but {1} images were supplied.",
                     inputBatchDimension, images.Count), "images");
@@ -231,29 +233,6 @@ namespace OnnxVision.Classification
                 ValidateImage(images[index]);
                 if (images[index].Width != first.Width || images[index].Height != first.Height)
                     throw new ArgumentException("All images in a batch must have the same dimensions.", "images");
-            }
-        }
-
-        private static void ValidateContract(IReadOnlyDictionary<string, string> metadata)
-        {
-            string task;
-            string contractName;
-            string contractVersion;
-            string names;
-            if (!metadata.TryGetValue("vision_task", out task) ||
-                task != OnnxVisionContract.ClassificationTask ||
-                !metadata.TryGetValue("contract_name", out contractName) ||
-                contractName != OnnxVisionContract.ClassificationName ||
-                !metadata.TryGetValue("contract_version", out contractVersion) ||
-                contractVersion != OnnxVisionContract.Version ||
-                !metadata.TryGetValue("names", out names) ||
-                string.IsNullOrWhiteSpace(names) ||
-                !metadata.ContainsKey("inputs") ||
-                !metadata.ContainsKey("outputs"))
-            {
-                throw new NotSupportedException(
-                    "Expected the " + OnnxVisionContract.ClassificationName +
-                    " " + OnnxVisionContract.Version + " classification metadata contract.");
             }
         }
 
@@ -357,48 +336,38 @@ namespace OnnxVision.Classification
             }
         }
 
-        private static int ResolveClassCount(NodeMetadata output, int classCount)
+        private static int ResolveClassCount(NodeMetadata output, int classCount, int batchDimension)
         {
             if (output.ElementType != typeof(float))
                 throw new NotSupportedException("ONNX classification output must contain float scores.");
 
             int[] dimensions = output.Dimensions;
-            if (dimensions.Length == 2 && dimensions[0] <= 0 &&
+            if (dimensions.Length == 2 &&
+                ((batchDimension <= 0 && dimensions[0] <= 0) ||
+                 (batchDimension > 0 && dimensions[0] == batchDimension)) &&
                 (dimensions[1] <= 0 || dimensions[1] == classCount))
                 return classCount;
 
             throw new NotSupportedException(string.Format(
-                "ONNX classification output must have dynamic-batch shape [B,{0}].", classCount));
+                "ONNX classification output must have shape [B,{0}] matching the model batch contract.", classCount));
         }
 
         private static float[] ToProbabilities(ReadOnlySpan<float> scores)
         {
             var probabilities = new float[scores.Length];
             double sum = 0;
-            bool alreadyProbabilities = true;
             for (int i = 0; i < scores.Length; i++)
             {
                 float value = scores[i];
                 probabilities[i] = value;
-                alreadyProbabilities &=
-                    !float.IsNaN(value) && !float.IsInfinity(value) && value >= 0f && value <= 1f;
+                if (float.IsNaN(value) || float.IsInfinity(value) || value < 0f || value > 1f)
+                    throw new InvalidOperationException(
+                        "Classification output must contain finite probabilities within [0,1].");
                 sum += value;
             }
-            if (alreadyProbabilities && Math.Abs(sum - 1.0) <= 0.001)
-                return probabilities;
-
-            float maximum = probabilities[0];
-            for (int i = 1; i < probabilities.Length; i++)
-            {
-                if (probabilities[i] > maximum)
-                    maximum = probabilities[i];
-            }
-
-            double denominator = 0;
-            for (int i = 0; i < probabilities.Length; i++)
-                denominator += Math.Exp(probabilities[i] - maximum);
-            for (int i = 0; i < probabilities.Length; i++)
-                probabilities[i] = (float)(Math.Exp(probabilities[i] - maximum) / denominator);
+            if (Math.Abs(sum - 1.0) > 0.001)
+                throw new InvalidOperationException(
+                    "Classification probability rows must sum to one.");
             return probabilities;
         }
 

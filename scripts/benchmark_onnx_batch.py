@@ -84,7 +84,7 @@ def _measure(session, input_name: str, value: np.ndarray, warmups: int, repeats:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", type=Path)
-    parser.add_argument("--batches", default="1,2,4,8,16,32")
+    parser.add_argument("--batches", help="comma-separated batches; defaults to the fixed model batch or 1,2,4,8,16,32")
     parser.add_argument("--height", type=int, default=224)
     parser.add_argument("--width", type=int, default=224)
     parser.add_argument("--warmups", type=int, default=20)
@@ -102,15 +102,21 @@ def main() -> None:
     providers = _providers(args.provider, ort)
     session = ort.InferenceSession(str(model), providers=providers)
     input_info = session.get_inputs()[0]
+    declared_batch = input_info.shape[0]
+    fixed_batch = int(declared_batch) if isinstance(declared_batch, int) and declared_batch > 0 else None
+    requested_batches = _parse_batches(args.batches) if args.batches else (
+        (fixed_batch,) if fixed_batch is not None else _parse_batches("1,2,4,8,16,32")
+    )
     result: dict[str, object] = {
         "model": str(model),
         "providers": session.get_providers(),
         "input_name": input_info.name,
         "input_type": input_info.type,
         "declared_input_shape": list(input_info.shape),
+        "batch_contract": {"mode": "fixed", "size": fixed_batch} if fixed_batch is not None else {"mode": "dynamic"},
         "batches": [],
     }
-    for batch in _parse_batches(args.batches):
+    for batch in requested_batches:
         value = _input_value(session, batch, args.height, args.width, args.seed + batch)
         try:
             measurement = _measure(session, input_info.name, value, args.warmups, args.repeats)

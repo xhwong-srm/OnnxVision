@@ -59,9 +59,14 @@
     <Reference Include="System.Core" />
     <Reference Include="System.Drawing" />
     <Reference Include="System.Runtime.Serialization" />
+    <Reference Include="System.Web.Extensions" />
     <Reference Include="System.Xml" />
     <Reference Include="System.Memory">
       <HintPath>$(UserProfile)\.nuget\packages\system.memory\4.5.5\lib\net461\System.Memory.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+    <Reference Include="Microsoft.ML.OnnxRuntime">
+      <HintPath>$(UserProfile)\.nuget\packages\microsoft.ml.onnxruntime.managed\1.24.1\lib\netstandard2.0\Microsoft.ML.OnnxRuntime.dll</HintPath>
       <Private>True</Private>
     </Reference>
     <Reference Include="Open_eVision_NetApi_22_12">
@@ -81,6 +86,7 @@
     <Compile Include="Detection\OnnxObjectDetectionModel.cs" />
     <Compile Include="Imaging\OnnxImageBuffer.cs" />
     <Compile Include="Runtime\OnnxExecutionProvider.cs" />
+    <Compile Include="Runtime\OnnxContractMetadata.cs" />
     <Compile Include="Runtime\OnnxModelTaskDetector.cs" />
     <Compile Include="Runtime\OnnxRuntimeEnvironment.cs" />
     <Compile Include="Runtime\OnnxVisionContract.cs" />

@@ -59,7 +59,7 @@ namespace OnnxVision.Euresys
         }
 
         public static IReadOnlyList<OnnxDetection> Detect(this OnnxObjectDetectionModel model,
-            string imagePath, float confidenceThreshold = 0.5f, float nmsIouThreshold = 1.0f)
+            string imagePath, float confidenceThreshold = 0.5f, float nmsIouThreshold = 0.7f)
         {
             if (model == null)
                 throw new ArgumentNullException("model");
@@ -83,7 +83,7 @@ namespace OnnxVision.Euresys
         }
 
         public static IReadOnlyList<OnnxDetection> Detect(this OnnxObjectDetectionModel model,
-            EImageBW8 image, float confidenceThreshold = 0.5f, float nmsIouThreshold = 1.0f)
+            EImageBW8 image, float confidenceThreshold = 0.5f, float nmsIouThreshold = 0.7f)
         {
             if (image == null)
                 throw new ArgumentNullException("image");
@@ -93,7 +93,7 @@ namespace OnnxVision.Euresys
 
         public static IReadOnlyList<OnnxDetection> Detect(this OnnxObjectDetectionModel model,
             EImageBW8 image, Rectangle region, float confidenceThreshold = 0.5f,
-            float nmsIouThreshold = 1.0f)
+            float nmsIouThreshold = 0.7f)
         {
             if (model == null)
                 throw new ArgumentNullException("model");
@@ -102,7 +102,7 @@ namespace OnnxVision.Euresys
         }
 
         public static IReadOnlyList<OnnxDetection> Detect(this OnnxObjectDetectionModel model,
-            EImageC24 image, float confidenceThreshold = 0.5f, float nmsIouThreshold = 1.0f)
+            EImageC24 image, float confidenceThreshold = 0.5f, float nmsIouThreshold = 0.7f)
         {
             if (image == null)
                 throw new ArgumentNullException("image");
@@ -112,7 +112,7 @@ namespace OnnxVision.Euresys
 
         public static IReadOnlyList<OnnxDetection> Detect(this OnnxObjectDetectionModel model,
             EImageC24 image, Rectangle region, float confidenceThreshold = 0.5f,
-            float nmsIouThreshold = 1.0f)
+            float nmsIouThreshold = 0.7f)
         {
             if (model == null)
                 throw new ArgumentNullException("model");
@@ -121,7 +121,7 @@ namespace OnnxVision.Euresys
         }
 
         public static IReadOnlyList<OnnxDetection> Detect(this OnnxObjectDetectionModel model,
-            EROIBW8 roi, float confidenceThreshold = 0.5f, float nmsIouThreshold = 1.0f)
+            EROIBW8 roi, float confidenceThreshold = 0.5f, float nmsIouThreshold = 0.7f)
         {
             if (model == null)
                 throw new ArgumentNullException("model");
@@ -131,7 +131,7 @@ namespace OnnxVision.Euresys
         }
 
         public static IReadOnlyList<OnnxDetection> Detect(this OnnxObjectDetectionModel model,
-            EROIC24 roi, float confidenceThreshold = 0.5f, float nmsIouThreshold = 1.0f)
+            EROIC24 roi, float confidenceThreshold = 0.5f, float nmsIouThreshold = 0.7f)
         {
             if (model == null)
                 throw new ArgumentNullException("model");

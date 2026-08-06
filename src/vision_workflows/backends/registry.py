@@ -42,6 +42,14 @@ def _training(image_size: int | None) -> ParameterSchema:
 def _export(image_size: int, *, nms_configurable: bool = False) -> ParameterSchema:
     base = _schema(
         ParameterSpec("image_size", int, "square export image size", image_size, minimum=1),
+        ParameterSpec(
+            "batch_size",
+            int,
+            "fixed ONNX batch size; omit for a dynamic batch axis",
+            None,
+            allow_none=True,
+            minimum=1,
+        ),
         ParameterSpec("opset", int, "ONNX operator-set version", 18, minimum=7),
         ParameterSpec("simplify", bool, "simplify the exported ONNX graph", True),
         ParameterSpec("device", str, "export device", "auto"),

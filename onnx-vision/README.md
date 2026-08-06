@@ -42,7 +42,7 @@ Both variants intentionally produce the `OnnxVision` assembly and contain the sa
   `C:\VisionRef64\Open_eVision_NetApi_22_12.dll`
 - NuGet restore access to `Intel.ML.OnnxRuntime.OpenVino` version `1.24.1`.
 
-The Intel OpenVINO package supplies the managed ONNX Runtime dependency transitively. There is no explicit `Microsoft.ML.OnnxRuntime` project reference. The projects copy the package's `win-x64` native OpenVINO/ONNX Runtime DLLs to their output directories.
+The Intel OpenVINO package supplies the managed ONNX Runtime dependency transitively to the SDK-style build. The legacy project includes an assembly hint to the same package version because old-style MSBuild does not expose that transitive compile reference reliably. The projects copy the package's `win-x64` native OpenVINO/ONNX Runtime DLLs to their output directories.
 
 ## Build
 
@@ -82,7 +82,7 @@ Show usage:
 .\onnx-vision\bin\Release\net461\win7-x64\OnnxVisionCLI.exe --help
 ```
 
-The CLI identifies classification versus object detection from the required ONNX metadata contract. Classification models use `onnx-vision-classification`; object-detection models use `onnx-vision-object-detection`. Contract `2.0.0` requires `vision_task`, `contract_name`, `contract_version`, `inputs`, `outputs`, and `names`; detection models also provide `nms_required`. Each artifact is a single embedded-preprocessing variant: BW8 uses dynamic-batch `uint8[B,1,H,W]` NCHW and C24 uses dynamic-batch `uint8[B,H,W,3]` raw-BGR NHWC. Classification outputs are `float32[B,C]`; detection outputs are normalized `xyxy` `boxes[B,Q,4]`, `scores[B,Q]`, and `class_ids[B,Q]`. Tensor and input validation is then performed by the selected model implementation. The CLI preloads images, runs ten warmup calls, repeats the measured pass as requested, and reports session construction, image loading, warmup calls, shared model calls, measured wall time, end-to-end time, and throughput. `repeats` defaults to `1`.
+The CLI identifies classification versus object detection from the required ONNX metadata contract. Classification models use `onnx-vision-classification`; object-detection models use `onnx-vision-object-detection`. Consumers accept valid `2.x.y` versions, validate every known serialized field and tensor, and permit additive unknown metadata; incompatible semantics require a new major version. Each artifact is a single embedded-preprocessing variant: BW8 uses `uint8[B,1,H,W]` NCHW and C24 uses `uint8[B,H,W,3]` raw-BGR NHWC. Batch may be dynamic or fixed. Classification outputs are categorical probabilities in `float32[B,C]`, with finite `[0,1]` rows summing to 1. Detection outputs are normalized ordered `xyxy` `boxes[B,Q,4]`, `[0,1]` `scores[B,Q]`, and `class_ids[B,Q]`; score-zero rows are padding and ignored before box/class validation. Provider-owned exports use confidence `0` and IoU `0.7`; class-aware consumer NMS at IoU `0.7` is applied only when `nms_required=true`. The CLI preloads images, runs warmup calls, repeats the measured pass as requested, and reports session construction, image loading, warmup calls, shared model calls, measured wall time, end-to-end time, and logical-image throughput. For fixed-batch models it requires the model batch internally, pads only the final batch by duplicating its last image, and discards padded results. `repeats` defaults to `1`.
 
 Both tasks accept a single image, a directory of images, or a labeled dataset. A
 single image and a flat image directory are inference-only inputs. Add `-dataset`
@@ -157,9 +157,11 @@ using (var image = new EImageBW8())
 
 The same adapter pattern is available for `EImageC24`, `EROIBW8`, `EROIC24`, and object detection. Region overloads accept a `System.Drawing.Rectangle` without requiring an intermediate image file.
 
-For dynamic-batch inference, use `ClassifyBatch` or `DetectBatch` with images that
-share the same dimensions and pixel format. The returned results preserve input
-order; detection postprocessing and NMS are applied independently per image.
+Use `ClassifyBatch` or `DetectBatch` with images that share the same dimensions
+and pixel format. Dynamic models accept any positive batch; fixed models require
+exactly `FixedBatchSize`. Single-image methods reject fixed batches greater than
+one. The returned results preserve input order; detection postprocessing and NMS
+are applied independently per image.
 
 ## Runtime deployment
 
