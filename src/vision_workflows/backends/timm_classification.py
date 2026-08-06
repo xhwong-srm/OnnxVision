@@ -183,7 +183,10 @@ class TimmClassificationBackend:
             completed_epoch = int(resume_state.get("epoch", 0))
             start_epoch = completed_epoch + 1
             metrics = resume_state.get("metrics", {})
-            best_accuracy = float(resume_state.get("best_accuracy", metrics.get("val_accuracy", -1.0)))
+            saved_best_accuracy = resume_state.get("best_accuracy")
+            if saved_best_accuracy is None:
+                saved_best_accuracy = metrics.get("val_accuracy", -1.0)
+            best_accuracy = float(saved_best_accuracy if saved_best_accuracy is not None else -1.0)
             best_epoch = int(resume_state.get("best_epoch", completed_epoch if best_accuracy >= 0 else 0))
             stale_epochs = int(resume_state.get("stale_epochs", 0))
             history = list(resume_state.get("history", []))
@@ -209,37 +212,61 @@ class TimmClassificationBackend:
                     if isinstance(layer, torch.nn.modules.batchnorm._BatchNorm):
                         layer.eval()
             train_loss_total = torch.zeros((), device=device, dtype=torch.float32)
+            train_correct = torch.zeros((), device=device, dtype=torch.int64)
+            train_total = torch.zeros((), device=device, dtype=torch.int64)
             with tqdm(loader, desc=f"Epoch {epoch}/{request.epochs} train", unit="batch", leave=False) as progress:
                 for images, labels in progress:
                     images = images.to(device, non_blocking=training_options.pin_memory)
                     labels = labels.to(device, non_blocking=training_options.pin_memory)
                     optimizer.zero_grad(set_to_none=True)
                     with training_options.autocast(torch, device):
-                        loss = criterion(training_model(images), labels)
+                        logits = training_model(images)
+                        loss = criterion(logits, labels)
                     training_options.backward_step(loss, optimizer, scaler)
-                    train_loss_total.add_(loss.detach().float())
-            train_loss = float(train_loss_total.cpu()) / max(1, len(loader))
+                    batch_size = labels.numel()
+                    train_loss_total.add_(loss.detach().float() * batch_size)
+                    train_correct.add_((logits.detach().argmax(1) == labels).sum())
+                    train_total.add_(batch_size)
+            train_samples = max(1, int(train_total.item()))
+            train_loss = float(train_loss_total.item()) / train_samples
+            train_accuracy = float(train_correct.item()) / train_samples
             training_model.eval()
             validate = epoch == start_epoch or epoch == request.epochs or (epoch - start_epoch) % validation_interval == 0
             if validate:
                 correct = torch.zeros((), device=device, dtype=torch.int64)
                 total = torch.zeros((), device=device, dtype=torch.int64)
+                val_loss_total = torch.zeros((), device=device, dtype=torch.float32)
                 with torch.inference_mode():
                     with tqdm(val_loader, desc=f"Epoch {epoch}/{request.epochs} val", unit="batch", leave=False) as progress:
                         for images, labels in progress:
-                            with training_options.autocast(torch, device):
-                                predictions = training_model(images.to(device, non_blocking=training_options.pin_memory)).argmax(1)
+                            images = images.to(device, non_blocking=training_options.pin_memory)
                             labels = labels.to(device, non_blocking=training_options.pin_memory)
+                            with training_options.autocast(torch, device):
+                                logits = training_model(images)
+                                loss = criterion(logits, labels)
+                            predictions = logits.argmax(1)
+                            val_loss_total.add_(loss.float() * labels.numel())
                             correct.add_((predictions == labels).sum())
                             total.add_(labels.numel())
-                accuracy = correct.float().div(total.clamp_min(1)).item()
+                val_samples = max(1, int(total.item()))
+                val_loss = float(val_loss_total.item()) / val_samples
+                val_accuracy = float(correct.item()) / val_samples
             else:
-                accuracy = best_accuracy
-            row = {"epoch": epoch, "train_loss": train_loss, "val_accuracy": accuracy, "validated": validate}
+                val_loss = None
+                val_accuracy = None
+            row = {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "train_accuracy": train_accuracy,
+                "val_loss": val_loss,
+                "val_accuracy": val_accuracy,
+                "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                "validated": validate,
+            }
             history.append(row)
-            improved = validate and accuracy > best_accuracy
+            improved = validate and val_accuracy is not None and val_accuracy > best_accuracy
             if improved:
-                best_accuracy = accuracy
+                best_accuracy = val_accuracy
                 best_epoch = epoch
                 stale_epochs = 0
             elif validate:
@@ -256,8 +283,11 @@ class TimmClassificationBackend:
             if improved:
                 torch.save(payload, context.run_dir / "best.pt")
             logger.info(
-                "Epoch %d/%d complete: train_loss=%.6f val_accuracy=%.4f duration=%.1fs%s%s",
-                epoch, request.epochs, row["train_loss"], accuracy, time.perf_counter() - epoch_started,
+                "Epoch %d/%d complete: train_loss=%.6f train_accuracy=%.4f val_loss=%s val_accuracy=%s learning_rate=%.6g duration=%.1fs%s%s",
+                epoch, request.epochs, row["train_loss"], row["train_accuracy"],
+                f"{val_loss:.6f}" if val_loss is not None else "skipped",
+                f"{val_accuracy:.4f}" if val_accuracy is not None else "skipped",
+                row["learning_rate"], time.perf_counter() - epoch_started,
                 " best" if improved else "", f" patience={stale_epochs}/{request.patience}" if request.patience > 0 else "",
             )
             if request.patience > 0 and stale_epochs >= request.patience:
@@ -265,9 +295,38 @@ class TimmClassificationBackend:
                 break
         completed_epochs = max(start_epoch - 1, max((int(row.get("epoch", 0)) for row in history), default=0))
         stopped_early = request.patience > 0 and stale_epochs >= request.patience
-        logger.info("Training complete: epochs=%d/%d best_epoch=%d best_val_accuracy=%.4f elapsed=%.1fs", completed_epochs, request.epochs, best_epoch, best_accuracy, time.perf_counter() - started)
-        context.write_json("metrics.json", {"history": history, "best_val_accuracy": best_accuracy, "best_epoch": best_epoch, "epochs": completed_epochs, "stopped_early": stopped_early, "image_size": image_size, "classes": train_set.classes})
-        return Execution(tuple(artifact(context.run_dir / name, "checkpoint") for name in ("best.pt", "last.pt")), {"best_val_accuracy": best_accuracy, "best_epoch": best_epoch, "epochs": completed_epochs, "stopped_early": stopped_early, "image_size": image_size})
+        last_metrics = history[-1] if history else {}
+        best_metrics = next((row for row in reversed(history) if int(row.get("epoch", 0)) == best_epoch), {})
+        logger.info(
+            "Training complete: epochs=%d/%d best_epoch=%d best_val_loss=%s best_val_accuracy=%.4f last_train_loss=%s last_train_accuracy=%s last_val_loss=%s last_val_accuracy=%s elapsed=%.1fs",
+            completed_epochs, request.epochs, best_epoch,
+            f"{best_metrics['val_loss']:.6f}" if best_metrics.get("val_loss") is not None else "n/a",
+            best_accuracy,
+            f"{last_metrics['train_loss']:.6f}" if last_metrics.get("train_loss") is not None else "n/a",
+            f"{last_metrics['train_accuracy']:.4f}" if last_metrics.get("train_accuracy") is not None else "n/a",
+            f"{last_metrics['val_loss']:.6f}" if last_metrics.get("val_loss") is not None else "n/a",
+            f"{last_metrics['val_accuracy']:.4f}" if last_metrics.get("val_accuracy") is not None else "n/a",
+            time.perf_counter() - started,
+        )
+        summary = {
+            "history": history,
+            "best_val_accuracy": best_accuracy,
+            "best_val_loss": best_metrics.get("val_loss"),
+            "best_epoch": best_epoch,
+            "last_train_loss": last_metrics.get("train_loss"),
+            "last_train_accuracy": last_metrics.get("train_accuracy"),
+            "last_val_loss": last_metrics.get("val_loss"),
+            "last_val_accuracy": last_metrics.get("val_accuracy"),
+            "epochs": completed_epochs,
+            "stopped_early": stopped_early,
+            "image_size": image_size,
+            "classes": train_set.classes,
+        }
+        context.write_json("metrics.json", summary)
+        return Execution(
+            tuple(artifact(context.run_dir / name, "checkpoint") for name in ("best.pt", "last.pt")),
+            {key: value for key, value in summary.items() if key != "history"},
+        )
 
     def _load(self, checkpoint: Path, device: str):
         timm, torch, _ = self._imports()
@@ -350,12 +409,33 @@ class TimmClassificationBackend:
         if dataset.classes != classes:
             raise ValueError("dataset classes differ from checkpoint classes")
         loader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=False)
+        device = torch.device(
+            "cuda" if request.device in {"auto", "cuda"} and torch.cuda.is_available()
+            else request.device if request.device != "auto" else "cpu"
+        )
+        model.to(device)
+        criterion = torch.nn.CrossEntropyLoss()
+        loss_total = 0.0
         correct = total = 0
         with torch.inference_mode():
             for images, labels in loader:
-                correct += int((model(images).argmax(1) == labels).sum())
+                labels = labels.to(device)
+                logits = model(images.to(device))
+                loss_total += float(criterion(logits, labels).item()) * len(labels)
+                correct += int((logits.argmax(1) == labels).sum())
                 total += len(labels)
-        return {"accuracy": correct / max(1, total), "images": total}
+        metrics = {
+            "split": split,
+            "loss": loss_total / max(1, total),
+            "accuracy": correct / max(1, total),
+            "correct": correct,
+            "images": total,
+        }
+        logger.info(
+            "Evaluation complete: split=%s images=%d loss=%.6f accuracy=%.4f correct=%d",
+            split, total, metrics["loss"], metrics["accuracy"], correct,
+        )
+        return metrics
 
     def validate(self, request: ResolvedValidateRequest, context: WorkflowContext) -> BackendExecution:
         if request.target.suffix.casefold() == ".onnx":
