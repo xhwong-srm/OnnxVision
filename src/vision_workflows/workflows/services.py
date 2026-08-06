@@ -111,6 +111,11 @@ class ExportService:
             store.finish(run_id, "export", config, status=RunStatus.FAILED, error=str(error))
             context.emit("run_failed", {"error": str(error)})
             raise
+        if any(check.get("status") == "failed" for check in execution.checks):
+            error = "exported model failed its ONNX contract checks"
+            store.finish(run_id, "export", config, status=RunStatus.FAILED, error=error)
+            context.emit("run_failed", {"error": error})
+            raise ValidationFailedError(f"{error}; report: {context.run_dir / 'manifest.json'}")
         run = store.finish(run_id, "export", config, status=RunStatus.SUCCEEDED, artifacts=execution.artifacts, metrics=dict(execution.metrics))
         return ExportResult(run, execution.artifacts, dict(execution.contract), {"checks": execution.checks, "metrics": dict(execution.metrics)})
 

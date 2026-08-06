@@ -16,6 +16,7 @@ from .common import (
     metadata_for_contract,
     require_file,
     set_onnx_metadata,
+    standardize_detection_core,
     validate_onnx,
     wrap_embedded_variants,
 )
@@ -70,10 +71,12 @@ class LibreYoloBackend:
     def export(self, request: ResolvedExportRequest, context: WorkflowContext) -> BackendExecution:
         checkpoint = require_file(request.checkpoint, "checkpoint")
         model = self._model(request)
-        exported = Path(model.export(format="onnx", imgsz=request.image_size, opset=request.opset, simplify=request.simplify, dynamic=True, device=request.device))
+        nms_required = bool(request.options.get("nms_required", False))
+        exported = Path(model.export(format="onnx", imgsz=request.image_size, opset=request.opset, simplify=request.simplify, dynamic=True, nms=not nms_required, device=request.device))
         names = class_names_from_model(model)
         if not names:
             raise ValueError("the exported detection model does not expose class names")
+        exported = standardize_detection_core(exported, context.run_dir / "core-detection-contract.onnx")
         outputs = embedded_output_paths(request.output)
         paths = wrap_embedded_variants(
             exported,
@@ -82,10 +85,10 @@ class LibreYoloBackend:
             mean=(0.0, 0.0, 0.0),
             std=(1.0, 1.0, 1.0),
         )
-        contract = detection_contract(names, nms_required=bool(request.options.get("nms_required", False)))
+        contract = detection_contract(names, nms_required=nms_required)
         checks: list[dict[str, Any]] = []
         for variant, path in outputs.items():
-            variant_contract = detection_contract(names, nms_required=bool(request.options.get("nms_required", False)), input_variant=variant)
+            variant_contract = detection_contract(names, nms_required=nms_required, input_variant=variant)
             set_onnx_metadata(path, metadata_for_contract(variant_contract))
             checks.extend({**check, "variant": variant} for check in validate_onnx(path, variant_contract))
         return Execution(tuple(artifact(path, "onnx") for path in paths), {}, contract, tuple(checks))

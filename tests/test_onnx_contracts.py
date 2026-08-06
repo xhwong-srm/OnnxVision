@@ -9,6 +9,7 @@ from vision_workflows.backends.common import (
     classification_contract,
     detection_contract,
     metadata_for_contract,
+    standardize_detection_core,
 )
 
 
@@ -68,3 +69,29 @@ def test_metadata_rejects_non_semver_contract_versions() -> None:
 
     with pytest.raises(ValueError, match="major.minor.micro"):
         metadata_for_contract(contract)
+
+
+def test_standardize_detection_core_splits_end_to_end_batch_output(tmp_path) -> None:
+    onnx = pytest.importorskip("onnx")
+    graph = onnx.helper.make_graph(
+        [
+            onnx.helper.make_node("Identity", ["images"], ["output0"]),
+            onnx.helper.make_node("Identity", ["images"], ["raw"]),
+        ],
+        "end_to_end",
+        [onnx.helper.make_tensor_value_info("images", onnx.TensorProto.FLOAT, ["B", 2, 6])],
+        [
+            onnx.helper.make_tensor_value_info("output0", onnx.TensorProto.FLOAT, ["B", 2, 6]),
+            onnx.helper.make_tensor_value_info("raw", onnx.TensorProto.FLOAT, ["B", 2, 6]),
+        ],
+    )
+    model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 18)])
+    source = tmp_path / "raw.onnx"
+    target = tmp_path / "standardized.onnx"
+    onnx.save(model, source)
+
+    standardize_detection_core(source, target)
+    standardized = onnx.load(target)
+
+    assert [value.name for value in standardized.graph.output] == ["boxes", "scores", "class_ids"]
+    assert [len(value.type.tensor_type.shape.dim) for value in standardized.graph.output] == [3, 2, 2]

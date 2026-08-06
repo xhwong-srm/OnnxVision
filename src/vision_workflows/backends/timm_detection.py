@@ -316,7 +316,7 @@ class TimmDetectionBackend:
                 output_names=["boxes", "scores", "class_ids"],
                 opset_version=request.opset,
                 dynamo=True,
-                dynamic_shapes={"images": {0: batch}},
+                dynamic_shapes=({0: batch},),
                 external_data=False,
                 optimize=True,
                 verify=True,

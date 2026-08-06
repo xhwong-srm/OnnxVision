@@ -19,6 +19,7 @@ from .common import (
     metadata_for_contract,
     require_file,
     set_onnx_metadata,
+    standardize_detection_core,
     validate_onnx,
     wrap_embedded_variants,
 )
@@ -86,13 +87,18 @@ class UltralyticsBackend:
     def export(self, request: ResolvedExportRequest, context: WorkflowContext) -> BackendExecution:
         checkpoint = require_file(request.checkpoint, "checkpoint")
         model = self._model(request)
+        nms_required = bool(request.options.get("nms_required", False))
         options: dict[str, Any] = {"format": "onnx", "imgsz": request.image_size, "opset": request.opset, "simplify": request.simplify, "dynamic": True}
+        if self._task == "detection":
+            options["nms"] = not nms_required
         if request.device != "auto":
             options["device"] = request.device
         exported = Path(model.export(**options))
         names = class_names_from_model(model)
         if not names:
             raise ValueError(f"the exported {self._task} model does not expose class names")
+        if self._task == "detection":
+            exported = standardize_detection_core(exported, context.run_dir / "core-detection-contract.onnx")
         outputs = embedded_output_paths(request.output)
         paths = wrap_embedded_variants(
             exported,
@@ -106,14 +112,14 @@ class UltralyticsBackend:
         contract = (
             classification_contract(names)
             if self._task == "classification"
-            else detection_contract(names, nms_required=bool(request.options.get("nms_required", False)))
+            else detection_contract(names, nms_required=nms_required)
         )
         checks: list[dict[str, Any]] = []
         for variant, path in outputs.items():
             variant_contract = (
                 classification_contract(names, input_variant=variant)
                 if self._task == "classification"
-                else detection_contract(names, nms_required=bool(request.options.get("nms_required", False)), input_variant=variant)
+                else detection_contract(names, nms_required=nms_required, input_variant=variant)
             )
             set_onnx_metadata(path, metadata_for_contract(variant_contract))
             checks.extend({**check, "variant": variant} for check in validate_onnx(path, variant_contract))

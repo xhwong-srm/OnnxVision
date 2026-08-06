@@ -274,6 +274,116 @@ def embedded_output_paths(output: Path) -> dict[str, Path]:
     }
 
 
+def standardize_detection_core(core: Path, output: Path) -> Path:
+    """Convert a supported end-to-end detector output to the shared contract."""
+    onnx = optional_module("onnx")
+    model = onnx.load(str(require_file(core, "ONNX core artifact")))
+    graph = model.graph
+    if len(graph.output) == 3 and {value.name for value in graph.output} == {
+        "boxes", "scores", "class_ids"
+    }:
+        output_path = output.expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        onnx.checker.check_model(model)
+        onnx.save(model, str(output_path))
+        return output_path
+
+    if len(graph.output) not in {1, 2}:
+        raise ConfigurationError(
+            "detection ONNX export must emit boxes/scores/class_ids or an end-to-end [B,Q,6] tensor first"
+        )
+    raw = graph.output[0]
+    raw_type = raw.type.tensor_type
+    raw_shape = raw_type.shape.dim
+    if len(raw_shape) != 3 or not raw_shape[2].HasField("dim_value") or int(raw_shape[2].dim_value) != 6:
+        raise ConfigurationError(
+            "unsupported detection ONNX output; expected an end-to-end [B,Q,6] tensor first "
+            "or explicit boxes/scores/class_ids outputs"
+        )
+    if raw_type.elem_type != onnx.TensorProto.FLOAT:
+        raise ConfigurationError("end-to-end detection output must use float32 values")
+
+    from onnx import TensorProto, helper
+
+    graph.initializer.extend([
+        helper.make_tensor("contract/slice_starts", TensorProto.INT64, [1], [0]),
+        helper.make_tensor("contract/boxes_ends", TensorProto.INT64, [1], [4]),
+        helper.make_tensor("contract/score_starts", TensorProto.INT64, [1], [4]),
+        helper.make_tensor("contract/class_starts", TensorProto.INT64, [1], [5]),
+        helper.make_tensor("contract/slice_axes", TensorProto.INT64, [1], [2]),
+        helper.make_tensor("contract/score_ends", TensorProto.INT64, [1], [5]),
+        helper.make_tensor("contract/class_ends", TensorProto.INT64, [1], [6]),
+        helper.make_tensor("contract/squeeze_axes", TensorProto.INT64, [1], [2]),
+    ])
+    graph.node.extend([
+        helper.make_node(
+            "Slice",
+            [raw.name, "contract/slice_starts", "contract/boxes_ends", "contract/slice_axes"],
+            ["boxes"],
+            name="contract/boxes",
+        ),
+        helper.make_node(
+            "Slice",
+            [raw.name, "contract/score_starts", "contract/score_ends", "contract/slice_axes"],
+            ["contract/scores_column"],
+            name="contract/scores_slice",
+        ),
+        helper.make_node(
+            "Squeeze",
+            ["contract/scores_column", "contract/squeeze_axes"],
+            ["scores"],
+            name="contract/scores",
+        ),
+        helper.make_node(
+            "Slice",
+            [raw.name, "contract/class_starts", "contract/class_ends", "contract/slice_axes"],
+            ["contract/class_column"],
+            name="contract/class_slice",
+        ),
+        helper.make_node(
+            "Squeeze",
+            ["contract/class_column", "contract/squeeze_axes"],
+            ["contract/class_values"],
+            name="contract/class_squeeze",
+        ),
+        helper.make_node(
+            "Cast",
+            ["contract/class_values"],
+            ["class_ids"],
+            to=TensorProto.INT64,
+            name="contract/class_ids",
+        ),
+    ])
+    batch_dimension = _dimension_value(raw_shape[0], "B")
+    query_dimension = _dimension_value(raw_shape[1], "Q")
+    del graph.output[:]
+    graph.output.extend([
+        helper.make_tensor_value_info(
+            "boxes", TensorProto.FLOAT, [batch_dimension, query_dimension, 4]
+        ),
+        helper.make_tensor_value_info(
+            "scores", TensorProto.FLOAT, [batch_dimension, query_dimension]
+        ),
+        helper.make_tensor_value_info(
+            "class_ids", TensorProto.INT64, [batch_dimension, query_dimension]
+        ),
+    ])
+    graph.doc_string = "Standardized end-to-end detection output with dynamic batch."
+    output_path = output.expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    onnx.checker.check_model(model)
+    onnx.save(model, str(output_path))
+    return output_path
+
+
+def _dimension_value(dimension: Any, fallback: str) -> int | str | None:
+    if dimension.HasField("dim_value"):
+        return int(dimension.dim_value)
+    if dimension.HasField("dim_param"):
+        return dimension.dim_param
+    return fallback
+
+
 def wrap_embedded_variants(
     core: Path,
     outputs: dict[str, Path],
