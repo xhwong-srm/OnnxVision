@@ -79,6 +79,7 @@ class LibreYoloBackend:
             "pretrained": request.pretrained,
             "amp": request.amp,
             "cache": False if request.cache == "none" else request.cache,
+            "allow_experimental": True,
         }
         results = model.train(**options)
         best = Path(results.get("best_checkpoint", context.run_dir / "weights" / "best.pt"))
