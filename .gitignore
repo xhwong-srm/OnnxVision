@@ -17,3 +17,6 @@ runs/
 *pt
 artifacts/
 tmp/
+
+# Agents
+AGENTS.md
