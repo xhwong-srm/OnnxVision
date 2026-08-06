@@ -26,7 +26,8 @@ namespace OnnxVision.Classification
         private readonly OnnxPixelFormat requiredPixelFormat;
         private readonly int inputWidth;
         private readonly int inputHeight;
-        private readonly long[] outputShape;
+        private readonly int inputBatchDimension;
+        private readonly int classCount;
         private readonly string[] inputNames;
         private readonly string[] outputNames;
         private readonly ConcurrentBag<InputWorkspace> workspaces = new ConcurrentBag<InputWorkspace>();
@@ -65,8 +66,11 @@ namespace OnnxVision.Classification
             {
                 session.Dispose();
                 throw new NotSupportedException(
-                    "ONNX classification requires embedded preprocessing with uint8 [1,1,H,W] BW8 NCHW or uint8 [1,H,W,3] C24 NHWC BGR input.");
+                    "ONNX classification requires embedded preprocessing with dynamic-batch uint8 [B,1,H,W] BW8 NCHW or uint8 [B,H,W,3] C24 NHWC BGR input.");
             }
+            inputBatchDimension = dimensions[0];
+            if (inputBatchDimension > 0)
+                throw new NotSupportedException("ONNX classification requires a dynamic batch dimension.");
 
             try
             {
@@ -74,8 +78,10 @@ namespace OnnxVision.Classification
                 if (classNames == null || classNames.Length == 0)
                     throw new InvalidOperationException("The ONNX model must contain contiguous class names in the 'names' metadata.");
 
+                if (session.OutputNames.Count() != 1)
+                    throw new NotSupportedException("ONNX classification requires exactly one output tensor.");
                 outputName = session.OutputNames[0];
-                outputShape = ResolveOutputShape(session.OutputMetadata[outputName], classNames.Length);
+                classCount = ResolveClassCount(session.OutputMetadata[outputName], classNames.Length);
                 inputNames = new[] { inputName };
                 outputNames = new[] { outputName };
             }
@@ -92,6 +98,7 @@ namespace OnnxVision.Classification
         public OnnxPixelFormat RequiredPixelFormat { get { return requiredPixelFormat; } }
         public int InputWidth { get { return inputWidth; } }
         public int InputHeight { get { return inputHeight; } }
+        public bool SupportsDynamicBatch { get { return inputBatchDimension <= 0; } }
         public bool RequiresColorInput { get { return requiredPixelFormat == OnnxPixelFormat.Bgr24; } }
 
         public OnnxClassification Classify(OnnxImageBuffer image)
@@ -101,7 +108,7 @@ namespace OnnxVision.Classification
 
             InputWorkspace workspace;
             if (!workspaces.TryTake(out workspace))
-                workspace = new InputWorkspace(outputShape);
+                workspace = new InputWorkspace();
 
             try
             {
@@ -125,28 +132,7 @@ namespace OnnxVision.Classification
                     inputValue = workspace.StagingInput;
                 }
                 workspace.InputValues[0] = inputValue;
-
-                long started = Stopwatch.GetTimestamp();
-                session.Run(workspace.RunOptions, inputNames, workspace.InputValues, outputNames, workspace.OutputValues);
-                var scores = workspace.Output.GetTensorDataAsSpan<float>();
-                if (scores.Length != classNames.Length)
-                {
-                    throw new InvalidOperationException(string.Format(
-                        "Model returned {0} scores for {1} embedded class names.", scores.Length, classNames.Length));
-                }
-
-                var probabilities = ToProbabilities(scores);
-                int bestIndex = 0;
-                for (int i = 1; i < probabilities.Length; i++)
-                {
-                    if (probabilities[i] > probabilities[bestIndex])
-                        bestIndex = i;
-                }
-
-                double inferenceMilliseconds =
-                    (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
-                return new OnnxClassification(classNames[bestIndex], bestIndex,
-                    probabilities[bestIndex], probabilities, inferenceMilliseconds);
+                return Execute(workspace, inputValue, 1)[0];
             }
             finally
             {
@@ -154,6 +140,97 @@ namespace OnnxVision.Classification
                     workspace.Dispose();
                 else
                     workspaces.Add(workspace);
+            }
+        }
+
+        public IReadOnlyList<OnnxClassification> ClassifyBatch(IReadOnlyList<OnnxImageBuffer> images)
+        {
+            ThrowIfDisposed();
+            ValidateBatch(images);
+
+            InputWorkspace workspace;
+            if (!workspaces.TryTake(out workspace))
+                workspace = new InputWorkspace();
+
+            try
+            {
+                OnnxImageBuffer first = images[0];
+                int channels = first.BytesPerPixel;
+                int rowBytes = checked(first.Width * channels);
+                int imageLength = checked(rowBytes * first.Height);
+                int totalLength = checked(imageLength * images.Count);
+                long[] inputShape = requiredPixelFormat == OnnxPixelFormat.Bw8
+                    ? new long[] { images.Count, 1, first.Height, first.Width }
+                    : new long[] { images.Count, first.Height, first.Width, 3 };
+                IntPtr destination = workspace.PrepareStagingInput(totalLength, inputShape);
+                for (int index = 0; index < images.Count; index++)
+                {
+                    CopyRows(images[index].Data, images[index].RowStride,
+                        new IntPtr(destination.ToInt64() + (long)index * imageLength),
+                        rowBytes, first.Height);
+                }
+                workspace.InputValues[0] = workspace.StagingInput;
+                return Execute(workspace, workspace.StagingInput, images.Count);
+            }
+            finally
+            {
+                if (disposed)
+                    workspace.Dispose();
+                else
+                    workspaces.Add(workspace);
+            }
+        }
+
+        private IReadOnlyList<OnnxClassification> Execute(
+            InputWorkspace workspace, OrtValue inputValue, int batchSize)
+        {
+            workspace.PrepareOutput(batchSize, classCount);
+            workspace.InputValues[0] = inputValue;
+            long started = Stopwatch.GetTimestamp();
+            session.Run(workspace.RunOptions, inputNames, workspace.InputValues, outputNames, workspace.OutputValues);
+            var scores = workspace.Output.GetTensorDataAsSpan<float>();
+            int expectedLength = checked(batchSize * classCount);
+            if (scores.Length != expectedLength)
+            {
+                throw new InvalidOperationException(string.Format(
+                    "Model returned {0} scores for batch {1} and {2} embedded classes.",
+                    scores.Length, batchSize, classCount));
+            }
+
+            double inferenceMilliseconds =
+                (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
+            var results = new List<OnnxClassification>(batchSize);
+            for (int batchIndex = 0; batchIndex < batchSize; batchIndex++)
+            {
+                float[] probabilities = ToProbabilities(scores.Slice(batchIndex * classCount, classCount));
+                int bestIndex = 0;
+                for (int classIndex = 1; classIndex < probabilities.Length; classIndex++)
+                {
+                    if (probabilities[classIndex] > probabilities[bestIndex])
+                        bestIndex = classIndex;
+                }
+                results.Add(new OnnxClassification(classNames[bestIndex], bestIndex,
+                    probabilities[bestIndex], probabilities, inferenceMilliseconds));
+            }
+            return results;
+        }
+
+        private void ValidateBatch(IReadOnlyList<OnnxImageBuffer> images)
+        {
+            if (images == null || images.Count == 0)
+                throw new ArgumentException("At least one image is required.", "images");
+            if (inputBatchDimension > 0 && images.Count != inputBatchDimension)
+                throw new ArgumentException(string.Format(
+                    "The model requires batch size {0}, but {1} images were supplied.",
+                    inputBatchDimension, images.Count), "images");
+
+            OnnxImageBuffer first = images[0];
+            ValidateImage(first);
+            for (int index = 1; index < images.Count; index++)
+            {
+                ValidateImage(images[index]);
+                if (images[index].Width != first.Width || images[index].Height != first.Height)
+                    throw new ArgumentException("All images in a batch must have the same dimensions.", "images");
             }
         }
 
@@ -170,11 +247,13 @@ namespace OnnxVision.Classification
                 !metadata.TryGetValue("contract_version", out contractVersion) ||
                 contractVersion != OnnxVisionContract.Version ||
                 !metadata.TryGetValue("names", out names) ||
-                string.IsNullOrWhiteSpace(names))
+                string.IsNullOrWhiteSpace(names) ||
+                !metadata.ContainsKey("inputs") ||
+                !metadata.ContainsKey("outputs"))
             {
                 throw new NotSupportedException(
                     "Expected the " + OnnxVisionContract.ClassificationName +
-                    " 1.0.0 classification metadata contract.");
+                    " " + OnnxVisionContract.Version + " classification metadata contract.");
             }
         }
 
@@ -278,23 +357,18 @@ namespace OnnxVision.Classification
             }
         }
 
-        private static long[] ResolveOutputShape(NodeMetadata output, int classCount)
+        private static int ResolveClassCount(NodeMetadata output, int classCount)
         {
             if (output.ElementType != typeof(float))
                 throw new NotSupportedException("ONNX classification output must contain float scores.");
 
             int[] dimensions = output.Dimensions;
-            if (dimensions.Length == 1 && (dimensions[0] <= 0 || dimensions[0] == classCount))
-                return new long[] { classCount };
-            if (dimensions.Length == 2 &&
-                (dimensions[0] <= 0 || dimensions[0] == 1) &&
+            if (dimensions.Length == 2 && dimensions[0] <= 0 &&
                 (dimensions[1] <= 0 || dimensions[1] == classCount))
-            {
-                return new long[] { 1, classCount };
-            }
+                return classCount;
 
             throw new NotSupportedException(string.Format(
-                "ONNX classification output must have shape [{0}] or [1,{0}].", classCount));
+                "ONNX classification output must have dynamic-batch shape [B,{0}].", classCount));
         }
 
         private static float[] ToProbabilities(ReadOnlySpan<float> scores)
@@ -416,14 +490,12 @@ namespace OnnxVision.Classification
             private IntPtr directPointer;
             private int directLength;
             private long[] directShape;
+            private long[] outputShape;
 
-            public InputWorkspace(long[] outputShape)
+            public InputWorkspace()
             {
                 RunOptions = new RunOptions();
-                Output = OrtValue.CreateAllocatedTensorValue(
-                    OrtAllocator.DefaultInstance, TensorElementType.Float, outputShape);
                 InputValues = new OrtValue[1];
-                OutputValues = new[] { Output };
             }
 
             public RunOptions RunOptions { get; private set; }
@@ -431,6 +503,19 @@ namespace OnnxVision.Classification
             public OrtValue[] OutputValues { get; private set; }
             public OrtValue StagingInput { get; private set; }
             public OrtValue Output { get; private set; }
+
+            public void PrepareOutput(int batchSize, int classCount)
+            {
+                long[] shape = new long[] { batchSize, classCount };
+                if (Output != null && ShapesEqual(outputShape, shape))
+                    return;
+                if (Output != null)
+                    Output.Dispose();
+                Output = OrtValue.CreateAllocatedTensorValue(
+                    OrtAllocator.DefaultInstance, TensorElementType.Float, shape);
+                OutputValues = new[] { Output };
+                outputShape = shape;
+            }
 
             public IntPtr PrepareStagingInput(int length, long[] shape)
             {

@@ -1837,10 +1837,13 @@ test = [
     { name = "pytest-cov" },
 ]
 timm = [
+    { name = "numpy" },
+    { name = "onnx" },
+    { name = "onnxscript" },
     { name = "timm" },
-    { name = "tqdm" },
     { name = "torch" },
     { name = "torchvision" },
+    { name = "tqdm" },
 ]
 ultralytics = [
     { name = "onnx" },
@@ -1855,11 +1858,14 @@ ultralytics = [
 [package.metadata]
 requires-dist = [
     { name = "libreyolo", marker = "extra == 'libreyolo'", specifier = ">=1.4.0" },
+    { name = "numpy", marker = "extra == 'timm'", specifier = ">=2.0" },
     { name = "onnx", marker = "extra == 'libreyolo'", specifier = ">=1.22.0" },
+    { name = "onnx", marker = "extra == 'timm'", specifier = ">=1.22.0" },
     { name = "onnx", marker = "extra == 'ultralytics'", specifier = ">=1.22.0" },
     { name = "onnxruntime", marker = "extra == 'libreyolo'", specifier = ">=1.27.0" },
     { name = "onnxruntime", marker = "extra == 'ultralytics'", specifier = ">=1.27.0" },
     { name = "onnxscript", marker = "extra == 'libreyolo'", specifier = ">=0.5" },
+    { name = "onnxscript", marker = "extra == 'timm'", specifier = ">=0.5" },
     { name = "onnxscript", marker = "extra == 'ultralytics'", specifier = ">=0.5" },
     { name = "onnxslim", marker = "extra == 'libreyolo'", specifier = ">=0.1.94" },
     { name = "onnxslim", marker = "extra == 'ultralytics'", specifier = ">=0.1.94" },
@@ -1870,13 +1876,13 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'test'", specifier = ">=5.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "timm", marker = "extra == 'timm'", specifier = ">=1.0.19" },
-    { name = "tqdm", marker = "extra == 'timm'", specifier = ">=4.65.0" },
     { name = "torch", marker = "extra == 'libreyolo'", specifier = ">=2.11.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torch", marker = "extra == 'timm'", specifier = ">=2.11.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torch", marker = "extra == 'ultralytics'", specifier = ">=2.11.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchvision", marker = "extra == 'libreyolo'", specifier = ">=0.26.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchvision", marker = "extra == 'timm'", specifier = ">=0.26.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchvision", marker = "extra == 'ultralytics'", specifier = ">=0.26.0", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "tqdm", marker = "extra == 'timm'", specifier = ">=4.65.0" },
     { name = "triton-windows", marker = "extra == 'gpu'", specifier = ">=3.7.1.post27" },
     { name = "ultralytics", marker = "extra == 'ultralytics'", specifier = ">=8.4.113" },
     { name = "xformers", marker = "extra == 'gpu'", specifier = ">=0.0.35" },

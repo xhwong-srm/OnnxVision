@@ -9,7 +9,16 @@ from ..workflows.context import WorkflowContext, optional_import
 from ..workflows.requests import ResolvedExportRequest, ResolvedTestRequest, ResolvedTrainRequest, ResolvedValidateRequest
 from ..workflows.runs import artifact
 from .base import BackendExecution
-from .common import class_names_from_model, detection_contract, metadata_for_contract, require_file, set_onnx_metadata, validate_onnx
+from .common import (
+    class_names_from_model,
+    detection_contract,
+    embedded_output_paths,
+    metadata_for_contract,
+    require_file,
+    set_onnx_metadata,
+    validate_onnx,
+    wrap_embedded_variants,
+)
 
 
 @dataclass(frozen=True)
@@ -61,18 +70,25 @@ class LibreYoloBackend:
     def export(self, request: ResolvedExportRequest, context: WorkflowContext) -> BackendExecution:
         checkpoint = require_file(request.checkpoint, "checkpoint")
         model = self._model(request)
-        exported = Path(model.export(format="onnx", imgsz=request.image_size, opset=request.opset, simplify=request.simplify, device=request.device))
-        output = request.output.expanduser().resolve()
-        output.parent.mkdir(parents=True, exist_ok=True)
-        if exported.resolve() != output:
-            exported.replace(output)
+        exported = Path(model.export(format="onnx", imgsz=request.image_size, opset=request.opset, simplify=request.simplify, dynamic=True, device=request.device))
         names = class_names_from_model(model)
         if not names:
             raise ValueError("the exported detection model does not expose class names")
+        outputs = embedded_output_paths(request.output)
+        paths = wrap_embedded_variants(
+            exported,
+            outputs,
+            image_size=request.image_size,
+            mean=(0.0, 0.0, 0.0),
+            std=(1.0, 1.0, 1.0),
+        )
         contract = detection_contract(names, nms_required=bool(request.options.get("nms_required", False)))
-        set_onnx_metadata(output, metadata_for_contract(contract))
-        checks = validate_onnx(output, contract)
-        return Execution((artifact(output, "onnx"),), {}, contract, checks)
+        checks: list[dict[str, Any]] = []
+        for variant, path in outputs.items():
+            variant_contract = detection_contract(names, nms_required=bool(request.options.get("nms_required", False)), input_variant=variant)
+            set_onnx_metadata(path, metadata_for_contract(variant_contract))
+            checks.extend({**check, "variant": variant} for check in validate_onnx(path, variant_contract))
+        return Execution(tuple(artifact(path, "onnx") for path in paths), {}, contract, tuple(checks))
 
     def validate(self, request: ResolvedValidateRequest, context: WorkflowContext) -> BackendExecution:
         target = require_file(request.target, "model artifact")

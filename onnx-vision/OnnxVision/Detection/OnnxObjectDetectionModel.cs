@@ -16,7 +16,7 @@ using OnnxVision.Runtime;
 namespace OnnxVision.Detection
 {
     /// <summary>
-    /// Model-neutral object detector for the onnx-vision-object-detection 1.0.0 contract.
+    /// Model-neutral object detector for the onnx-vision-object-detection 2.0.0 contract.
     /// A model instance can be reused and supports concurrent predictions.
     /// </summary>
     public sealed class OnnxObjectDetectionModel : IDisposable
@@ -30,6 +30,7 @@ namespace OnnxVision.Detection
         private readonly OnnxPixelFormat requiredPixelFormat;
         private readonly int inputWidth;
         private readonly int inputHeight;
+        private readonly int inputBatchDimension;
         private readonly bool nmsRequired;
         private readonly string[] inputNames;
         private readonly string[] outputNames;
@@ -92,8 +93,11 @@ namespace OnnxVision.Detection
                 else
                 {
                     throw new NotSupportedException(
-                        "ONNX object detection requires embedded preprocessing with uint8 [1,1,H,W] BW8 NCHW or uint8 [1,H,W,3] C24 NHWC BGR input.");
+                        "ONNX object detection requires embedded preprocessing with dynamic-batch uint8 [B,1,H,W] BW8 NCHW or uint8 [B,H,W,3] C24 NHWC BGR input.");
                 }
+                inputBatchDimension = dimensions[0];
+                if (inputBatchDimension > 0)
+                    throw new NotSupportedException("ONNX object detection requires a dynamic batch dimension.");
             }
             catch
             {
@@ -110,6 +114,7 @@ namespace OnnxVision.Detection
         public OnnxPixelFormat RequiredPixelFormat { get { return requiredPixelFormat; } }
         public int InputWidth { get { return inputWidth; } }
         public int InputHeight { get { return inputHeight; } }
+        public bool SupportsDynamicBatch { get { return inputBatchDimension <= 0; } }
         public bool RequiresColorInput { get { return requiredPixelFormat == OnnxPixelFormat.Bgr24; } }
         public bool NmsRequired { get { return nmsRequired; } }
 
@@ -118,8 +123,8 @@ namespace OnnxVision.Detection
             get
             {
                 return RequiresColorInput
-                    ? "uint8 [1,H,W,3] C24 NHWC BGR; preprocessing runs inside ONNX"
-                    : "uint8 [1,1,H,W] BW8 NCHW; preprocessing runs inside ONNX";
+                    ? "uint8 [B,H,W,3] C24 NHWC BGR; preprocessing runs inside ONNX"
+                    : "uint8 [B,1,H,W] BW8 NCHW; preprocessing runs inside ONNX";
             }
         }
 
@@ -155,41 +160,7 @@ namespace OnnxVision.Detection
                     inputValue = workspace.StagingInput;
                 }
                 workspace.InputValues[0] = inputValue;
-
-                using (var results = session.Run(workspace.RunOptions, inputNames,
-                    workspace.InputValues, outputNames))
-                {
-                    var outputs = results.ToArray();
-                    var boxes = outputs[0].GetTensorDataAsSpan<float>();
-                    var scores = outputs[1].GetTensorDataAsSpan<float>();
-                    var classIds = outputs[2].GetTensorDataAsSpan<long>();
-                    if (boxes.Length != scores.Length * 4 || classIds.Length != scores.Length)
-                        throw new InvalidOperationException("Detection output tensor sizes do not agree.");
-
-                    var candidates = new List<OnnxDetection>();
-                    for (int index = 0; index < scores.Length; index++)
-                    {
-                        float score = scores[index];
-                        if (score < confidenceThreshold)
-                            continue;
-
-                        long classId = classIds[index];
-                        if (classId < 0 || classId >= classNames.Length)
-                            throw new InvalidOperationException("Model returned an out-of-range class ID.");
-                        int classIndex = (int)classId;
-
-                        candidates.Add(new OnnxDetection(
-                            classNames[classIndex], classIndex, score,
-                            Clamp(boxes[index * 4] * image.Width, 0, image.Width),
-                            Clamp(boxes[index * 4 + 1] * image.Height, 0, image.Height),
-                            Clamp(boxes[index * 4 + 2] * image.Width, 0, image.Width),
-                            Clamp(boxes[index * 4 + 3] * image.Height, 0, image.Height)));
-                    }
-
-                    if (!nmsRequired || nmsIouThreshold >= 1.0f)
-                        return candidates;
-                    return ApplyClassAwareNms(candidates, nmsIouThreshold);
-                }
+                return Execute(workspace, inputValue, new[] { image }, confidenceThreshold, nmsIouThreshold)[0];
             }
             finally
             {
@@ -197,6 +168,114 @@ namespace OnnxVision.Detection
                     workspace.Dispose();
                 else
                     workspaces.Add(workspace);
+            }
+        }
+
+        public IReadOnlyList<IReadOnlyList<OnnxDetection>> DetectBatch(
+            IReadOnlyList<OnnxImageBuffer> images,
+            float confidenceThreshold = 0.5f, float nmsIouThreshold = 1.0f)
+        {
+            ThrowIfDisposed();
+            ValidateThresholds(confidenceThreshold, nmsIouThreshold);
+            ValidateBatch(images);
+
+            InputWorkspace workspace;
+            if (!workspaces.TryTake(out workspace))
+                workspace = new InputWorkspace();
+
+            try
+            {
+                OnnxImageBuffer first = images[0];
+                int channels = first.BytesPerPixel;
+                int rowBytes = checked(first.Width * channels);
+                int imageLength = checked(rowBytes * first.Height);
+                int totalLength = checked(imageLength * images.Count);
+                long[] inputShape = requiredPixelFormat == OnnxPixelFormat.Bw8
+                    ? new long[] { images.Count, 1, first.Height, first.Width }
+                    : new long[] { images.Count, first.Height, first.Width, 3 };
+                IntPtr destination = workspace.PrepareStagingInput(totalLength, inputShape);
+                for (int index = 0; index < images.Count; index++)
+                {
+                    CopyRows(images[index].Data, images[index].RowStride,
+                        new IntPtr(destination.ToInt64() + (long)index * imageLength),
+                        rowBytes, first.Height);
+                }
+                workspace.InputValues[0] = workspace.StagingInput;
+                return Execute(workspace, workspace.StagingInput, images, confidenceThreshold, nmsIouThreshold);
+            }
+            finally
+            {
+                if (disposed)
+                    workspace.Dispose();
+                else
+                    workspaces.Add(workspace);
+            }
+        }
+
+        private IReadOnlyList<IReadOnlyList<OnnxDetection>> Execute(
+            InputWorkspace workspace, OrtValue inputValue, IReadOnlyList<OnnxImageBuffer> images,
+            float confidenceThreshold, float nmsIouThreshold)
+        {
+            workspace.InputValues[0] = inputValue;
+            using (var results = session.Run(workspace.RunOptions, inputNames,
+                workspace.InputValues, outputNames))
+            {
+                var outputs = results.ToArray();
+                var boxes = outputs[0].GetTensorDataAsSpan<float>();
+                var scores = outputs[1].GetTensorDataAsSpan<float>();
+                var classIds = outputs[2].GetTensorDataAsSpan<long>();
+                int batchSize = images.Count;
+                if (scores.Length % batchSize != 0 || boxes.Length != scores.Length * 4 || classIds.Length != scores.Length)
+                    throw new InvalidOperationException("Detection output tensor sizes do not agree with the input batch.");
+                int queryCount = scores.Length / batchSize;
+                var detections = new List<IReadOnlyList<OnnxDetection>>(batchSize);
+                for (int batchIndex = 0; batchIndex < batchSize; batchIndex++)
+                {
+                    OnnxImageBuffer image = images[batchIndex];
+                    var candidates = new List<OnnxDetection>();
+                    for (int queryIndex = 0; queryIndex < queryCount; queryIndex++)
+                    {
+                        int scoreIndex = batchIndex * queryCount + queryIndex;
+                        float score = scores[scoreIndex];
+                        if (score < confidenceThreshold)
+                            continue;
+
+                        long classId = classIds[scoreIndex];
+                        if (classId < 0 || classId >= classNames.Length)
+                            throw new InvalidOperationException("Model returned an out-of-range class ID.");
+                        int classIndex = (int)classId;
+                        int boxIndex = scoreIndex * 4;
+                        candidates.Add(new OnnxDetection(
+                            classNames[classIndex], classIndex, score,
+                            Clamp(boxes[boxIndex] * image.Width, 0, image.Width),
+                            Clamp(boxes[boxIndex + 1] * image.Height, 0, image.Height),
+                            Clamp(boxes[boxIndex + 2] * image.Width, 0, image.Width),
+                            Clamp(boxes[boxIndex + 3] * image.Height, 0, image.Height)));
+                    }
+                    detections.Add(!nmsRequired || nmsIouThreshold >= 1.0f
+                        ? candidates
+                        : ApplyClassAwareNms(candidates, nmsIouThreshold));
+                }
+                return detections;
+            }
+        }
+
+        private void ValidateBatch(IReadOnlyList<OnnxImageBuffer> images)
+        {
+            if (images == null || images.Count == 0)
+                throw new ArgumentException("At least one image is required.", "images");
+            if (inputBatchDimension > 0 && images.Count != inputBatchDimension)
+                throw new ArgumentException(string.Format(
+                    "The model requires batch size {0}, but {1} images were supplied.",
+                    inputBatchDimension, images.Count), "images");
+
+            OnnxImageBuffer first = images[0];
+            ValidateImage(first);
+            for (int index = 1; index < images.Count; index++)
+            {
+                ValidateImage(images[index]);
+                if (images[index].Width != first.Width || images[index].Height != first.Height)
+                    throw new ArgumentException("All images in a batch must have the same dimensions.", "images");
             }
         }
 
@@ -223,10 +302,12 @@ namespace OnnxVision.Detection
                 !metadata.TryGetValue("contract_name", out contractName) ||
                 contractName != Contract ||
                 !metadata.TryGetValue("contract_version", out contractVersion) ||
-                contractVersion != OnnxVisionContract.Version)
+                contractVersion != OnnxVisionContract.Version ||
+                !metadata.ContainsKey("inputs") ||
+                !metadata.ContainsKey("outputs"))
             {
                 throw new NotSupportedException(
-                    "Expected the " + Contract + " 1.0.0 object-detection metadata contract.");
+                    "Expected the " + Contract + " " + OnnxVisionContract.Version + " object-detection metadata contract.");
             }
 
             string nmsRequiredValue;
@@ -240,6 +321,9 @@ namespace OnnxVision.Detection
             RequireOutput(BoxesOutputName, typeof(float), 3);
             RequireOutput(ScoresOutputName, typeof(float), 2);
             RequireOutput(ClassIdsOutputName, typeof(long), 2);
+            RequireDynamicBatch(BoxesOutputName);
+            RequireDynamicBatch(ScoresOutputName);
+            RequireDynamicBatch(ClassIdsOutputName);
             return parsedNmsRequired;
         }
 
@@ -252,6 +336,16 @@ namespace OnnxVision.Detection
                 throw new NotSupportedException(string.Format(
                     "Expected output {0} with element type {1} and rank {2}.",
                     name, elementType.Name, rank));
+            }
+        }
+
+        private void RequireDynamicBatch(string name)
+        {
+            NodeMetadata metadata = session.OutputMetadata[name];
+            if (metadata.Dimensions.Length == 0 || metadata.Dimensions[0] > 0)
+            {
+                throw new NotSupportedException(
+                    "Expected dynamic batch dimension on detection output " + name + ".");
             }
         }
 

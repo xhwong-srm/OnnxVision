@@ -13,7 +13,15 @@ from ..workflows.context import WorkflowContext, optional_import
 from ..workflows.requests import ResolvedExportRequest, ResolvedTestRequest, ResolvedTrainRequest, ResolvedValidateRequest
 from ..workflows.runs import artifact
 from .base import BackendExecution
-from .common import classification_contract, metadata_for_contract, require_file, set_onnx_metadata, validate_onnx
+from .common import (
+    classification_contract,
+    embedded_output_paths,
+    metadata_for_contract,
+    require_file,
+    set_onnx_metadata,
+    validate_onnx,
+    wrap_embedded_variants,
+)
 from .timm_training import (
     TimmTrainingOptions,
     capture_rng_state,
@@ -278,15 +286,45 @@ class TimmClassificationBackend:
         _, torch, _ = self._imports()
         model, classes, value = self._load(request.checkpoint, request.device)
         size = int(request.image_size or value.get("data_config", {}).get("input_size", [3, 224, 224])[-1])
-        output = request.output.expanduser().resolve()
-        output.parent.mkdir(parents=True, exist_ok=True)
+        data_config = value.get("data_config", {})
+        mean = tuple(float(item) for item in data_config.get("mean", _DEFAULT_MEAN))
+        std = tuple(float(item) for item in data_config.get("std", _DEFAULT_STD))
+        core = context.run_dir / "core-float32.onnx"
         tensor = torch.zeros(1, 3, size, size)
+        batch = torch.export.Dim("batch", min=1)
+
+        class ProbabilityModel(torch.nn.Module):
+            def __init__(self, classifier):
+                super().__init__()
+                self.classifier = classifier
+
+            def forward(self, images):
+                return torch.softmax(self.classifier(images), dim=1)
+
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            torch.onnx.export(model, tensor, output, input_names=["images"], output_names=["probabilities"], opset_version=request.opset, dynamo=True)
+            torch.onnx.export(
+                ProbabilityModel(model).eval(),
+                (tensor,),
+                core,
+                input_names=["images"],
+                output_names=["probabilities"],
+                opset_version=request.opset,
+                dynamo=True,
+                dynamic_shapes={"images": {0: batch}},
+                external_data=False,
+                optimize=True,
+                verify=True,
+                verbose=False,
+            )
+        outputs = embedded_output_paths(request.output)
+        paths = wrap_embedded_variants(core, outputs, image_size=size, mean=mean, std=std)
         contract = classification_contract(classes)
-        set_onnx_metadata(output, metadata_for_contract(contract))
-        checks = validate_onnx(output, contract)
-        return Execution((artifact(output, "onnx"),), {}, contract, checks)
+        checks: list[dict[str, Any]] = []
+        for variant, path in outputs.items():
+            variant_contract = classification_contract(classes, input_variant=variant)
+            set_onnx_metadata(path, metadata_for_contract(variant_contract))
+            checks.extend({**check, "variant": variant} for check in validate_onnx(path, variant_contract))
+        return Execution(tuple(artifact(path, "onnx") for path in paths), {}, contract, tuple(checks))
 
     def _evaluate(self, request: ResolvedValidateRequest | ResolvedTestRequest):
         _, torch, _ = self._imports()

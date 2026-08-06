@@ -14,7 +14,15 @@ from ..workflows.context import WorkflowContext, optional_import
 from ..workflows.requests import ResolvedExportRequest, ResolvedTestRequest, ResolvedTrainRequest, ResolvedValidateRequest
 from ..workflows.runs import artifact
 from .base import BackendExecution
-from .common import detection_contract, metadata_for_contract, require_file, set_onnx_metadata, validate_onnx
+from .common import (
+    detection_contract,
+    embedded_output_paths,
+    metadata_for_contract,
+    require_file,
+    set_onnx_metadata,
+    validate_onnx,
+    wrap_embedded_variants,
+)
 from .timm_training import (
     TimmTrainingOptions,
     capture_rng_state,
@@ -288,8 +296,8 @@ class TimmDetectionBackend:
     def export(self, request: ResolvedExportRequest, context: WorkflowContext) -> BackendExecution:
         torch, _, _ = _torch_components()
         model, classes, checkpoint = self._load(request.checkpoint, torch.device("cpu"))
-        output = request.output.expanduser().resolve()
-        output.parent.mkdir(parents=True, exist_ok=True)
+        core = context.run_dir / "core-float32.onnx"
+        batch = torch.export.Dim("batch", min=1)
         class ExportWrapper(torch.nn.Module):
             def __init__(self, detector):
                 super().__init__()
@@ -300,10 +308,35 @@ class TimmDetectionBackend:
 
         wrapper = ExportWrapper(model.eval())
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            torch.onnx.export(wrapper, torch.zeros(1, 3, request.image_size, request.image_size), output, input_names=["images"], output_names=["boxes", "scores", "class_ids"], opset_version=request.opset, dynamo=True)
+            torch.onnx.export(
+                wrapper,
+                (torch.zeros(1, 3, request.image_size, request.image_size),),
+                core,
+                input_names=["images"],
+                output_names=["boxes", "scores", "class_ids"],
+                opset_version=request.opset,
+                dynamo=True,
+                dynamic_shapes={"images": {0: batch}},
+                external_data=False,
+                optimize=True,
+                verify=True,
+                verbose=False,
+            )
+        outputs = embedded_output_paths(request.output)
+        paths = wrap_embedded_variants(
+            core,
+            outputs,
+            image_size=request.image_size,
+            mean=(0.485, 0.456, 0.406),
+            std=(0.229, 0.224, 0.225),
+        )
         contract = detection_contract(classes, nms_required=False)
-        set_onnx_metadata(output, metadata_for_contract(contract))
-        return Execution((artifact(output, "onnx"),), {}, contract, validate_onnx(output, contract))
+        checks: list[dict[str, Any]] = []
+        for variant, path in outputs.items():
+            variant_contract = detection_contract(classes, nms_required=False, input_variant=variant)
+            set_onnx_metadata(path, metadata_for_contract(variant_contract))
+            checks.extend({**check, "variant": variant} for check in validate_onnx(path, variant_contract))
+        return Execution(tuple(artifact(path, "onnx") for path in paths), {}, contract, tuple(checks))
 
     def validate(self, request: ResolvedValidateRequest, context: WorkflowContext) -> BackendExecution:
         if request.target.suffix.casefold() == ".onnx":

@@ -65,6 +65,15 @@ namespace OnnxVision.Runtime
                     "Expected contract_name metadata '" + expectedName + "'.");
             }
 
+            string inputs;
+            string outputs;
+            if (!metadata.TryGetValue("inputs", out inputs) || string.IsNullOrWhiteSpace(inputs) ||
+                !metadata.TryGetValue("outputs", out outputs) || string.IsNullOrWhiteSpace(outputs))
+            {
+                throw new NotSupportedException(
+                    "The ONNX model is missing inputs or outputs contract metadata.");
+            }
+
             string version;
             if (!metadata.TryGetValue("contract_version", out version) ||
                 !string.Equals(version, OnnxVisionContract.Version, StringComparison.Ordinal))

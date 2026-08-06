@@ -15,7 +15,32 @@ from ..workflows.runs import artifact
 CONTRACT_VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
 DETECTION_CONTRACT_NAME = "onnx-vision-object-detection"
 CLASSIFICATION_CONTRACT_NAME = "onnx-vision-classification"
-CONTRACT_VERSION = "1.0.0"
+CONTRACT_VERSION = "2.0.0"
+
+
+def embedded_input_contract() -> dict[str, Any]:
+    """Return the shared raw-image input contract used by both ONNX tasks."""
+    return {
+        "batch": {"axis": 0, "minimum": 1, "dynamic": True},
+        "variants": {
+            "bw8": {
+                "name": "images_bw8_uint8_nchw",
+                "dtype": "uint8",
+                "layout": "NCHW",
+                "pixel_format": "BW8",
+                "shape": ["B", 1, "H", "W"],
+                "preprocessing": "embedded",
+            },
+            "c24": {
+                "name": "images_c24_uint8_nhwc_bgr",
+                "dtype": "uint8",
+                "layout": "NHWC",
+                "pixel_format": "C24_BGR",
+                "shape": ["B", "H", "W", 3],
+                "preprocessing": "embedded",
+            },
+        },
+    }
 
 
 def require_file(path: Path, label: str) -> Path:
@@ -32,27 +57,51 @@ def optional_module(module: str):
         raise
 
 
-def detection_contract(names: list[str] | tuple[str, ...], *, nms_required: bool = False) -> dict[str, Any]:
-    return {
+def detection_contract(
+    names: list[str] | tuple[str, ...],
+    *,
+    nms_required: bool = False,
+    input_variant: str | None = None,
+) -> dict[str, Any]:
+    contract = {
         "name": DETECTION_CONTRACT_NAME,
         "version": CONTRACT_VERSION,
         "task": "object_detection",
-        "inputs": {"float": {"dtype": "float32", "layout": "NCHW"}},
-        "outputs": {"boxes": "float32[N,4]", "scores": "float32[N]", "class_ids": "int64[N]"},
+        "inputs": embedded_input_contract(),
+        "outputs": {
+            "boxes": {"dtype": "float32", "shape": ["B", "Q", 4]},
+            "scores": {"dtype": "float32", "shape": ["B", "Q"]},
+            "class_ids": {"dtype": "int64", "shape": ["B", "Q"]},
+        },
         "names": {str(index): name for index, name in enumerate(names)},
         "nms_required": nms_required,
     }
+    if input_variant is not None:
+        _validate_input_variant(input_variant)
+        contract["input_variant"] = input_variant
+    return contract
 
 
-def classification_contract(names: list[str] | tuple[str, ...]) -> dict[str, Any]:
-    return {
+def classification_contract(
+    names: list[str] | tuple[str, ...], *, input_variant: str | None = None
+) -> dict[str, Any]:
+    contract = {
         "name": CLASSIFICATION_CONTRACT_NAME,
         "version": CONTRACT_VERSION,
         "task": "classification",
-        "inputs": {"images": {"dtype": "float32", "layout": "NCHW"}},
-        "outputs": {"probabilities": "float32[N,C]"},
+        "inputs": embedded_input_contract(),
+        "outputs": {"probabilities": {"dtype": "float32", "shape": ["B", "C"]}},
         "names": {str(index): name for index, name in enumerate(names)},
     }
+    if input_variant is not None:
+        _validate_input_variant(input_variant)
+        contract["input_variant"] = input_variant
+    return contract
+
+
+def _validate_input_variant(value: str) -> None:
+    if value not in {"bw8", "c24"}:
+        raise ValueError(f"unsupported embedded input variant: {value}")
 
 
 def metadata_for_contract(contract: dict[str, Any]) -> dict[str, Any]:
@@ -65,7 +114,11 @@ def metadata_for_contract(contract: dict[str, Any]) -> dict[str, Any]:
         "contract_name": contract["name"],
         "contract_version": version,
         "names": contract["names"],
+        "inputs": contract["inputs"],
+        "outputs": contract["outputs"],
     }
+    if "input_variant" in contract:
+        metadata["input_variant"] = contract["input_variant"]
     if contract["task"] == "object_detection":
         metadata["nms_required"] = bool(contract["nms_required"])
     return metadata
@@ -89,9 +142,19 @@ def validate_onnx(path: Path, contract: dict[str, Any]) -> tuple[dict[str, Any],
     metadata = {item.key: item.value for item in model.metadata_props}
     checks = [{"name": "onnx_checker", "status": "passed"}]
     expected = metadata_for_contract(contract)
-    for key in ("vision_task", "contract_name", "contract_version"):
+    for key in ("vision_task", "contract_name", "contract_version", "input_variant"):
+        if key not in expected:
+            continue
         if metadata.get(key) != expected[key]:
             checks.append({"name": key, "status": "failed", "expected": expected[key], "actual": metadata.get(key)})
+
+    for key in ("inputs", "outputs"):
+        try:
+            actual_value = json.loads(metadata.get(key, ""))
+        except json.JSONDecodeError:
+            actual_value = None
+        if actual_value != expected[key]:
+            checks.append({"name": key, "status": "failed", "expected": expected[key], "actual": actual_value})
 
     if contract["task"] == "object_detection":
         nms_required = metadata.get("nms_required")
@@ -107,7 +170,265 @@ def validate_onnx(path: Path, contract: dict[str, Any]) -> tuple[dict[str, Any],
         checks.append({"name": "names", "status": "failed", "expected": "non-empty class mapping", "actual": actual_names})
     elif expected_names and actual_names != expected_names:
         checks.append({"name": "names", "status": "failed", "expected": expected_names, "actual": actual_names})
+
+    _append_tensor_checks(checks, model, contract, metadata)
     return tuple(checks)
+
+
+def _append_tensor_checks(
+    checks: list[dict[str, Any]], model: Any, contract: dict[str, Any], metadata: dict[str, str]
+) -> None:
+    graph = model.graph
+    variants = contract["inputs"]["variants"]
+    selected_variant = contract.get("input_variant") or metadata.get("input_variant")
+    if selected_variant is not None and selected_variant not in variants:
+        checks.append({"name": "input_variant", "status": "failed", "expected": tuple(variants), "actual": selected_variant})
+        return
+
+    if len(graph.input) != 1:
+        checks.append({"name": "input_tensor", "status": "failed", "expected": "exactly one input tensor", "actual": len(graph.input)})
+    else:
+        actual_input = graph.input[0]
+        candidates = ((selected_variant, variants[selected_variant]),) if selected_variant else tuple(variants.items())
+        if not any(_input_matches(actual_input, variant, contract["inputs"]["batch"]) for _, variant in candidates):
+            checks.append({"name": "input_tensor", "status": "failed", "expected": candidates, "actual": _tensor_description(actual_input)})
+
+    output_by_name = {value.name: value for value in graph.output}
+    for name, specification in contract["outputs"].items():
+        actual_output = output_by_name.get(name)
+        if actual_output is None or not _output_matches(actual_output, specification, contract, name):
+            checks.append({"name": f"output_tensor:{name}", "status": "failed", "expected": specification, "actual": _tensor_description(actual_output) if actual_output else None})
+
+
+def _tensor_description(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    tensor = value.type.tensor_type
+    dimensions = []
+    for dimension in tensor.shape.dim:
+        if dimension.HasField("dim_value"):
+            dimensions.append(int(dimension.dim_value))
+        elif dimension.HasField("dim_param"):
+            dimensions.append(dimension.dim_param)
+        else:
+            dimensions.append(None)
+    return {"name": value.name, "dtype": int(tensor.elem_type), "shape": dimensions}
+
+
+def _tensor_dtype(value: Any) -> str:
+    import onnx
+
+    return {
+        "float": "float32",
+        "double": "float64",
+        "int64": "int64",
+        "uint8": "uint8",
+    }.get(onnx.TensorProto.DataType.Name(value.type.tensor_type.elem_type).casefold(), "unknown")
+
+
+def _dimension_matches(actual: Any, expected: Any, *, dynamic: bool = False) -> bool:
+    if dynamic:
+        return not actual.HasField("dim_value")
+    if isinstance(expected, int):
+        return actual.HasField("dim_value") and int(actual.dim_value) == expected
+    return True
+
+
+def _input_matches(value: Any, variant: dict[str, Any], batch: dict[str, Any]) -> bool:
+    tensor = value.type.tensor_type
+    expected_shape = variant["shape"]
+    if value.name != variant["name"] or _tensor_dtype(value) != variant["dtype"]:
+        return False
+    if len(tensor.shape.dim) != len(expected_shape):
+        return False
+    for index, expected in enumerate(expected_shape):
+        if not _dimension_matches(tensor.shape.dim[index], expected, dynamic=index == batch["axis"] and batch["dynamic"]):
+            return False
+    return True
+
+
+def _output_matches(value: Any, specification: dict[str, Any], contract: dict[str, Any], name: str) -> bool:
+    tensor = value.type.tensor_type
+    expected_shape = specification["shape"]
+    if _tensor_dtype(value) != specification["dtype"] or len(tensor.shape.dim) != len(expected_shape):
+        return False
+    for index, expected in enumerate(expected_shape):
+        if expected == "B":
+            if not _dimension_matches(tensor.shape.dim[index], expected, dynamic=True):
+                return False
+        elif expected == "C" and contract["names"]:
+            if not _dimension_matches(tensor.shape.dim[index], len(contract["names"])):
+                return False
+        elif not _dimension_matches(tensor.shape.dim[index], expected):
+            return False
+    return True
+
+
+def embedded_output_paths(output: Path) -> dict[str, Path]:
+    output = output.expanduser().resolve()
+    if output.suffix.casefold() != ".onnx":
+        raise ConfigurationError("ONNX export output must be a .onnx file path; variants are emitted beside it")
+    return {
+        "bw8": output.with_name(f"{output.stem}-bw8.onnx"),
+        "c24": output.with_name(f"{output.stem}-c24.onnx"),
+    }
+
+
+def wrap_embedded_variants(
+    core: Path,
+    outputs: dict[str, Path],
+    *,
+    image_size: int,
+    mean: tuple[float, float, float],
+    std: tuple[float, float, float],
+    apply_softmax: bool = False,
+    output_names: tuple[str, ...] | None = None,
+) -> tuple[Path, ...]:
+    """Wrap a float RGB NCHW ONNX core with dynamic-batch BW8 and C24 inputs."""
+    onnx = optional_module("onnx")
+    np = optional_module("numpy")
+    core_model = require_file(core, "ONNX core artifact")
+    if image_size <= 0:
+        raise ValueError("image_size must be positive")
+    if len(mean) != 3 or len(std) != 3:
+        raise ValueError("embedded preprocessing requires three mean and std values")
+    for variant, output in outputs.items():
+        if variant not in {"bw8", "c24"}:
+            raise ValueError(f"unsupported embedded input variant: {variant}")
+        model = onnx.load(str(core_model))
+        if len(model.graph.input) != 1:
+            raise ValueError("ONNX core must have exactly one input")
+        if not any(item.domain == "" and item.version >= 18 for item in model.opset_import):
+            raise ValueError("embedded preprocessing requires ONNX opset 18 or newer")
+        core_graph = onnx.compose.add_prefix(model, "core/")
+        core_input = core_graph.graph.input[0].name
+        del core_graph.graph.input[:]
+        original_nodes = list(core_graph.graph.node)
+        del core_graph.graph.node[:]
+        preprocessing = _embedded_preprocessing_nodes(
+            onnx,
+            np,
+            core_graph,
+            core_input,
+            variant,
+            image_size,
+            mean,
+            std,
+        )
+        postprocessing: list[Any] = []
+        if output_names is not None and len(output_names) != len(core_graph.graph.output):
+            raise ValueError("output_names must match the ONNX core output count")
+        if apply_softmax and len(core_graph.graph.output) != 1:
+            raise ValueError("classification core must have exactly one output for softmax wrapping")
+        for output_index, output_value in enumerate(core_graph.graph.output):
+            original_output = output_value.name
+            public_output = output_names[output_index] if output_names is not None else original_output.removeprefix("core/")
+            if apply_softmax:
+                public_output = "probabilities"
+                postprocessing.append(onnx.helper.make_node("Softmax", [original_output], [public_output], axis=1, name="contract/softmax"))
+            else:
+                postprocessing.append(onnx.helper.make_node("Identity", [original_output], [public_output], name=f"contract/{public_output}"))
+            output_value.name = public_output
+        core_graph.graph.node.extend(preprocessing + original_nodes + postprocessing)
+        core_graph.graph.doc_string = f"Embedded {variant} preprocessing with dynamic batch."
+        output_path = output.expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        onnx.checker.check_model(core_graph)
+        onnx.save(core_graph, str(output_path))
+    return tuple(outputs[variant].expanduser().resolve() for variant in ("bw8", "c24"))
+
+
+def _embedded_preprocessing_nodes(
+    onnx: Any,
+    np: Any,
+    model: Any,
+    core_input: str,
+    variant: str,
+    image_size: int,
+    mean: tuple[float, float, float],
+    std: tuple[float, float, float],
+) -> list[Any]:
+    from onnx import TensorProto, helper, numpy_helper
+
+    if variant == "bw8":
+        input_name = "images_bw8_uint8_nchw"
+        model.graph.input.append(helper.make_tensor_value_info(input_name, TensorProto.UINT8, ["B", 1, "H", "W"]))
+        resized_source = input_name
+        input_channels = 1
+        nodes: list[Any] = []
+    else:
+        input_name = "images_c24_uint8_nhwc_bgr"
+        model.graph.input.append(helper.make_tensor_value_info(input_name, TensorProto.UINT8, ["B", "H", "W", 3]))
+        nodes = [
+            helper.make_node("Transpose", [input_name], ["preprocess/bgr_nchw"], perm=[0, 3, 1, 2], name="preprocess/transpose"),
+            helper.make_node(
+                "Gather",
+                ["preprocess/bgr_nchw", "preprocess/bgr_to_rgb_indices"],
+                ["preprocess/rgb_nchw"],
+                axis=1,
+                name="preprocess/bgr_to_rgb",
+            ),
+        ]
+        model.graph.initializer.append(numpy_helper.from_array(np.asarray([2, 1, 0], dtype=np.int64), "preprocess/bgr_to_rgb_indices"))
+        resized_source = "preprocess/rgb_nchw"
+        input_channels = 3
+
+    sizes_name, size_nodes = _add_dynamic_sizes(model, np, helper, resized_source, input_channels, image_size, "preprocess/resize_sizes")
+    nodes.extend(size_nodes)
+    nodes.extend([
+        helper.make_node(
+            "Resize",
+            [resized_source, "", "", sizes_name],
+            ["preprocess/resized_uint8"],
+            mode="linear",
+            coordinate_transformation_mode="half_pixel",
+            antialias=1,
+            name="preprocess/resize",
+        ),
+        helper.make_node("Cast", ["preprocess/resized_uint8"], ["preprocess/resized_float"], to=TensorProto.FLOAT, name="preprocess/cast"),
+        helper.make_node(
+            "Div",
+            ["preprocess/resized_float", "preprocess/pixel_scale"],
+            ["preprocess/scaled"],
+            name="preprocess/scale",
+        ),
+    ])
+    model.graph.initializer.append(numpy_helper.from_array(np.asarray([[[[255.0]]]], dtype=np.float32), "preprocess/pixel_scale"))
+
+    if variant == "bw8":
+        rgb_sizes_name, rgb_size_nodes = _add_dynamic_sizes(model, np, helper, "preprocess/resized_float", 3, image_size, "preprocess/rgb_sizes")
+        nodes.extend(rgb_size_nodes)
+        nodes.append(helper.make_node("Expand", ["preprocess/scaled", rgb_sizes_name], ["preprocess/rgb"], name="preprocess/gray_to_rgb"))
+        normalized_source = "preprocess/rgb"
+    else:
+        normalized_source = "preprocess/scaled"
+
+    model.graph.initializer.extend([
+        numpy_helper.from_array(np.asarray(mean, dtype=np.float32).reshape(1, 3, 1, 1), "preprocess/mean"),
+        numpy_helper.from_array(np.asarray(std, dtype=np.float32).reshape(1, 3, 1, 1), "preprocess/std"),
+    ])
+    nodes.extend([
+        helper.make_node("Sub", [normalized_source, "preprocess/mean"], ["preprocess/centered"], name="preprocess/mean"),
+        helper.make_node("Div", ["preprocess/centered", "preprocess/std"], [core_input], name="preprocess/std"),
+    ])
+    return nodes
+
+
+def _add_dynamic_sizes(model: Any, np: Any, helper: Any, source: str, channels: int, image_size: int, name: str) -> tuple[str, list[Any]]:
+    shape_name = f"{name}/shape"
+    batch_name = f"{name}/batch"
+    tail_name = f"{name}/tail"
+    index_name = f"{name}/batch_index"
+    sizes_name = name
+    model.graph.initializer.extend([
+        helper.make_tensor(index_name, 7, [1], [0]),
+        helper.make_tensor(tail_name, 7, [3], [channels, image_size, image_size]),
+    ])
+    return sizes_name, [
+        helper.make_node("Shape", [source], [shape_name], name=f"{name}/shape_node"),
+        helper.make_node("Gather", [shape_name, index_name], [batch_name], axis=0, name=f"{name}/batch_node"),
+        helper.make_node("Concat", [batch_name, tail_name], [sizes_name], axis=0, name=f"{name}/concat"),
+    ]
 
 
 def set_onnx_metadata(path: Path, values: dict[str, Any]) -> None:

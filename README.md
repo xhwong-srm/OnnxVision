@@ -65,7 +65,12 @@ the Python API. Unknown parameters are rejected before a run starts.
 
 ONNX exports are self-describing. Classification artifacts use the
 `onnx-vision-classification` contract, while object-detection artifacts use
-`onnx-vision-object-detection`. Each artifact embeds `vision_task`,
-`contract_name`, `contract_version`, and `names`; detection artifacts also
-embed `nms_required`. Contract versions use `major.minor.micro` format, for
-example `1.0.0`.
+`onnx-vision-object-detection`. Each deployment export emits separate
+`-bw8.onnx` and `-c24.onnx` artifacts. Both use embedded preprocessing and a
+dynamic batch axis: BW8 is `uint8[B,1,H,W]` and C24 is `uint8[B,H,W,3]` raw BGR.
+Classification outputs are `float32[B,C]`; detection outputs are
+`boxes float32[B,Q,4]`, `scores float32[B,Q]`, and `class_ids int64[B,Q]`.
+Each artifact embeds `vision_task`, `contract_name`, `contract_version`,
+`inputs`, `outputs`, `input_variant`, and `names`; detection artifacts also
+embed `nms_required`. Contract version `2.0.0` reflects this deployment
+contract.

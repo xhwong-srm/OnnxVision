@@ -82,7 +82,7 @@ Show usage:
 .\onnx-vision\bin\Release\net461\win7-x64\OnnxVisionCLI.exe --help
 ```
 
-The CLI identifies classification versus object detection from the required ONNX metadata contract. Classification models use `onnx-vision-classification`; object-detection models use `onnx-vision-object-detection`. Each model must provide `vision_task`, `contract_name`, `contract_version` (`major.minor.micro`, currently `1.0.0`), and `names`; detection models also provide `nms_required`. Tensor and input validation is then performed by the selected model implementation. The CLI preloads images, runs ten warmup calls, repeats the measured pass as requested, and reports session construction, image loading, warmup calls, shared model calls, measured wall time, end-to-end time, and throughput. `repeats` defaults to `1`.
+The CLI identifies classification versus object detection from the required ONNX metadata contract. Classification models use `onnx-vision-classification`; object-detection models use `onnx-vision-object-detection`. Contract `2.0.0` requires `vision_task`, `contract_name`, `contract_version`, `inputs`, `outputs`, and `names`; detection models also provide `nms_required`. Each artifact is a single embedded-preprocessing variant: BW8 uses dynamic-batch `uint8[B,1,H,W]` NCHW and C24 uses dynamic-batch `uint8[B,H,W,3]` raw-BGR NHWC. Classification outputs are `float32[B,C]`; detection outputs are `boxes[B,Q,4]`, `scores[B,Q]`, and `class_ids[B,Q]`. Tensor and input validation is then performed by the selected model implementation. The CLI preloads images, runs ten warmup calls, repeats the measured pass as requested, and reports session construction, image loading, warmup calls, shared model calls, measured wall time, end-to-end time, and throughput. `repeats` defaults to `1`.
 
 Both tasks accept a single image, a directory of images, or a labeled dataset. A
 single image and a flat image directory are inference-only inputs. Add `-dataset`
@@ -156,6 +156,10 @@ using (var image = new EImageBW8())
 ```
 
 The same adapter pattern is available for `EImageC24`, `EROIBW8`, `EROIC24`, and object detection. Region overloads accept a `System.Drawing.Rectangle` without requiring an intermediate image file.
+
+For dynamic-batch inference, use `ClassifyBatch` or `DetectBatch` with images that
+share the same dimensions and pixel format. The returned results preserve input
+order; detection postprocessing and NMS are applied independently per image.
 
 ## Runtime deployment
 
