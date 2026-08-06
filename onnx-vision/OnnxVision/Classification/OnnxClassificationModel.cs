@@ -204,13 +204,9 @@ namespace OnnxVision.Classification
             var results = new List<OnnxClassification>(batchSize);
             for (int batchIndex = 0; batchIndex < batchSize; batchIndex++)
             {
-                float[] probabilities = ToProbabilities(scores.Slice(batchIndex * classCount, classCount));
-                int bestIndex = 0;
-                for (int classIndex = 1; classIndex < probabilities.Length; classIndex++)
-                {
-                    if (probabilities[classIndex] > probabilities[bestIndex])
-                        bestIndex = classIndex;
-                }
+                int bestIndex;
+                float[] probabilities = ToProbabilities(
+                    scores.Slice(batchIndex * classCount, classCount), out bestIndex);
                 results.Add(new OnnxClassification(classNames[bestIndex], bestIndex,
                     probabilities[bestIndex], probabilities, inferenceMilliseconds));
             }
@@ -352,10 +348,11 @@ namespace OnnxVision.Classification
                 "ONNX classification output must have shape [B,{0}] matching the model batch contract.", classCount));
         }
 
-        private static float[] ToProbabilities(ReadOnlySpan<float> scores)
+        private static float[] ToProbabilities(ReadOnlySpan<float> scores, out int bestIndex)
         {
             var probabilities = new float[scores.Length];
             double sum = 0;
+            bestIndex = 0;
             for (int i = 0; i < scores.Length; i++)
             {
                 float value = scores[i];
@@ -363,6 +360,8 @@ namespace OnnxVision.Classification
                 if (float.IsNaN(value) || float.IsInfinity(value) || value < 0f || value > 1f)
                     throw new InvalidOperationException(
                         "Classification output must contain finite probabilities within [0,1].");
+                if (i > 0 && value > probabilities[bestIndex])
+                    bestIndex = i;
                 sum += value;
             }
             if (Math.Abs(sum - 1.0) > 0.001)

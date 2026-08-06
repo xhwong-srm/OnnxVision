@@ -5,7 +5,7 @@ namespace OnnxVision.Detection
     public sealed class OnnxDetection
     {
         internal OnnxDetection(string className, int classIndex, float confidence,
-            float x1, float y1, float x2, float y2)
+            float x1, float y1, float x2, float y2, int sourceIndex)
         {
             ClassName = className;
             ClassIndex = classIndex;
@@ -14,7 +14,10 @@ namespace OnnxVision.Detection
             Y1 = y1;
             X2 = x2;
             Y2 = y2;
+            SourceIndex = sourceIndex;
         }
+
+        internal int SourceIndex { get; private set; }
 
         public string ClassName { get; private set; }
         public string Name { get { return ClassName; } }
