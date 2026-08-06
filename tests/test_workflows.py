@@ -75,6 +75,16 @@ def test_export_schema_defaults_to_dynamic_and_rejects_nonpositive_fixed_batch()
         schema.resolve({"batch_size": 0}, context)
 
 
+def test_libreyolo_picodet_export_defaults_to_native_image_size() -> None:
+    selection = ModelSelection(TaskKind.OBJECT_DETECTION, "libreyolo", "picodets")
+    plugin = plugin_for(selection)
+    model = plugin.catalog.resolve(selection.model)
+    schema = plugin.handlers[Operation.EXPORT].schema(model)
+    context = type("Context", (), {"selection": selection, "model": model, "request": None})()
+
+    assert schema.resolve({}, context)["image_size"] == 320
+
+
 def test_ultralytics_classification_translates_only_its_supported_parameters(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured: dict[str, object] = {}
 

@@ -120,6 +120,12 @@ def _libre_train(_: ModelInfo) -> ParameterSchema:
     return _training(640).compose(framework)
 
 
+def _libre_export(model: ModelInfo) -> ParameterSchema:
+    native_sizes = {"s": 320, "m": 416, "l": 640}
+    image_size = native_sizes.get(str(model.metadata.get("variant")), 640)
+    return _export(image_size, nms_configurable=True)
+
+
 def _all_handlers(backend, train_schema, export_size: int, dataset: DatasetRequirement, *, nms_configurable: bool = False):
     return {
         Operation.TRAIN: OperationHandler(train_schema, backend.train, dataset),
@@ -161,7 +167,7 @@ def _plugins() -> tuple[FrameworkTaskPlugin, ...]:
         operation: OperationHandler(schema, libre_backend(operation), yolo_data if operation in {Operation.TRAIN, Operation.TEST} else None)
         for operation, schema in (
             (Operation.TRAIN, _libre_train),
-            (Operation.EXPORT, lambda _: _export(640, nms_configurable=True)),
+            (Operation.EXPORT, _libre_export),
             (Operation.VALIDATE, lambda _: _evaluation("cpu")),
             (Operation.TEST, lambda _: _evaluation("auto")),
         )

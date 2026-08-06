@@ -100,6 +100,39 @@ def test_fixed_batch_contract_is_explicit() -> None:
     assert contract["inputs"]["batch"] == {"axis": 0, "mode": "fixed", "size": 4}
 
 
+def test_embedded_preprocessing_supports_pixel_space_normalization(tmp_path) -> None:
+    onnx = pytest.importorskip("onnx")
+    np = pytest.importorskip("numpy")
+    graph = onnx.helper.make_graph(
+        [onnx.helper.make_node("Identity", ["images"], ["values"])],
+        "pixel_space_preprocessing",
+        [onnx.helper.make_tensor_value_info("images", onnx.TensorProto.FLOAT, [1, 3, 8, 8])],
+        [onnx.helper.make_tensor_value_info("values", onnx.TensorProto.FLOAT, [1, 3, 8, 8])],
+    )
+    core = tmp_path / "pixel-space.onnx"
+    onnx.save(onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 18)]), core)
+    outputs = embedded_output_paths(tmp_path / "pixel-space-wrapped.onnx")
+    wrap_embedded_variants(
+        core,
+        outputs,
+        image_size=8,
+        mean=(1.0, 2.0, 3.0),
+        std=(1.0, 1.0, 1.0),
+        pixel_scale=1.0,
+        batch_size=1,
+        output_names=("values",),
+    )
+
+    ort = pytest.importorskip("onnxruntime")
+    session = ort.InferenceSession(str(outputs["c24"]), providers=["CPUExecutionProvider"])
+    bgr = np.zeros((1, 8, 8, 3), dtype=np.uint8)
+    bgr[..., 0] = 10
+    bgr[..., 1] = 20
+    bgr[..., 2] = 30
+    values = session.run(None, {"images_c24_uint8_nhwc_bgr": bgr})[0]
+    assert values[0, :, 0, 0].tolist() == [29.0, 18.0, 7.0]
+
+
 def test_standardize_detection_core_splits_end_to_end_batch_output(tmp_path) -> None:
     onnx = pytest.importorskip("onnx")
     graph = onnx.helper.make_graph(

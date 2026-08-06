@@ -78,5 +78,8 @@ embed `nms_required`. Detection rows with score `0` are padding and are ignored;
 positive-score rows must contain valid class IDs and ordered normalized boxes.
 Provider-owned exports use confidence `0` and IoU `0.7`; consumer-side
 class-aware NMS runs at IoU `0.7` only when `nms_required=true`.
+LibreYOLO PicoDet exports use a family-specific embedded-NMS adapter and
+require `--batch-size 1`; PicoDet-s/m/l default to their native 320/416/640
+export sizes.
 Contract consumers accept any valid `2.x.y` version and ignore additive unknown
 metadata; incompatible semantic changes require contract major version 3.

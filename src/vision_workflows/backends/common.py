@@ -659,11 +659,18 @@ def wrap_embedded_variants(
     image_size: int,
     mean: tuple[float, float, float],
     std: tuple[float, float, float],
+    pixel_scale: float = 255.0,
+    resize_antialias: bool = True,
     batch_size: int | None = None,
     apply_softmax: bool = False,
     output_names: tuple[str, ...] | None = None,
 ) -> tuple[Path, ...]:
-    """Wrap a float RGB NCHW ONNX core with batch-aware BW8 and C24 inputs."""
+    """Wrap a float RGB NCHW ONNX core with BW8 and C24 inputs.
+
+    ``pixel_scale=255`` is the usual uint8-to-[0,1] path. Models such as
+    PicoDet that consume ImageNet-normalized pixel values can set it to 1 and
+    provide pixel-space ``mean``/``std`` values instead.
+    """
     onnx = optional_module("onnx")
     np = optional_module("numpy")
     core_model = require_file(core, "ONNX core artifact")
@@ -671,6 +678,8 @@ def wrap_embedded_variants(
         raise ValueError("image_size must be positive")
     if len(mean) != 3 or len(std) != 3:
         raise ValueError("embedded preprocessing requires three mean and std values")
+    if pixel_scale <= 0:
+        raise ValueError("embedded preprocessing pixel_scale must be positive")
     for variant, output in outputs.items():
         if variant not in {"bw8", "c24"}:
             raise ValueError(f"unsupported embedded input variant: {variant}")
@@ -693,6 +702,8 @@ def wrap_embedded_variants(
             image_size,
             mean,
             std,
+            pixel_scale,
+            resize_antialias,
             batch_size,
         )
         postprocessing: list[Any] = []
@@ -728,6 +739,8 @@ def _embedded_preprocessing_nodes(
     image_size: int,
     mean: tuple[float, float, float],
     std: tuple[float, float, float],
+    pixel_scale: float,
+    resize_antialias: bool,
     batch_size: int | None,
 ) -> list[Any]:
     from onnx import TensorProto, helper, numpy_helper
@@ -766,7 +779,7 @@ def _embedded_preprocessing_nodes(
             ["preprocess/resized_uint8"],
             mode="linear",
             coordinate_transformation_mode="half_pixel",
-            antialias=1,
+            antialias=int(resize_antialias),
             name="preprocess/resize",
         ),
         helper.make_node("Cast", ["preprocess/resized_uint8"], ["preprocess/resized_float"], to=TensorProto.FLOAT, name="preprocess/cast"),
@@ -777,7 +790,7 @@ def _embedded_preprocessing_nodes(
             name="preprocess/scale",
         ),
     ])
-    model.graph.initializer.append(numpy_helper.from_array(np.asarray([[[[255.0]]]], dtype=np.float32), "preprocess/pixel_scale"))
+    model.graph.initializer.append(numpy_helper.from_array(np.asarray([[[[pixel_scale]]]], dtype=np.float32), "preprocess/pixel_scale"))
 
     if variant == "bw8":
         rgb_sizes_name, rgb_size_nodes = _add_dynamic_sizes(model, np, helper, "preprocess/resized_float", 3, image_size, "preprocess/rgb_sizes")

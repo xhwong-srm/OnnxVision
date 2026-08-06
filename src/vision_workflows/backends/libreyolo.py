@@ -21,6 +21,7 @@ from .common import (
     validate_onnx,
     wrap_embedded_variants,
 )
+from .libreyolo_picodet import export_picodet_core
 
 
 @dataclass(frozen=True)
@@ -90,31 +91,61 @@ class LibreYoloBackend:
         checkpoint = require_file(request.checkpoint, "checkpoint")
         model = self._model(request)
         nms_required = bool(request.options.get("nms_required", False))
-        if nms_required:
-            raise ConfigurationError(
-                "LibreYOLO raw detection output is provider-specific and cannot be "
-                "serialized as contract candidates; use embedded NMS (nms_required=false)"
-            )
-        if not nms_required and request.batch_size != 1:
-            raise ValueError(
-                "LibreYOLO embedded NMS supports only fixed batch 1; use "
-                "--batch-size 1 or request consumer-side NMS"
-            )
-        exported = Path(model.export(
-            format="onnx",
-            imgsz=request.image_size,
-            opset=request.opset,
-            simplify=request.simplify,
-            dynamic=request.batch_size is None,
-            batch=request.batch_size or 1,
-            nms=not nms_required,
-            conf=0.0,
-            iou=0.7,
-            device=request.device,
-        ))
         names = class_names_from_model(model)
         if not names:
             raise ValueError("the exported detection model does not expose class names")
+        if self._family == "picodet":
+            if nms_required:
+                raise ConfigurationError(
+                    "PicoDet export emits embedded NMS candidates; use "
+                    "nms_required=false"
+                )
+            if request.batch_size != 1:
+                raise ValueError(
+                    "PicoDet embedded NMS supports only fixed batch 1; use "
+                    "--batch-size 1"
+                )
+            exported = export_picodet_core(
+                model,
+                context.run_dir / "picodet-core.onnx",
+                image_size=request.image_size,
+                num_classes=len(names),
+                opset=request.opset,
+                simplify=request.simplify,
+                confidence=0.0,
+                iou=0.7,
+            )
+            mean = (123.675, 116.28, 103.53)
+            std = (58.395, 57.12, 57.375)
+            pixel_scale = 1.0
+            resize_antialias = False
+        else:
+            if nms_required:
+                raise ConfigurationError(
+                    "LibreYOLO raw detection output is provider-specific and cannot be "
+                    "serialized as contract candidates; use embedded NMS (nms_required=false)"
+                )
+            if request.batch_size != 1:
+                raise ValueError(
+                    "LibreYOLO embedded NMS supports only fixed batch 1; use "
+                    "--batch-size 1 or request consumer-side NMS"
+                )
+            exported = Path(model.export(
+                format="onnx",
+                imgsz=request.image_size,
+                opset=request.opset,
+                simplify=request.simplify,
+                dynamic=request.batch_size is None,
+                batch=request.batch_size or 1,
+                nms=True,
+                conf=0.0,
+                iou=0.7,
+                device=request.device,
+            ))
+            mean = (0.0, 0.0, 0.0)
+            std = (1.0, 1.0, 1.0)
+            pixel_scale = 255.0
+            resize_antialias = True
         exported = standardize_detection_core(
             exported,
             context.run_dir / "core-detection-contract.onnx",
@@ -127,8 +158,10 @@ class LibreYoloBackend:
             exported,
             outputs,
             image_size=request.image_size,
-            mean=(0.0, 0.0, 0.0),
-            std=(1.0, 1.0, 1.0),
+            mean=mean,
+            std=std,
+            pixel_scale=pixel_scale,
+            resize_antialias=resize_antialias,
             batch_size=request.batch_size,
         )
         contract = detection_contract(
