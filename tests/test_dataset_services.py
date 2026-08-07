@@ -77,6 +77,10 @@ def test_coco_yolo_round_trip(tmp_path: Path) -> None:
     yolo = service.convert(ConvertDatasetRequest(source, tmp_path / "yolo", DatasetFormat.YOLO, materialization=MaterializationMode.COPY))
     assert yolo.split_counts == {"train": 1, "val": 1, "test": 1}
     assert (yolo.output / "data.yaml").is_file()
+    data_yaml = (yolo.output / "data.yaml").read_text(encoding="utf-8")
+    assert "path:" not in data_yaml
+    assert "train: images/train" in data_yaml
+    assert "val: images/val" in data_yaml
     report = service.validate(ValidateDatasetRequest(yolo.output, DatasetFormat.YOLO, require_train_val=True))
     assert report.valid, report.issues
     back = service.convert(ConvertDatasetRequest(yolo.output, tmp_path / "back", DatasetFormat.COCO, materialization=MaterializationMode.COPY))

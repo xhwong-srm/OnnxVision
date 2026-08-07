@@ -422,7 +422,7 @@ def write_yolo(dataset: DetectionDataset, output: Path, mode: MaterializationMod
                 labels.append(f"{annotation.class_id} {(box.x1 + box.x2) / 2 / sample.image.width:.9g} {(box.y1 + box.y2) / 2 / sample.image.height:.9g} {box.width / sample.image.width:.9g} {box.height / sample.image.height:.9g}")
             (output / "labels" / split.value / f"{Path(name).stem}.txt").parent.mkdir(parents=True, exist_ok=True)
             (output / "labels" / split.value / f"{Path(name).stem}.txt").write_text("\n".join(labels) + ("\n" if labels else ""), encoding="utf-8")
-    (output / "data.yaml").write_text("path: .\n" + "\n".join(f"{split.value}: images/{split.value}" for split in Split) + "\nnames:\n" + "\n".join(f"  {index}: {json.dumps(name)}" for index, name in enumerate(dataset.classes)) + "\n", encoding="utf-8")
+    (output / "data.yaml").write_text("\n".join(f"{split.value}: images/{split.value}" for split in Split) + "\nnames:\n" + "\n".join(f"  {index}: {json.dumps(name)}" for index, name in enumerate(dataset.classes)) + "\n", encoding="utf-8")
 
 
 def write_neurocle(dataset: DetectionDataset, output: Path, mode: MaterializationMode) -> None:
