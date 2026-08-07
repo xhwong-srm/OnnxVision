@@ -82,3 +82,43 @@ holdout with the same preprocessing and the test manifest:
 
 The training log and the test evaluation log are the evidence for the final
 Top-1 result. Do not report the best validation score as test performance.
+
+## ONNX export and C# validation
+
+PaddleClas first exports the checkpoint to a float RGB-NCHW inference model.
+Paddle2ONNX 2.1.0 rejects this Paddle 2.6.1 model, so the remote export used
+an isolated Python 3.10 environment with Paddle2ONNX 1.0.6. That converter
+supports only opset 16; `export_contract.py` upgrades the core to opset 18
+locally before adding the shared embedded-preprocessing contract:
+
+```powershell
+uv run --extra timm python experiments/paddleclas_pplcnetv2/export_contract.py `
+  --core experiments/paddleclas_pplcnetv2/artifacts/pplcnetv2_seal_float_opset16.onnx `
+  --output experiments/paddleclas_pplcnetv2/artifacts/pplcnetv2_seal_float.onnx
+```
+
+The emitted artifacts are ignored experiment outputs:
+
+- `pplcnetv2_seal_float-bw8.onnx`: `uint8[B,1,H,W]`, BW8, NCHW.
+- `pplcnetv2_seal_float-c24.onnx`: `uint8[B,H,W,3]`, raw BGR C24, NHWC.
+
+Both contain resize-to-224 stretch preprocessing, ImageNet normalization,
+and softmax, and advertise `onnx-vision-classification` contract `2.0.0`.
+The current PaddleClas eval recipe uses resize-short 256 plus center crop;
+the ONNX experiment's stretch mode is therefore a deployment preprocessing
+variant and its metrics should be read separately from PaddleClas's native
+metrics.
+
+Build and run the C# CLI against the requested local dataset:
+
+```powershell
+dotnet restore onnx-vision\OnnxVisionCLI.csproj
+dotnet build onnx-vision\OnnxVisionCLI.csproj -c Release --no-restore
+& .\onnx-vision\bin\Release\net461\win7-x64\OnnxVisionCLI.exe `
+  .\experiments\paddleclas_pplcnetv2\artifacts\pplcnetv2_seal_float-bw8.onnx `
+  'C:\Users\xhwong\Desktop\Images\0603 seal\datasets\v6\seal_dataset_v6.2' `
+  cpu -set test -validate --json
+```
+
+Use batch 1 for this dataset: the source crops have varying dimensions, and
+the CLI requires equal raw-image dimensions within a dynamic batch.
