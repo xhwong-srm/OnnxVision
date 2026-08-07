@@ -29,7 +29,7 @@ from .timm_training import (
     seed_everything,
     worker_seed,
 )
-from .export_validation import validate_classification_wrappers
+from .export_validation import validate_classification_native_export, validate_classification_wrappers
 
 
 logger = logging.getLogger(__name__)
@@ -399,6 +399,7 @@ class TimmClassificationBackend:
                 classes,
                 value,
                 outputs,
+                core,
                 request.data,
                 image_size=size,
                 batch_size=request.batch_size,
@@ -410,7 +411,13 @@ class TimmClassificationBackend:
                 "name": "checkpoint_native_validation",
                 "status": "passed",
                 "split": "val",
-                "images": metrics["native_images"],
+                "images": metrics["native"]["images"],
+            })
+            checks.append({
+                "name": "native_export_validation",
+                "status": "passed",
+                "split": "val",
+                "images": metrics["native-export"]["images"],
             })
             for variant in ("bw8", "c24"):
                 checks.append({
@@ -418,7 +425,7 @@ class TimmClassificationBackend:
                     "status": "passed",
                     "variant": variant,
                     "split": "val",
-                    "images": metrics[f"{variant}_images"],
+                    "images": metrics[variant]["images"],
                 })
         return Execution(tuple(artifacts), metrics, contract, tuple(checks))
 
@@ -428,6 +435,7 @@ class TimmClassificationBackend:
         classes: list[str],
         value: dict[str, Any],
         outputs: dict[str, Path],
+        core: Path,
         data: Path | None,
         *,
         image_size: int,
@@ -443,14 +451,31 @@ class TimmClassificationBackend:
             device,
             image_size=image_size,
         )
-        metrics = dict(native_metrics)
+        native_section = {
+            key.removeprefix("native_"): value
+            for key, value in native_metrics.items()
+            if key.startswith("native_")
+        }
+        metrics: dict[str, Any] = {"validation_split": "val", "native": native_section}
+        native_export, native_export_probabilities = validate_classification_native_export(
+            core,
+            data,
+            classes=classes,
+            image_size=image_size,
+            batch_size=batch_size,
+            mean=tuple(float(item) for item in value.get("data_config", {}).get("mean", _DEFAULT_MEAN)),
+            std=tuple(float(item) for item in value.get("data_config", {}).get("std", _DEFAULT_STD)),
+            reference_probabilities=native_probabilities,
+        )
+        metrics.update(native_export)
         wrapped = validate_classification_wrappers(
             outputs,
             data,
             classes=classes,
             image_size=image_size,
             batch_size=batch_size,
-            reference_probabilities=native_probabilities,
+            reference_probabilities=native_export_probabilities,
+            reference_name="native_export",
         )
         metrics.update(wrapped)
         metrics["validation_split"] = "val"

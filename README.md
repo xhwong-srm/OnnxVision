@@ -77,10 +77,17 @@ Each artifact embeds `vision_task`, `contract_name`, `contract_version`,
 embed `nms_required`. Detection rows with score `0` are padding and are ignored;
 positive-score rows must contain valid class IDs and ordered normalized boxes.
 When `export --data DATASET` is supplied, the export also evaluates the `val`
-split with the native checkpoint and both wrapped artifacts. Classification
-reports accuracy, loss, prediction agreement, and probability error; detection
-reports native provider metrics plus contract-based BW8/C24 mAP50, precision,
-recall, F1, and prediction agreement in `dataset-validation.json`.
+split with the native checkpoint, the exported float ONNX core, and both wrapped
+artifacts. `dataset-validation.json` reports these as peer `native`,
+`native-export`, `bw8`, and `c24` sections. Classification sections contain
+accuracy/loss and parity metrics; detection sections contain contract-based
+mAP50, mAP50-95, precision, recall, F1, and IoU metrics. The top-level
+`bw8_c24_*` fields compare the two wrapped variants directly. For detection,
+`bw8_c24_agreement50` and its current alias `bw8_c24_agreement` are matched
+BW8/C24 predictions divided by the larger prediction count per image, where
+class IDs must match and IoU must be at least 0.5. `bw8_c24_score_mae` is the
+mean absolute confidence-score difference for those matched pairs only; it is
+not compared with the native checkpoint or `native-export` core.
 The export command saves its complete JSON result beside the requested output
 using the same stem (`model.onnx` produces `model.json`) and logs that path
 instead of printing the result.

@@ -23,7 +23,13 @@ from .common import (
     validate_onnx,
     wrap_embedded_variants,
 )
-from .export_validation import native_validation_metrics, validate_classification_wrappers, validate_detection_wrappers
+from .export_validation import (
+    native_validation_metrics,
+    validate_classification_native_export,
+    validate_classification_wrappers,
+    validate_detection_native_export,
+    validate_detection_wrappers,
+)
 
 
 @dataclass(frozen=True)
@@ -173,14 +179,40 @@ class UltralyticsBackend:
             native = model.val(**_validation_options(data, "val", request.device))
             metrics.update(native_validation_metrics(native))
             if self._task == "classification":
+                native_export_metrics, native_export_probabilities = validate_classification_native_export(
+                    exported,
+                    data,
+                    classes=list(names),
+                    image_size=request.image_size,
+                    batch_size=request.batch_size,
+                    mean=(0.0, 0.0, 0.0),
+                    std=(1.0, 1.0, 1.0),
+                    apply_softmax=True,
+                    reference_probabilities=None,
+                )
+                metrics.update(native_export_metrics)
                 metrics.update(validate_classification_wrappers(
                     outputs,
                     data,
                     classes=names,
                     image_size=request.image_size,
                     batch_size=request.batch_size,
+                    reference_probabilities=native_export_probabilities,
+                    reference_name="native_export",
                 ))
             else:
+                metrics.update(validate_detection_native_export(
+                    exported,
+                    data,
+                    class_count=len(names),
+                    image_size=request.image_size,
+                    batch_size=request.batch_size,
+                    mean=(0.0, 0.0, 0.0),
+                    std=(1.0, 1.0, 1.0),
+                    pixel_scale=255.0,
+                    resize_mode="letterbox",
+                    resize_antialias=False,
+                ))
                 metrics.update(validate_detection_wrappers(
                     outputs,
                     data,
@@ -191,13 +223,19 @@ class UltralyticsBackend:
             report = context.write_json("dataset-validation.json", metrics)
             artifacts.append(artifact(report, "report"))
             checks.append({"name": "checkpoint_native_validation", "status": "passed", "split": "val"})
+            checks.append({
+                "name": "native_export_validation",
+                "status": "passed",
+                "split": "val",
+                "images": metrics["native-export"]["images"],
+            })
             for variant in ("bw8", "c24"):
                 checks.append({
                     "name": "wrapped_dataset_validation",
                     "status": "passed",
                     "variant": variant,
                     "split": "val",
-                    "images": metrics[f"{variant}_images"] if self._task == "classification" else metrics["validation_images"],
+                    "images": metrics[variant]["images"] if self._task == "classification" else metrics["validation_images"],
                 })
         return Execution(tuple(artifacts), metrics, contract, tuple(checks))
 

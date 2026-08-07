@@ -36,6 +36,7 @@ def validate_classification_wrappers(
     image_size: int,
     batch_size: int | None,
     reference_probabilities: Any | None = None,
+    reference_name: str = "native",
 ) -> dict[str, Any]:
     np = optional_import("numpy")
     ort = optional_import("onnxruntime")
@@ -73,19 +74,20 @@ def validate_classification_wrappers(
         probabilities_by_variant[variant] = variant_probabilities
         predictions = variant_probabilities.argmax(axis=1)
         correct = int(np.sum(predictions == labels))
-        result.update({
-            f"{variant}_accuracy": correct / len(labels),
-            f"{variant}_loss": float(np.mean(-np.log(np.clip(variant_probabilities[np.arange(len(labels)), labels], 1e-12, 1.0)))),
-            f"{variant}_correct": correct,
-            f"{variant}_images": len(labels),
-        })
+        section = {
+            "accuracy": correct / len(labels),
+            "loss": float(np.mean(-np.log(np.clip(variant_probabilities[np.arange(len(labels)), labels], 1e-12, 1.0)))),
+            "correct": correct,
+            "images": len(labels),
+        }
         if reference_probabilities is not None and reference_predictions is not None:
             probability_error = np.abs(variant_probabilities - reference_probabilities)
-            result.update({
-                f"{variant}_native_agreement": float(np.mean(predictions == reference_predictions)),
-                f"{variant}_native_probability_mae": float(np.mean(probability_error)),
-                f"{variant}_native_max_probability_error": float(np.max(probability_error)),
+            section.update({
+                f"{reference_name}_agreement": float(np.mean(predictions == reference_predictions)),
+                f"{reference_name}_probability_mae": float(np.mean(probability_error)),
+                f"{reference_name}_max_probability_error": float(np.max(probability_error)),
             })
+        result[variant] = section
 
     bw8 = probabilities_by_variant["bw8"]
     c24 = probabilities_by_variant["c24"]
@@ -97,17 +99,252 @@ def validate_classification_wrappers(
     return result
 
 
-def _classification_raw_image(path: str, variant: str, np: Any) -> Any:
+def validate_classification_native_export(
+    output: Path,
+    data_root: Path,
+    *,
+    classes: list[str],
+    image_size: int,
+    batch_size: int | None,
+    mean: tuple[float, ...],
+    std: tuple[float, ...],
+    pixel_scale: float = 255.0,
+    apply_softmax: bool = False,
+    reference_probabilities: Any | None = None,
+) -> tuple[dict[str, Any], Any]:
+    """Evaluate the exported float ONNX core using its native tensor input."""
+    np = optional_import("numpy")
+    ort = optional_import("onnxruntime")
+    torchvision = optional_import("torchvision")
+    dataset = torchvision.datasets.ImageFolder(str(data_root / "val"))
+    if dataset.classes != classes:
+        raise ValueError("dataset classes differ from checkpoint classes")
+    if len(dataset) == 0:
+        raise ValueError("classification validation split is empty")
+
+    labels = np.asarray([label for _, label in dataset.samples], dtype=np.int64)
+    session = ort.InferenceSession(str(output), providers=["CPUExecutionProvider"])
+    input_name = session.get_inputs()[0].name
+    run_batch = batch_size or 32
+    probabilities: list[Any] = []
+    for start in range(0, len(dataset.samples), run_batch):
+        current = dataset.samples[start:start + run_batch]
+        raw_images = [
+            _classification_raw_image(
+                path,
+                "native-export",
+                np,
+                image_size=image_size,
+                mean=mean,
+                std=std,
+                pixel_scale=pixel_scale,
+            )
+            for path, _ in current
+        ]
+        actual_batch = len(raw_images)
+        while len(raw_images) < run_batch:
+            raw_images.append(np.zeros_like(raw_images[0]))
+        values = session.run(None, {input_name: np.stack(raw_images, axis=0)})
+        batch_probabilities = np.asarray(values[0])
+        if apply_softmax:
+            shifted = batch_probabilities - np.max(batch_probabilities, axis=1, keepdims=True)
+            exponentials = np.exp(shifted)
+            batch_probabilities = exponentials / np.sum(exponentials, axis=1, keepdims=True)
+        if batch_probabilities.shape != (run_batch, len(classes)):
+            raise ValueError(
+                "native-export ONNX validation output shape mismatch: "
+                f"{batch_probabilities.shape}; expected {(run_batch, len(classes))}"
+            )
+        probabilities.append(batch_probabilities[:actual_batch])
+
+    native_export_probabilities = np.concatenate(probabilities, axis=0)
+    predictions = native_export_probabilities.argmax(axis=1)
+    correct = int(np.sum(predictions == labels))
+    section: dict[str, Any] = {
+        "accuracy": correct / len(labels),
+        "loss": float(np.mean(-np.log(np.clip(native_export_probabilities[np.arange(len(labels)), labels], 1e-12, 1.0)))),
+        "correct": correct,
+        "images": len(labels),
+    }
+    if reference_probabilities is not None:
+        reference_predictions = reference_probabilities.argmax(axis=1)
+        probability_error = np.abs(native_export_probabilities - reference_probabilities)
+        section.update({
+            "native_agreement": float(np.mean(predictions == reference_predictions)),
+            "native_probability_mae": float(np.mean(probability_error)),
+            "native_max_probability_error": float(np.max(probability_error)),
+        })
+    return {"native-export": section}, native_export_probabilities
+
+
+def _classification_raw_image(
+    path: str,
+    variant: str,
+    np: Any,
+    *,
+    image_size: int | None = None,
+    mean: tuple[float, ...] = (0.0, 0.0, 0.0),
+    std: tuple[float, ...] = (1.0, 1.0, 1.0),
+    pixel_scale: float = 255.0,
+) -> Any:
     image_module = optional_import("PIL.Image")
     image = image_module.open(path)
     try:
         if variant == "bw8":
             # Keep the channel axis per image; batching then produces [B, 1, H, W].
             return np.asarray(image.convert("L"), dtype=np.uint8)[None, ...]
+        if variant == "native-export":
+            if image_size is None or image_size <= 0:
+                raise ValueError("native-export image_size must be positive")
+            if len(mean) != 3 or len(std) != 3 or pixel_scale <= 0:
+                raise ValueError("native-export preprocessing requires three mean/std values and a positive pixel scale")
+            resized = image.convert("RGB").resize((image_size, image_size), image_module.Resampling.BILINEAR)
+            rgb = np.asarray(resized, dtype=np.float32).transpose(2, 0, 1) / pixel_scale
+            return (rgb - np.asarray(mean, dtype=np.float32)[:, None, None]) / np.asarray(std, dtype=np.float32)[:, None, None]
         rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
         return np.ascontiguousarray(rgb[..., ::-1])
     finally:
         image.close()
+
+
+def validate_detection_native_export(
+    output: Path,
+    data_yaml: Path,
+    *,
+    class_count: int,
+    image_size: int,
+    batch_size: int | None,
+    mean: tuple[float, ...],
+    std: tuple[float, ...],
+    pixel_scale: float,
+    resize_mode: str,
+    resize_antialias: bool,
+) -> dict[str, Any]:
+    """Evaluate the standardized exported detection core with native input."""
+    if resize_mode not in {"stretch", "letterbox"}:
+        raise ValueError("native-export resize_mode must be stretch or letterbox")
+    if len(mean) != 3 or len(std) != 3 or pixel_scale <= 0:
+        raise ValueError("native-export preprocessing requires three mean/std values and a positive pixel scale")
+
+    np = optional_import("numpy")
+    ort = optional_import("onnxruntime")
+    samples = _yolo_validation_samples(data_yaml)
+    if not samples:
+        raise ValueError("detection validation split is empty")
+
+    session = ort.InferenceSession(str(output), providers=["CPUExecutionProvider"])
+    input_name = session.get_inputs()[0].name
+    run_batch = batch_size or 16
+    predictions: list[tuple[Any, Any, Any]] = []
+    for start in range(0, len(samples), run_batch):
+        current = samples[start:start + run_batch]
+        raw_images = [
+            _native_detection_image(
+                path,
+                image_size=image_size,
+                mean=mean,
+                std=std,
+                pixel_scale=pixel_scale,
+                resize_mode=resize_mode,
+                resize_antialias=resize_antialias,
+                np=np,
+            )
+            for path, _ in current
+        ]
+        actual_batch = len(raw_images)
+        while len(raw_images) < run_batch:
+            raw_images.append(np.zeros_like(raw_images[0]))
+        values = session.run(None, {input_name: np.stack(raw_images, axis=0)})
+        boxes, scores, class_ids = (np.asarray(value) for value in values[:3])
+        if boxes.shape[0] != run_batch or scores.shape[0] != run_batch or class_ids.shape[0] != run_batch:
+            raise ValueError("native-export ONNX validation batch dimension mismatch")
+        for index, (path, _) in enumerate(current):
+            predictions.append((
+                _restore_native_detection_boxes(
+                    boxes[index],
+                    path,
+                    image_size=image_size,
+                    resize_mode=resize_mode,
+                    np=np,
+                ),
+                scores[index],
+                class_ids[index],
+            ))
+
+    metrics = _detection_metrics(
+        "native_export",
+        predictions,
+        [annotations for _, annotations in samples],
+        class_count=class_count,
+        confidence=0.0,
+        iou_threshold=0.5,
+        np=np,
+    )
+    return {
+        "native-export": {
+            key.removeprefix("native_export_"): value
+            for key, value in metrics.items()
+        }
+    }
+
+
+def _native_detection_image(
+    path: Path,
+    *,
+    image_size: int,
+    mean: tuple[float, ...],
+    std: tuple[float, ...],
+    pixel_scale: float,
+    resize_mode: str,
+    resize_antialias: bool,
+    np: Any,
+) -> Any:
+    image_module = optional_import("PIL.Image")
+    image = image_module.open(path)
+    try:
+        rgb = image.convert("RGB")
+        width, height = rgb.size
+        resample = image_module.Resampling.LANCZOS if resize_antialias else image_module.Resampling.BILINEAR
+        if resize_mode == "stretch":
+            prepared = rgb.resize((image_size, image_size), resample)
+        else:
+            scale = image_size / max(height, width)
+            resized_height = max(1, int(np.floor(height * scale + 0.5)))
+            resized_width = max(1, int(np.floor(width * scale + 0.5)))
+            resized = rgb.resize((resized_width, resized_height), resample)
+            prepared = image_module.new("RGB", (image_size, image_size), (114, 114, 114))
+            prepared.paste(resized, ((image_size - resized_width) // 2, (image_size - resized_height) // 2))
+        pixels = np.asarray(prepared, dtype=np.float32).transpose(2, 0, 1) / pixel_scale
+        return (pixels - np.asarray(mean, dtype=np.float32)[:, None, None]) / np.asarray(std, dtype=np.float32)[:, None, None]
+    finally:
+        image.close()
+
+
+def _restore_native_detection_boxes(
+    boxes: Any,
+    path: Path,
+    *,
+    image_size: int,
+    resize_mode: str,
+    np: Any,
+) -> Any:
+    if resize_mode == "stretch":
+        return boxes
+    image_module = optional_import("PIL.Image")
+    image = image_module.open(path)
+    try:
+        width, height = image.size
+    finally:
+        image.close()
+    scale = image_size / max(height, width)
+    resized_height = max(1, int(np.floor(height * scale + 0.5)))
+    resized_width = max(1, int(np.floor(width * scale + 0.5)))
+    top = (image_size - resized_height) // 2
+    left = (image_size - resized_width) // 2
+    restored = np.asarray(boxes, dtype=np.float32).copy() * image_size
+    restored[..., [0, 2]] = (restored[..., [0, 2]] - left) / resized_width
+    restored[..., [1, 3]] = (restored[..., [1, 3]] - top) / resized_height
+    return np.clip(restored, 0.0, 1.0)
 
 
 def validate_detection_wrappers(
@@ -157,7 +394,7 @@ def validate_detection_wrappers(
             for index in range(actual_batch):
                 predictions.append((boxes[index], scores[index], class_ids[index]))
         predictions_by_variant[variant] = predictions
-        result.update(_detection_metrics(
+        metrics = _detection_metrics(
             variant,
             predictions,
             [annotations for _, annotations in samples],
@@ -165,7 +402,11 @@ def validate_detection_wrappers(
             confidence=confidence,
             iou_threshold=iou_threshold,
             np=np,
-        ))
+        )
+        result[variant] = {
+            key.removeprefix(f"{variant}_"): value
+            for key, value in metrics.items()
+        }
 
     result.update(_variant_agreement(
         predictions_by_variant["bw8"],

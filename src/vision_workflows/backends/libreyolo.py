@@ -22,7 +22,11 @@ from .common import (
     wrap_embedded_variants,
 )
 from .libreyolo_picodet import export_picodet_core
-from .export_validation import native_validation_metrics, validate_detection_wrappers
+from .export_validation import (
+    native_validation_metrics,
+    validate_detection_native_export,
+    validate_detection_wrappers,
+)
 
 
 @dataclass(frozen=True)
@@ -120,6 +124,7 @@ class LibreYoloBackend:
             std = (58.395, 57.12, 57.375)
             pixel_scale = 1.0
             resize_antialias = False
+            resize_mode = "stretch"
         else:
             if nms_required:
                 raise ConfigurationError(
@@ -147,6 +152,7 @@ class LibreYoloBackend:
             std = (1.0, 1.0, 1.0)
             pixel_scale = 255.0
             resize_antialias = True
+            resize_mode = "letterbox"
         exported = standardize_detection_core(
             exported,
             context.run_dir / "core-detection-contract.onnx",
@@ -185,6 +191,18 @@ class LibreYoloBackend:
             data = require_file(request.data, "dataset YAML")
             values = model.val(data=str(data), split="val", device=request.device)
             metrics.update(native_validation_metrics(values))
+            metrics.update(validate_detection_native_export(
+                exported,
+                data,
+                class_count=len(names),
+                image_size=request.image_size,
+                batch_size=request.batch_size,
+                mean=mean,
+                std=std,
+                pixel_scale=pixel_scale,
+                resize_mode=resize_mode,
+                resize_antialias=resize_antialias,
+            ))
             metrics.update(validate_detection_wrappers(
                 outputs,
                 data,
@@ -195,6 +213,12 @@ class LibreYoloBackend:
             report = context.write_json("dataset-validation.json", metrics)
             artifacts.append(artifact(report, "report"))
             checks.append({"name": "checkpoint_native_validation", "status": "passed", "split": "val"})
+            checks.append({
+                "name": "native_export_validation",
+                "status": "passed",
+                "split": "val",
+                "images": metrics["native-export"]["images"],
+            })
             for variant in ("bw8", "c24"):
                 checks.append({
                     "name": "wrapped_dataset_validation",

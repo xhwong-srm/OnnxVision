@@ -94,10 +94,23 @@ def test_classification_wrappers_report_accuracy_and_agreement(monkeypatch: pyte
         reference_probabilities=reference,
     )
 
-    assert metrics["bw8_accuracy"] == 0.5
-    assert metrics["c24_accuracy"] == 0.5
+    assert metrics["bw8"]["accuracy"] == 0.5
+    assert metrics["c24"]["accuracy"] == 0.5
     assert metrics["bw8_c24_agreement"] == 1.0
-    assert metrics["bw8_native_agreement"] == 0.5
+    assert metrics["bw8"]["native_agreement"] == 0.5
+
+    native_export, _ = validation.validate_classification_native_export(
+        tmp_path / "model-core.onnx",
+        tmp_path,
+        classes=["first", "second"],
+        image_size=4,
+        batch_size=None,
+        mean=(0.0, 0.0, 0.0),
+        std=(1.0, 1.0, 1.0),
+        reference_probabilities=reference,
+    )
+    assert native_export["native-export"]["accuracy"] == 0.5
+    assert native_export["native-export"]["native_agreement"] == 0.5
 
 
 def test_detection_wrappers_report_map_and_variant_agreement(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -131,11 +144,25 @@ def test_detection_wrappers_report_map_and_variant_agreement(monkeypatch: pytest
         batch_size=1,
     )
 
-    assert metrics["bw8_map50"] == pytest.approx(0.995)
-    assert metrics["bw8_map50_95"] == pytest.approx(0.995)
-    assert metrics["c24_recall50"] == pytest.approx(1.0)
-    assert metrics["c24_map50_95"] == pytest.approx(0.995)
+    assert metrics["bw8"]["map50"] == pytest.approx(0.995)
+    assert metrics["bw8"]["map50_95"] == pytest.approx(0.995)
+    assert metrics["c24"]["recall50"] == pytest.approx(1.0)
+    assert metrics["c24"]["map50_95"] == pytest.approx(0.995)
     assert metrics["bw8_c24_agreement50"] == pytest.approx(1.0)
+
+    native_export = validation.validate_detection_native_export(
+        tmp_path / "model-core.onnx",
+        data_yaml,
+        class_count=1,
+        image_size=4,
+        batch_size=1,
+        mean=(0.0, 0.0, 0.0),
+        std=(1.0, 1.0, 1.0),
+        pixel_scale=255.0,
+        resize_mode="stretch",
+        resize_antialias=False,
+    )
+    assert native_export["native-export"]["map50"] == pytest.approx(0.995)
 
 
 def test_label_path_uses_the_dataset_images_component() -> None:
