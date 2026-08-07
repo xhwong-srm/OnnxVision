@@ -115,3 +115,9 @@ def test_detection_wrappers_report_map_and_variant_agreement(monkeypatch: pytest
     assert metrics["bw8_map50"] == pytest.approx(1.0)
     assert metrics["c24_recall50"] == pytest.approx(1.0)
     assert metrics["bw8_c24_agreement50"] == pytest.approx(1.0)
+
+
+def test_label_path_uses_the_dataset_images_component() -> None:
+    path = Path("C:/Images/project/images/val/sample.png")
+
+    assert validation._label_path(path) == Path("C:/Images/project/labels/val/sample.txt")

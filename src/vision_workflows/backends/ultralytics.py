@@ -138,6 +138,9 @@ class UltralyticsBackend:
             batch_size=request.batch_size,
             apply_softmax=self._task == "classification",
             output_names=("probabilities",) if self._task == "classification" else None,
+            resize_mode="letterbox" if self._task == "detection" else "stretch",
+            deletterbox_boxes=self._task == "detection",
+            resize_antialias=False if self._task == "detection" else True,
         )
         contract = (
             classification_contract(names, batch_size=request.batch_size)

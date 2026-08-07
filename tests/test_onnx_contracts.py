@@ -133,6 +133,67 @@ def test_embedded_preprocessing_supports_pixel_space_normalization(tmp_path) -> 
     assert values[0, :, 0, 0].tolist() == [29.0, 18.0, 7.0]
 
 
+def test_letterbox_wrapper_maps_boxes_back_to_original_frame(tmp_path) -> None:
+    onnx = pytest.importorskip("onnx")
+    np = pytest.importorskip("numpy")
+    graph = onnx.helper.make_graph(
+        [
+            onnx.helper.make_node(
+                "Constant",
+                [],
+                ["boxes"],
+                value=onnx.numpy_helper.from_array(
+                    np.asarray([[[0.25, 0.25, 0.75, 0.75]]], dtype=np.float32)
+                ),
+            ),
+            onnx.helper.make_node(
+                "Constant",
+                [],
+                ["scores"],
+                value=onnx.numpy_helper.from_array(np.asarray([[0.9]], dtype=np.float32)),
+            ),
+            onnx.helper.make_node(
+                "Constant",
+                [],
+                ["class_ids"],
+                value=onnx.numpy_helper.from_array(np.asarray([[0]], dtype=np.int64)),
+            ),
+        ],
+        "letterbox_detection",
+        [onnx.helper.make_tensor_value_info("images", onnx.TensorProto.FLOAT, [1, 3, 8, 8])],
+        [
+            onnx.helper.make_tensor_value_info("boxes", onnx.TensorProto.FLOAT, [1, 1, 4]),
+            onnx.helper.make_tensor_value_info("scores", onnx.TensorProto.FLOAT, [1, 1]),
+            onnx.helper.make_tensor_value_info("class_ids", onnx.TensorProto.INT64, [1, 1]),
+        ],
+    )
+    core = tmp_path / "letterbox-core.onnx"
+    onnx.save(onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 18)]), core)
+    outputs = embedded_output_paths(tmp_path / "letterbox.onnx")
+    wrap_embedded_variants(
+        core,
+        outputs,
+        image_size=8,
+        mean=(0.0, 0.0, 0.0),
+        std=(1.0, 1.0, 1.0),
+        batch_size=1,
+        resize_mode="letterbox",
+        deletterbox_boxes=True,
+    )
+
+    ort = pytest.importorskip("onnxruntime")
+    for variant, path in outputs.items():
+        session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+        if variant == "bw8":
+            value = np.zeros((1, 1, 4, 8), dtype=np.uint8)
+        else:
+            value = np.zeros((1, 4, 8, 3), dtype=np.uint8)
+        boxes, scores, class_ids = session.run(None, {session.get_inputs()[0].name: value})
+        np.testing.assert_allclose(boxes, np.asarray([[[0.25, 0.0, 0.75, 1.0]]], dtype=np.float32))
+        np.testing.assert_allclose(scores, np.asarray([[0.9]], dtype=np.float32))
+        assert class_ids.tolist() == [[0]]
+
+
 def test_standardize_detection_core_splits_end_to_end_batch_output(tmp_path) -> None:
     onnx = pytest.importorskip("onnx")
     graph = onnx.helper.make_graph(

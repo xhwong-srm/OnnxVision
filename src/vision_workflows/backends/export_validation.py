@@ -225,7 +225,7 @@ def _read_image_list(path: Path, root: Path) -> list[Path]:
 def _label_path(image_path: Path) -> Path:
     parts = list(image_path.parts)
     try:
-        index = next(index for index, part in enumerate(parts) if part.casefold() == "images")
+        index = next(index for index in range(len(parts) - 1, -1, -1) if parts[index].casefold() == "images")
     except StopIteration:
         return image_path.parent / "labels" / f"{image_path.stem}.txt"
     parts[index] = "labels"

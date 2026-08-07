@@ -457,6 +457,14 @@ def embedded_output_paths(output: Path) -> dict[str, Path]:
     }
 
 
+def _embedded_input_name(variant: str) -> str:
+    if variant == "bw8":
+        return "images_bw8_uint8_nchw"
+    if variant == "c24":
+        return "images_c24_uint8_nhwc_bgr"
+    raise ValueError(f"unsupported embedded input variant: {variant}")
+
+
 def standardize_detection_core(
     core: Path,
     output: Path,
@@ -664,6 +672,8 @@ def wrap_embedded_variants(
     batch_size: int | None = None,
     apply_softmax: bool = False,
     output_names: tuple[str, ...] | None = None,
+    resize_mode: str = "stretch",
+    deletterbox_boxes: bool = False,
 ) -> tuple[Path, ...]:
     """Wrap a float RGB NCHW ONNX core with BW8 and C24 inputs.
 
@@ -680,6 +690,10 @@ def wrap_embedded_variants(
         raise ValueError("embedded preprocessing requires three mean and std values")
     if pixel_scale <= 0:
         raise ValueError("embedded preprocessing pixel_scale must be positive")
+    if resize_mode not in {"stretch", "letterbox"}:
+        raise ValueError("embedded preprocessing resize_mode must be stretch or letterbox")
+    if deletterbox_boxes and resize_mode != "letterbox":
+        raise ValueError("deletterbox_boxes requires letterbox preprocessing")
     for variant, output in outputs.items():
         if variant not in {"bw8", "c24"}:
             raise ValueError(f"unsupported embedded input variant: {variant}")
@@ -705,20 +719,33 @@ def wrap_embedded_variants(
             pixel_scale,
             resize_antialias,
             batch_size,
+            resize_mode,
         )
         postprocessing: list[Any] = []
         if output_names is not None and len(output_names) != len(core_graph.graph.output):
             raise ValueError("output_names must match the ONNX core output count")
         if apply_softmax and len(core_graph.graph.output) != 1:
             raise ValueError("classification core must have exactly one output for softmax wrapping")
+        if deletterbox_boxes and len(core_graph.graph.output) != 3:
+            raise ValueError("deletterbox_boxes requires boxes, scores, and class_ids outputs")
         for output_index, output_value in enumerate(core_graph.graph.output):
             original_output = output_value.name
             public_output = output_names[output_index] if output_names is not None else original_output.removeprefix("core/")
+            source_output = original_output
+            if deletterbox_boxes and output_index == 0 and public_output == "boxes":
+                source_output, box_nodes = _deletterbox_boxes_nodes(
+                    core_graph,
+                    _embedded_input_name(variant),
+                    original_output,
+                    image_size,
+                    variant,
+                )
+                postprocessing.extend(box_nodes)
             if apply_softmax:
                 public_output = "probabilities"
-                postprocessing.append(onnx.helper.make_node("Softmax", [original_output], [public_output], axis=1, name="contract/softmax"))
+                postprocessing.append(onnx.helper.make_node("Softmax", [source_output], [public_output], axis=1, name="contract/softmax"))
             else:
-                postprocessing.append(onnx.helper.make_node("Identity", [original_output], [public_output], name=f"contract/{public_output}"))
+                postprocessing.append(onnx.helper.make_node("Identity", [source_output], [public_output], name=f"contract/{public_output}"))
             output_value.name = public_output
         core_graph.graph.node.extend(preprocessing + original_nodes + postprocessing)
         mode = "dynamic" if batch_size is None else f"fixed batch {batch_size}"
@@ -742,6 +769,7 @@ def _embedded_preprocessing_nodes(
     pixel_scale: float,
     resize_antialias: bool,
     batch_size: int | None,
+    resize_mode: str,
 ) -> list[Any]:
     from onnx import TensorProto, helper, numpy_helper
 
@@ -769,6 +797,25 @@ def _embedded_preprocessing_nodes(
         model.graph.initializer.append(numpy_helper.from_array(np.asarray([2, 1, 0], dtype=np.int64), "preprocess/bgr_to_rgb_indices"))
         resized_source = "preprocess/rgb_nchw"
         input_channels = 3
+
+    if resize_mode == "letterbox":
+        model.graph.initializer.extend([
+            numpy_helper.from_array(np.asarray(mean, dtype=np.float32).reshape(1, 3, 1, 1), "preprocess/mean"),
+            numpy_helper.from_array(np.asarray(std, dtype=np.float32).reshape(1, 3, 1, 1), "preprocess/std"),
+        ])
+        return nodes + _letterbox_preprocessing_nodes(
+            onnx,
+            np,
+            model,
+            core_input,
+            input_name,
+            resized_source,
+            input_channels,
+            image_size,
+            pixel_scale,
+            resize_antialias,
+            variant,
+        )
 
     sizes_name, size_nodes = _add_dynamic_sizes(model, np, helper, resized_source, input_channels, image_size, "preprocess/resize_sizes")
     nodes.extend(size_nodes)
@@ -809,6 +856,210 @@ def _embedded_preprocessing_nodes(
         helper.make_node("Div", ["preprocess/centered", "preprocess/std"], [core_input], name="preprocess/std"),
     ])
     return nodes
+
+
+def _letterbox_preprocessing_nodes(
+    onnx: Any,
+    np: Any,
+    model: Any,
+    core_input: str,
+    input_name: str,
+    source: str,
+    input_channels: int,
+    image_size: int,
+    pixel_scale: float,
+    resize_antialias: bool,
+    variant: str,
+) -> list[Any]:
+    from onnx import TensorProto, helper, numpy_helper
+
+    prefix = "preprocess/letterbox"
+    shape_name = f"{prefix}/shape"
+    batch_name = f"{prefix}/batch"
+    height_name = f"{prefix}/height"
+    width_name = f"{prefix}/width"
+    max_name = f"{prefix}/max_dimension"
+    height_float = f"{prefix}/height_float"
+    width_float = f"{prefix}/width_float"
+    max_float = f"{prefix}/max_dimension_float"
+    scale_name = f"{prefix}/scale"
+    resized_height_float = f"{prefix}/resized_height_float"
+    resized_width_float = f"{prefix}/resized_width_float"
+    resized_height = f"{prefix}/resized_height"
+    resized_width = f"{prefix}/resized_width"
+    sizes_name = f"{prefix}/sizes"
+    pad_height = f"{prefix}/pad_height"
+    pad_width = f"{prefix}/pad_width"
+    pad_top = f"{prefix}/pad_top"
+    pad_left = f"{prefix}/pad_left"
+    pad_bottom = f"{prefix}/pad_bottom"
+    pad_right = f"{prefix}/pad_right"
+    pads_name = f"{prefix}/pads"
+    resized_name = f"{prefix}/resized_uint8"
+    padded_name = f"{prefix}/padded_uint8"
+
+    model.graph.initializer.extend([
+        helper.make_tensor(f"{prefix}/batch_index", TensorProto.INT64, [1], [0]),
+        helper.make_tensor(f"{prefix}/height_index", TensorProto.INT64, [1], [2]),
+        helper.make_tensor(f"{prefix}/width_index", TensorProto.INT64, [1], [3]),
+        helper.make_tensor(f"{prefix}/channels", TensorProto.INT64, [1], [input_channels]),
+        helper.make_tensor(f"{prefix}/target_int", TensorProto.INT64, [1], [image_size]),
+        numpy_helper.from_array(np.asarray(float(image_size), dtype=np.float32), f"{prefix}/target_float"),
+        numpy_helper.from_array(np.asarray(2, dtype=np.int64), f"{prefix}/two_int"),
+        numpy_helper.from_array(np.asarray(float(pixel_scale), dtype=np.float32), f"{prefix}/pixel_scale"),
+        numpy_helper.from_array(np.asarray(114, dtype=np.uint8), f"{prefix}/pad_value"),
+        numpy_helper.from_array(np.asarray([0], dtype=np.int64), f"{prefix}/zero"),
+    ])
+    nodes: list[Any] = [
+        helper.make_node("Shape", [source], [shape_name], name=f"{prefix}/shape_node"),
+        helper.make_node("Gather", [shape_name, f"{prefix}/batch_index"], [batch_name], axis=0, name=f"{prefix}/batch"),
+        helper.make_node("Gather", [shape_name, f"{prefix}/height_index"], [height_name], axis=0, name=f"{prefix}/height"),
+        helper.make_node("Gather", [shape_name, f"{prefix}/width_index"], [width_name], axis=0, name=f"{prefix}/width"),
+        helper.make_node("Max", [height_name, width_name], [max_name], name=f"{prefix}/max_dimension"),
+        helper.make_node("Cast", [height_name], [height_float], to=TensorProto.FLOAT, name=f"{prefix}/height_cast"),
+        helper.make_node("Cast", [width_name], [width_float], to=TensorProto.FLOAT, name=f"{prefix}/width_cast"),
+        helper.make_node("Cast", [max_name], [max_float], to=TensorProto.FLOAT, name=f"{prefix}/max_dimension_cast"),
+        helper.make_node("Div", [f"{prefix}/target_float", max_float], [scale_name], name=f"{prefix}/scale"),
+        helper.make_node("Mul", [height_float, scale_name], [resized_height_float], name=f"{prefix}/resized_height_float"),
+        helper.make_node("Mul", [width_float, scale_name], [resized_width_float], name=f"{prefix}/resized_width_float"),
+        helper.make_node("Round", [resized_height_float], [f"{prefix}/resized_height_rounded"], name=f"{prefix}/resized_height_round"),
+        helper.make_node("Round", [resized_width_float], [f"{prefix}/resized_width_rounded"], name=f"{prefix}/resized_width_round"),
+        helper.make_node("Cast", [f"{prefix}/resized_height_rounded"], [resized_height], to=TensorProto.INT64, name=f"{prefix}/resized_height_cast"),
+        helper.make_node("Cast", [f"{prefix}/resized_width_rounded"], [resized_width], to=TensorProto.INT64, name=f"{prefix}/resized_width_cast"),
+        helper.make_node("Concat", [batch_name, f"{prefix}/channels", resized_height, resized_width], [sizes_name], axis=0, name=f"{prefix}/sizes"),
+        helper.make_node(
+            "Resize",
+            [source, "", "", sizes_name],
+            [resized_name],
+            mode="linear",
+            coordinate_transformation_mode="half_pixel",
+            antialias=int(resize_antialias),
+            name=f"{prefix}/resize",
+        ),
+        helper.make_node("Sub", [f"{prefix}/target_int", resized_height], [pad_height], name=f"{prefix}/pad_height"),
+        helper.make_node("Sub", [f"{prefix}/target_int", resized_width], [pad_width], name=f"{prefix}/pad_width"),
+        helper.make_node("Div", [pad_height, f"{prefix}/two_int"], [pad_top], name=f"{prefix}/pad_top"),
+        helper.make_node("Div", [pad_width, f"{prefix}/two_int"], [pad_left], name=f"{prefix}/pad_left"),
+        helper.make_node("Sub", [pad_height, pad_top], [pad_bottom], name=f"{prefix}/pad_bottom"),
+        helper.make_node("Sub", [pad_width, pad_left], [pad_right], name=f"{prefix}/pad_right"),
+        helper.make_node(
+            "Concat",
+            [f"{prefix}/zero", f"{prefix}/zero", pad_top, pad_left, f"{prefix}/zero", f"{prefix}/zero", pad_bottom, pad_right],
+            [pads_name],
+            axis=0,
+            name=f"{prefix}/pads",
+        ),
+        helper.make_node("Pad", [resized_name, pads_name, f"{prefix}/pad_value"], [padded_name], name=f"{prefix}/pad"),
+        helper.make_node("Cast", [padded_name], [f"{prefix}/float"], to=TensorProto.FLOAT, name=f"{prefix}/cast"),
+        helper.make_node("Div", [f"{prefix}/float", f"{prefix}/pixel_scale"], [f"{prefix}/scaled"], name=f"{prefix}/scale_pixels"),
+    ]
+
+    if variant == "bw8":
+        padded_shape = f"{prefix}/padded_shape"
+        padded_batch = f"{prefix}/padded_batch"
+        rgb_sizes = f"{prefix}/rgb_sizes"
+        model.graph.initializer.extend([
+            helper.make_tensor(f"{prefix}/padded_batch_index", TensorProto.INT64, [1], [0]),
+            helper.make_tensor(f"{prefix}/rgb_channels", TensorProto.INT64, [1], [3]),
+            helper.make_tensor(f"{prefix}/rgb_height", TensorProto.INT64, [1], [image_size]),
+            helper.make_tensor(f"{prefix}/rgb_width", TensorProto.INT64, [1], [image_size]),
+        ])
+        nodes.extend([
+            helper.make_node("Shape", [f"{prefix}/scaled"], [padded_shape], name=f"{prefix}/rgb_shape"),
+            helper.make_node("Gather", [padded_shape, f"{prefix}/padded_batch_index"], [padded_batch], axis=0, name=f"{prefix}/rgb_batch"),
+            helper.make_node("Concat", [padded_batch, f"{prefix}/rgb_channels", f"{prefix}/rgb_height", f"{prefix}/rgb_width"], [rgb_sizes], axis=0, name=f"{prefix}/rgb_sizes"),
+            helper.make_node("Expand", [f"{prefix}/scaled", rgb_sizes], [f"{prefix}/rgb"], name=f"{prefix}/gray_to_rgb"),
+            helper.make_node("Sub", [f"{prefix}/rgb", "preprocess/mean"], ["preprocess/centered"], name="preprocess/mean"),
+            helper.make_node("Div", ["preprocess/centered", "preprocess/std"], [core_input], name="preprocess/std"),
+        ])
+    else:
+        nodes.extend([
+            helper.make_node("Sub", [f"{prefix}/scaled", "preprocess/mean"], ["preprocess/centered"], name="preprocess/mean"),
+            helper.make_node("Div", ["preprocess/centered", "preprocess/std"], [core_input], name="preprocess/std"),
+        ])
+    return nodes
+
+
+def _deletterbox_boxes_nodes(
+    model: Any,
+    input_name: str,
+    boxes: str,
+    image_size: int,
+    variant: str,
+) -> tuple[str, list[Any]]:
+    np = optional_module("numpy")
+    from onnx import TensorProto, helper, numpy_helper
+
+    prefix = "postprocess/deletterbox"
+    height_axis = 2 if variant == "bw8" else 1
+    width_axis = 3 if variant == "bw8" else 2
+    model.graph.initializer.extend([
+        helper.make_tensor(f"{prefix}/height_index", TensorProto.INT64, [1], [height_axis]),
+        helper.make_tensor(f"{prefix}/width_index", TensorProto.INT64, [1], [width_axis]),
+        helper.make_tensor(f"{prefix}/two", TensorProto.INT64, [], [2]),
+        helper.make_tensor(f"{prefix}/target_int", TensorProto.INT64, [1], [image_size]),
+        numpy_helper.from_array(np.asarray(float(image_size), dtype=np.float32), f"{prefix}/target"),
+        numpy_helper.from_array(np.full((1, 1, 4), float(image_size), dtype=np.float32), f"{prefix}/canvas_scale"),
+        numpy_helper.from_array(np.asarray(0.0, dtype=np.float32), f"{prefix}/clip_min"),
+        numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), f"{prefix}/clip_max"),
+    ])
+    shape = f"{prefix}/shape"
+    height = f"{prefix}/height"
+    width = f"{prefix}/width"
+    max_dimension = f"{prefix}/max_dimension"
+    scale = f"{prefix}/scale"
+    resized_height = f"{prefix}/resized_height"
+    resized_width = f"{prefix}/resized_width"
+    pad_height = f"{prefix}/pad_height"
+    pad_width = f"{prefix}/pad_width"
+    top = f"{prefix}/top"
+    left = f"{prefix}/left"
+    nodes: list[Any] = [
+        helper.make_node("Shape", [input_name], [shape], name=f"{prefix}/shape_node"),
+        helper.make_node("Gather", [shape, f"{prefix}/height_index"], [height], axis=0, name=f"{prefix}/height"),
+        helper.make_node("Gather", [shape, f"{prefix}/width_index"], [width], axis=0, name=f"{prefix}/width"),
+        helper.make_node("Max", [height, width], [max_dimension], name=f"{prefix}/max_dimension"),
+        helper.make_node("Cast", [max_dimension], [f"{prefix}/max_float"], to=TensorProto.FLOAT, name=f"{prefix}/max_cast"),
+        helper.make_node("Div", [f"{prefix}/target", f"{prefix}/max_float"], [scale], name=f"{prefix}/scale"),
+        helper.make_node("Cast", [height], [f"{prefix}/height_float"], to=TensorProto.FLOAT, name=f"{prefix}/height_cast"),
+        helper.make_node("Cast", [width], [f"{prefix}/width_float"], to=TensorProto.FLOAT, name=f"{prefix}/width_cast"),
+        helper.make_node("Mul", [f"{prefix}/height_float", scale], [f"{prefix}/resized_height_float"], name=f"{prefix}/resized_height_float"),
+        helper.make_node("Mul", [f"{prefix}/width_float", scale], [f"{prefix}/resized_width_float"], name=f"{prefix}/resized_width_float"),
+        helper.make_node("Round", [f"{prefix}/resized_height_float"], [f"{prefix}/resized_height_rounded"], name=f"{prefix}/resized_height_round"),
+        helper.make_node("Round", [f"{prefix}/resized_width_float"], [f"{prefix}/resized_width_rounded"], name=f"{prefix}/resized_width_round"),
+        helper.make_node("Cast", [f"{prefix}/resized_height_rounded"], [resized_height], to=TensorProto.INT64, name=f"{prefix}/resized_height_cast"),
+        helper.make_node("Cast", [f"{prefix}/resized_width_rounded"], [resized_width], to=TensorProto.INT64, name=f"{prefix}/resized_width_cast"),
+        helper.make_node("Sub", [f"{prefix}/target_int", resized_height], [pad_height], name=f"{prefix}/pad_height"),
+        helper.make_node("Sub", [f"{prefix}/target_int", resized_width], [pad_width], name=f"{prefix}/pad_width"),
+        helper.make_node("Div", [pad_height, f"{prefix}/two"], [top], name=f"{prefix}/top"),
+        helper.make_node("Div", [pad_width, f"{prefix}/two"], [left], name=f"{prefix}/left"),
+        helper.make_node("Cast", [top], [f"{prefix}/top_float"], to=TensorProto.FLOAT, name=f"{prefix}/top_cast"),
+        helper.make_node("Cast", [left], [f"{prefix}/left_float"], to=TensorProto.FLOAT, name=f"{prefix}/left_cast"),
+        helper.make_node("Cast", [resized_height], [f"{prefix}/resized_height_float_final"], to=TensorProto.FLOAT, name=f"{prefix}/resized_height_final_cast"),
+        helper.make_node("Cast", [resized_width], [f"{prefix}/resized_width_float_final"], to=TensorProto.FLOAT, name=f"{prefix}/resized_width_final_cast"),
+        helper.make_node("Mul", [boxes, f"{prefix}/canvas_scale"], [f"{prefix}/boxes_pixels"], name=f"{prefix}/boxes_pixels"),
+        helper.make_node("Split", [f"{prefix}/boxes_pixels"], [f"{prefix}/x1", f"{prefix}/y1", f"{prefix}/x2", f"{prefix}/y2"], axis=2, num_outputs=4, name=f"{prefix}/split"),
+    ]
+    normalized: list[str] = []
+    for coordinate, offset, denominator in (
+        ("x1", f"{prefix}/left_float", f"{prefix}/resized_width_float_final"),
+        ("y1", f"{prefix}/top_float", f"{prefix}/resized_height_float_final"),
+        ("x2", f"{prefix}/left_float", f"{prefix}/resized_width_float_final"),
+        ("y2", f"{prefix}/top_float", f"{prefix}/resized_height_float_final"),
+    ):
+        shifted = f"{prefix}/{coordinate}_shifted"
+        normalized_name = f"{prefix}/{coordinate}_normalized"
+        nodes.extend([
+            helper.make_node("Sub", [f"{prefix}/{coordinate}", offset], [shifted], name=f"{prefix}/{coordinate}_shift"),
+            helper.make_node("Div", [shifted, denominator], [normalized_name], name=f"{prefix}/{coordinate}_normalize"),
+        ])
+        normalized.append(normalized_name)
+    output = f"{prefix}/boxes_normalized"
+    nodes.extend([
+        helper.make_node("Concat", normalized, [f"{prefix}/boxes_concat"], axis=2, name=f"{prefix}/concat"),
+        helper.make_node("Clip", [f"{prefix}/boxes_concat", f"{prefix}/clip_min", f"{prefix}/clip_max"], [output], name=f"{prefix}/clip"),
+    ])
+    return output, nodes
 
 
 def _add_dynamic_sizes(model: Any, np: Any, helper: Any, source: str, channels: int, image_size: int, name: str) -> tuple[str, list[Any]]:
