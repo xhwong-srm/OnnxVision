@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import logging
+import shutil
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ from typing import Any
 
 from ..domain.results import ArtifactRef
 from ..workflows.context import WorkflowContext, optional_import
-from ..workflows.requests import ResolvedExportRequest, ResolvedTestRequest, ResolvedTrainRequest, ResolvedValidateRequest
+from ..workflows.requests import ResolvedExportRequest, ResolvedTestRequest, ResolvedTrainRequest, ResolvedTuneRequest, ResolvedValidateRequest
 from ..workflows.runs import artifact
 from .base import BackendExecution
 from .common import (
@@ -73,8 +74,52 @@ class TimmClassificationBackend:
         return timm, torch, torchvision
 
     @staticmethod
-    def _datasets(data: Path, image_size: int, train: bool, mean: tuple[float, ...] = _DEFAULT_MEAN, std: tuple[float, ...] = _DEFAULT_STD):
-        _, _, torchvision = TimmClassificationBackend._imports()
+    def _albumentations_transform(image_size: int, train: bool, mean: tuple[float, ...], std: tuple[float, ...], torch):
+        albumentations = optional_import("albumentations")
+        numpy = optional_import("numpy")
+        operations = [albumentations.Resize(height=image_size, width=image_size)]
+        if train:
+            operations.extend([
+                albumentations.HorizontalFlip(p=0.5),
+                albumentations.Rotate(limit=5, p=0.5),
+            ])
+        operations.append(albumentations.Normalize(mean=mean, std=std))
+        pipeline = albumentations.Compose(operations)
+
+        def transform(image):
+            if hasattr(image, "convert"):
+                image = image.convert("RGB")
+            array = numpy.asarray(image)
+            result = pipeline(image=array)["image"]
+            if result.ndim == 2:
+                result = result[..., None]
+            if result.shape[-1] == 1:
+                result = numpy.repeat(result, 3, axis=-1)
+            return torch.from_numpy(numpy.ascontiguousarray(result, dtype=numpy.float32)).permute(2, 0, 1)
+
+        return transform
+
+    @staticmethod
+    def _datasets(
+        data: Path,
+        image_size: int,
+        train: bool,
+        mean: tuple[float, ...] = _DEFAULT_MEAN,
+        std: tuple[float, ...] = _DEFAULT_STD,
+        augmentation: str = "torchvision",
+    ):
+        _, torch, torchvision = TimmClassificationBackend._imports()
+        if augmentation == "albumentations":
+            transform = TimmClassificationBackend._albumentations_transform(image_size, train, mean, std, torch)
+        elif augmentation == "torchvision":
+            transform = None
+        else:
+            raise ValueError(f"unsupported augmentation backend: {augmentation}")
+        if transform is not None:
+            root = data / ("train" if train else "val")
+            if not root.is_dir():
+                raise FileNotFoundError(f"classification split does not exist: {root}")
+            return torchvision.datasets.ImageFolder(str(root), transform=transform)
         transforms = torchvision.transforms
         operations = [transforms.Resize((image_size, image_size))]
         if train:
@@ -105,7 +150,11 @@ class TimmClassificationBackend:
             return dict(getattr(model, "pretrained_cfg", {}) or getattr(model, "default_cfg", {}) or {})
 
     def train(self, request: ResolvedTrainRequest, context: WorkflowContext) -> BackendExecution:
+        return self._train(request, context)
+
+    def _train(self, request: ResolvedTrainRequest, context: WorkflowContext, trial=None) -> BackendExecution:
         started = time.perf_counter()
+        optuna = optional_import("optuna") if trial is not None else None
         logger.info(
             "Training parameters: model=%s data=%s output=%s device=%s epochs=%d batch=%d image_size=%s learning_rate=%g workers=%d seed=%d pretrained=%s resume=%s patience=%d deterministic=%s weights=%s options=%s",
             request.model,
@@ -146,8 +195,9 @@ class TimmClassificationBackend:
         mean = tuple(float(value) for value in model_data_config.get("mean", _DEFAULT_MEAN))
         std = tuple(float(value) for value in model_data_config.get("std", _DEFAULT_STD))
         logger.info("Effective image size: %d (requested=%s, model_suggested=%s)", image_size, request.image_size, input_size[-1])
-        train_set = self._datasets(data, image_size, True, mean, std)
-        val_set = self._datasets(data, image_size, False, mean, std)
+        augmentation = str(request.options.get("augmentation", "torchvision"))
+        train_set = self._datasets(data, image_size, True, mean, std, augmentation)
+        val_set = self._datasets(data, image_size, False, mean, std, augmentation)
         logger.info("Dataset ready: train=%d val=%d classes=%s", len(train_set), len(val_set), ", ".join(train_set.classes))
         if request.weights and not request.resume:
             logger.info("Loading custom weights from %s", request.weights)
@@ -164,7 +214,7 @@ class TimmClassificationBackend:
         loader = torch.utils.data.DataLoader(train_set, batch_size=request.batch, shuffle=True, generator=loader_generator, worker_init_fn=worker_init_fn, **loader_options)
         val_loader = torch.utils.data.DataLoader(val_set, batch_size=request.batch, shuffle=False, worker_init_fn=worker_init_fn, **loader_options)
         logger.info("DataLoaders ready: batch=%d requested_workers=%d effective_workers=%d validate_every=%d", request.batch, requested_workers, workers, validation_interval)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=request.learning_rate)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=request.learning_rate, weight_decay=float(request.options.get("weight_decay", 0.01)))
         criterion = torch.nn.CrossEntropyLoss()
         scaler = training_options.grad_scaler(torch, device)
         start_epoch = 1
@@ -264,6 +314,11 @@ class TimmClassificationBackend:
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
                 "validated": validate,
             }
+            if trial is not None and validate and val_accuracy is not None:
+                trial.report(val_accuracy, step=epoch)
+                if trial.should_prune():
+                    context.emit("optuna_trial_pruned", {"trial": trial.number, "epoch": epoch, "value": val_accuracy})
+                    raise optuna.TrialPruned()
             history.append(row)
             improved = validate and val_accuracy is not None and val_accuracy > best_accuracy
             if improved:
@@ -274,7 +329,7 @@ class TimmClassificationBackend:
                 stale_epochs += 1
             payload = {
                 "task": "classification", "model_name": request.model.variant, "classes": train_set.classes,
-                "data_config": {"input_size": [3, image_size, image_size], "mean": list(mean), "std": list(std)},
+                "data_config": {"input_size": [3, image_size, image_size], "mean": list(mean), "std": list(std), "augmentation": augmentation},
                 "epoch": epoch, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(),
                 "metrics": row, "best_accuracy": best_accuracy, "best_epoch": best_epoch,
                 "stale_epochs": stale_epochs, "history": history, "rng_state": capture_rng_state(torch, loader_generator),
@@ -327,6 +382,96 @@ class TimmClassificationBackend:
         return Execution(
             tuple(artifact(context.run_dir / name, "checkpoint") for name in ("best.pt", "last.pt")),
             {key: value for key, value in summary.items() if key != "history"},
+        )
+
+    def tune(self, request: ResolvedTuneRequest, context: WorkflowContext) -> BackendExecution:
+        optuna = optional_import("optuna")
+        learning_rate_min = float(request.learning_rate_min)
+        learning_rate_max = float(request.learning_rate_max)
+        weight_decay_min = float(request.weight_decay_min)
+        weight_decay_max = float(request.weight_decay_max)
+        if not 0.0 < learning_rate_min < learning_rate_max:
+            raise ValueError("learning_rate_min must be less than learning_rate_max and greater than zero")
+        if not 0.0 <= weight_decay_min < weight_decay_max:
+            raise ValueError("weight_decay_min must be less than weight_decay_max")
+
+        sampler = optuna.samplers.TPESampler(seed=int(request.seed))
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=sampler,
+            pruner=optuna.pruners.MedianPruner(),
+            storage=request.storage,
+            study_name=request.study_name,
+            load_if_exists=request.storage is not None,
+        )
+        current_trials = []
+
+        def objective(trial):
+            trial_options = dict(request.options)
+            trial_options["learning_rate"] = trial.suggest_float(
+                "learning_rate", learning_rate_min, learning_rate_max, log=True
+            )
+            trial_options["weight_decay"] = trial.suggest_float(
+                "weight_decay", weight_decay_min, weight_decay_max
+            )
+            trial_dir = context.run_dir / f"trial-{trial.number:04d}"
+            trial_dir.mkdir(parents=True, exist_ok=True)
+            trial_request = ResolvedTrainRequest(
+                request.selection,
+                request.model,
+                request.data,
+                trial_dir,
+                None,
+                False,
+                False,
+                trial_options,
+            )
+            trial_context = WorkflowContext(trial_dir, context.emit, context.device)
+            execution = self._train(trial_request, trial_context, trial)
+            score = float(execution.metrics["best_val_accuracy"])
+            trial.set_user_attr("run_dir", str(trial_dir))
+            current_trials.append(trial)
+            return score
+
+        study.optimize(objective, n_trials=int(request.trials))
+        if not current_trials:
+            raise ValueError("Optuna completed no trials")
+        best_trial = max(current_trials, key=lambda item: item.value)
+        best_dir = Path(best_trial.user_attrs["run_dir"])
+        for name in ("best.pt", "last.pt"):
+            source = require_file(best_dir / name, f"Optuna trial {name}")
+            shutil.copy2(source, context.run_dir / name)
+
+        trials = [
+            {
+                "number": item.number,
+                "state": getattr(item.state, "name", str(item.state)),
+                "value": item.value,
+                "params": dict(item.params),
+                "user_attrs": dict(item.user_attrs),
+            }
+            for item in study.trials
+        ]
+        summary = {
+            "study_name": study.study_name,
+            "direction": "maximize",
+            "best_value": best_trial.value,
+            "best_params": dict(best_trial.params),
+            "study_best_value": study.best_value,
+            "trials": trials,
+        }
+        context.write_json("optuna.json", summary)
+        metrics = {
+            "study_name": study.study_name,
+            "best_val_accuracy": float(best_trial.value),
+            "best_params": dict(best_trial.params),
+            "trials": len(study.trials),
+            "completed_trials": sum(getattr(item.state, "name", str(item.state)) == "COMPLETE" for item in study.trials),
+        }
+        return Execution(
+            tuple(artifact(context.run_dir / name, "checkpoint") for name in ("best.pt", "last.pt"))
+            + (artifact(context.run_dir / "optuna.json", "report"),),
+            metrics,
         )
 
     def _load(self, checkpoint: Path, device: str):
@@ -505,11 +650,16 @@ class TimmClassificationBackend:
         _, _, torchvision = self._imports()
         data_config = value.get("data_config", {})
         size = int(image_size or data_config.get("input_size", [3, 224, 224])[-1])
-        transform_ops = torchvision.transforms.Compose([
-            torchvision.transforms.Resize((size,) * 2),
-            torchvision.transforms.ToTensor(),
-            torchvision.transforms.Normalize(tuple(data_config.get("mean", _DEFAULT_MEAN)), tuple(data_config.get("std", _DEFAULT_STD))),
-        ])
+        mean = tuple(float(item) for item in data_config.get("mean", _DEFAULT_MEAN))
+        std = tuple(float(item) for item in data_config.get("std", _DEFAULT_STD))
+        if data_config.get("augmentation", "torchvision") == "albumentations":
+            transform_ops = self._albumentations_transform(size, False, mean, std, torch)
+        else:
+            transform_ops = torchvision.transforms.Compose([
+                torchvision.transforms.Resize((size,) * 2),
+                torchvision.transforms.ToTensor(),
+                torchvision.transforms.Normalize(mean, std),
+            ])
         dataset = torchvision.datasets.ImageFolder(str(data / split), transform=transform_ops)
         if dataset.classes != classes:
             raise ValueError("dataset classes differ from checkpoint classes")

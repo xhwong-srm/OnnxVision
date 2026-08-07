@@ -19,12 +19,15 @@ from ..api import (
     TestService,
     TrainRequest,
     TrainService,
+    TuneRequest,
+    TuneService,
     ValidateDatasetRequest,
     ValidateRequest,
     ValidationService,
 )
 from ..backends.registry import frameworks, models_for, plugin_for
 from ..domain.datasets import BalanceMode, DatasetFormat, MaterializationMode, SplitPolicy, TaskKind
+from ..domain.errors import ConfigurationError
 from ..domain.models import ModelSelection, Operation, ParameterSchema
 
 
@@ -74,7 +77,8 @@ def _selected_schema(argv: Sequence[str]) -> tuple[Operation, ModelSelection, Pa
     selection = ModelSelection(TaskKind(values.task), values.framework, values.model)
     plugin = plugin_for(selection)
     model = plugin.catalog.resolve(selection.model)
-    return operation, selection, plugin.handlers[operation].schema(model)
+    handler = plugin.handlers.get(operation)
+    return operation, selection, handler.schema(model) if handler is not None else ParameterSchema()
 
 
 def _add_parameters(parser: argparse.ArgumentParser, schema: ParameterSchema) -> None:
@@ -159,6 +163,11 @@ def build_parser(argv: Sequence[str] | None = None) -> argparse.ArgumentParser:
     train.add_argument("--weights", type=_path)
     train.add_argument("--resume", action="store_true")
     train.add_argument("--overwrite", action="store_true")
+    tune = workflow_parsers[Operation.TUNE] = commands.add_parser("tune")
+    _add_selection(tune)
+    tune.add_argument("--data", type=_path, required=True)
+    tune.add_argument("--output", type=_path, required=True)
+    tune.add_argument("--overwrite", action="store_true")
     export = workflow_parsers[Operation.EXPORT] = commands.add_parser("export")
     _add_selection(export)
     export.add_argument("--checkpoint", type=_path, required=True)
@@ -184,7 +193,10 @@ def _parameters(args: argparse.Namespace, operation: Operation) -> dict:
     selection = _selection(args)
     plugin = plugin_for(selection)
     model = plugin.catalog.resolve(selection.model)
-    schema = plugin.handlers[operation].schema(model)
+    handler = plugin.handlers.get(operation)
+    if handler is None:
+        return {}
+    schema = handler.schema(model)
     return {spec.name: getattr(args, spec.name) for spec in schema.parameters if hasattr(args, spec.name)}
 
 
@@ -204,7 +216,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             selection = _selection(args)
             plugin = plugin_for(selection)
             model_info = plugin.catalog.resolve(selection.model)
-            handler = plugin.handlers[Operation(args.operation)]
+            operation = Operation(args.operation)
+            handler = plugin.handlers.get(operation)
+            if handler is None:
+                raise ConfigurationError(f"{selection} does not support {operation.value}")
             _print({"selection": str(selection), "resolved_model": asdict(model_info), "parameters": handler.schema(model_info).describe(), "dataset": asdict(handler.dataset) if handler.dataset else None})
         return 0
     service = DatasetService()
@@ -229,6 +244,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parameters = _parameters(args, operation)
     if operation is Operation.TRAIN:
         TrainService().run(TrainRequest(selection, args.data, args.output, args.weights, args.resume, args.overwrite, parameters))
+        return 0
+    elif operation is Operation.TUNE:
+        TuneService().run(TuneRequest(selection, args.data, args.output, args.overwrite, parameters))
         return 0
     elif operation is Operation.EXPORT:
         ExportService().run(ExportRequest(selection, args.checkpoint, args.output, args.data, parameters))

@@ -13,9 +13,9 @@ from vision_workflows.domain.errors import ConfigurationError
 from vision_workflows.domain.models import ModelInfo, ModelSelection, Operation, ParameterSchema, ParameterSpec, ProviderDescriptor, StaticModelCatalog
 from vision_workflows.domain.results import ArtifactRef, RunStatus
 from vision_workflows.workflows.context import optional_import
-from vision_workflows.workflows.requests import ExportRequest, TrainRequest
+from vision_workflows.workflows.requests import ExportRequest, TrainRequest, TuneRequest
 from vision_workflows.workflows.runs import RunStore
-from vision_workflows.workflows.services import ExportService, TrainService
+from vision_workflows.workflows.services import ExportService, TrainService, TuneService
 
 
 def test_registry_exposes_framework_task_plugins() -> None:
@@ -27,6 +27,10 @@ def test_registry_exposes_framework_task_plugins() -> None:
         ("libreyolo", TaskKind.OBJECT_DETECTION),
     }
     assert all(Operation.TRAIN in item.operations for item in frameworks())
+    timm_descriptor = next(item for item in frameworks() if item.framework == "timm" and item.task is TaskKind.CLASSIFICATION)
+    assert Operation.TUNE in timm_descriptor.operations
+    assert all(Operation.TUNE in item.operations for item in frameworks() if item.framework == "ultralytics")
+    assert all(Operation.TUNE not in item.operations for item in frameworks() if item.framework == "libreyolo")
     with pytest.raises(ConfigurationError, match="unsupported framework/task: pytorch/object-detection"):
         plugin_for(ModelSelection(TaskKind.OBJECT_DETECTION, "pytorch", "timm-obd-v1"))
 
@@ -43,6 +47,23 @@ def test_timm_classification_catalog_exposes_only_validated_model() -> None:
     assert [item.id for item in models_for(TaskKind.CLASSIFICATION, "timm")] == [model]
     with pytest.raises(ConfigurationError, match="unsupported model: resnet18"):
         plugin_for(ModelSelection(TaskKind.CLASSIFICATION, "timm", "resnet18")).catalog.resolve("resnet18")
+
+
+def test_timm_training_and_tuning_schemas_expose_first_class_integrations() -> None:
+    selection = ModelSelection(TaskKind.CLASSIFICATION, "timm", "mobilenetv4_conv_small_050.e3000_r224_in1k")
+    plugin = plugin_for(selection)
+    model = plugin.catalog.resolve(selection.model)
+    context = type("Context", (), {"selection": selection, "model": model, "request": None})()
+
+    train = plugin.handlers[Operation.TRAIN].schema(model).resolve({}, context)
+    tune = plugin.handlers[Operation.TUNE].schema(model).resolve({}, context)
+    assert train["augmentation"] == "torchvision"
+    assert train["weight_decay"] == 0.01
+    assert tune["trials"] == 10
+    assert tune["epochs"] == 10
+    assert tune["patience"] == 3
+    assert tune["learning_rate_min"] < tune["learning_rate_max"]
+    assert tune["weight_decay_min"] < tune["weight_decay_max"]
 
 
 def test_provider_schema_rejects_parameters_owned_by_another_provider() -> None:
@@ -163,6 +184,40 @@ def test_libreyolo_translates_amp_and_cache(monkeypatch: pytest.MonkeyPatch, tmp
 
     assert captured["amp"] is False
     assert captured["cache"] == "disk"
+
+
+def test_ultralytics_tune_delegates_to_native_tune_api(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeModel:
+        def __init__(self, checkpoint: str):
+            captured["checkpoint"] = checkpoint
+
+        def tune(self, **options):
+            captured.update(options)
+            return {"best_fitness": 0.9}
+
+    import vision_workflows.backends.ultralytics as integration
+    monkeypatch.setattr(integration, "optional_import", lambda _: type("Module", (), {"YOLO": FakeModel})())
+    data = tmp_path / "images"
+    data.mkdir()
+    selection = ModelSelection(TaskKind.CLASSIFICATION, "ultralytics", "yolo26n")
+
+    result = TuneService().run(
+        TuneRequest(
+            selection,
+            data,
+            tmp_path / "run",
+            parameters={"iterations": 2, "epochs": 3, "optimizer": "AdamW"},
+        )
+    )
+
+    assert captured["checkpoint"] == "yolo26n-cls.pt"
+    assert captured["iterations"] == 2
+    assert captured["epochs"] == 3
+    assert captured["optimizer"] == "AdamW"
+    assert captured["plots"] is False
+    assert result.metrics["best_fitness"] == 0.9
 
 
 def test_optional_import_does_not_eagerly_load_optional_exports() -> None:

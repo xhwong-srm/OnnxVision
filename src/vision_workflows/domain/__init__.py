@@ -44,6 +44,7 @@ from .results import (
     SplitResult,
     TestResult,
     TrainResult,
+    TuneResult,
     ValidationResult,
 )
 
@@ -86,6 +87,7 @@ __all__ = (
     "TaskKind",
     "TestResult",
     "TrainResult",
+    "TuneResult",
     "ValidationFailedError",
     "ValidationResult",
 )

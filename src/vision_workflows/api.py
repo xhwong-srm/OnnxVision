@@ -5,8 +5,8 @@ from .datasets.service import (
     SplitDatasetRequest,
     ValidateDatasetRequest,
 )
-from .workflows.requests import ExportRequest, TestRequest, TrainRequest, ValidateRequest
-from .workflows.services import ExportService, TestService, TrainService, ValidationService
+from .workflows.requests import ExportRequest, TestRequest, TrainRequest, TuneRequest, ValidateRequest
+from .workflows.services import ExportService, TestService, TrainService, TuneService, ValidationService
 
 __all__ = (
     "ConvertDatasetRequest",
@@ -19,6 +19,8 @@ __all__ = (
     "TestService",
     "TrainRequest",
     "TrainService",
+    "TuneRequest",
+    "TuneService",
     "ValidateDatasetRequest",
     "ValidateRequest",
     "ValidationService",

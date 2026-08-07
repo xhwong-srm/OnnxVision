@@ -5,6 +5,7 @@ from .api import (
     ExportService,
     TestService,
     TrainService,
+    TuneService,
     ValidationService,
 )
 
@@ -13,5 +14,6 @@ __all__ = (
     "ExportService",
     "TestService",
     "TrainService",
+    "TuneService",
     "ValidationService",
 )

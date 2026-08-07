@@ -32,7 +32,11 @@ print(result.output)
 ```
 
 Framework integrations are imported lazily. Install only the extras needed by
-the host, for example `uv sync --extra test --extra timm`.
+the host, for example `uv sync --extra test --extra timm`. Timm classification
+can opt into the official `albumentations` package with
+`uv sync --extra timm --extra albumentations`; this project intentionally does
+not install or import AlbumentationsX. Hyperparameter tuning is available with
+`uv sync --extra timm --extra optuna`.
 
 Models are selected explicitly by task, framework, and canonical model ID. The
 framework/task plugin resolves that ID to its native checkpoint or architecture:
@@ -62,6 +66,26 @@ uv run vision-workflows train --task classification --framework timm --model mob
 `prefetch_factor` and `persistent_workers` require a positive `--workers` value.
 The same settings can be supplied through `TrainRequest.parameters` when using
 the Python API. Unknown parameters are rejected before a run starts.
+
+Timm classification accepts `--augmentation albumentations` for an
+Albumentations `Compose` pipeline. The selected preprocessing backend, image
+size, mean, and standard deviation are stored in the checkpoint and reused by
+evaluation. Ultralytics and LibreYOLO retain their provider-native
+augmentation controls.
+
+Optuna tuning is a first-class timm classification operation. It searches
+learning rate and weight decay, reports validation accuracy each validation
+epoch for pruning, stores trial summaries in `optuna.json`, and copies the
+best trial checkpoints to the requested output. Ultralytics `tune` delegates
+to its native tuning API; LibreYOLO does not advertise tuning without a
+verified provider implementation.
+
+```powershell
+uv run --extra timm --extra optuna vision-workflows tune `
+  --task classification --framework timm `
+  --model mobilenetv4_conv_small_050.e3000_r224_in1k `
+  --data data --output runs/timm-tune --trials 10
+```
 
 ONNX exports are self-describing. Classification artifacts use the
 `onnx-vision-classification` contract, while object-detection artifacts use

@@ -12,6 +12,7 @@ from .errors import ConfigurationError
 
 class Operation(StrEnum):
     TRAIN = "train"
+    TUNE = "tune"
     EXPORT = "export"
     VALIDATE = "validate"
     TEST = "test"

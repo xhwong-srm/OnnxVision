@@ -71,6 +71,14 @@ class TrainResult:
 
 
 @dataclass(frozen=True)
+class TuneResult:
+    run: RunManifest
+    best_checkpoint: ArtifactRef | None
+    last_checkpoint: ArtifactRef | None
+    metrics: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class ExportResult:
     run: RunManifest
     contract: dict[str, Any]

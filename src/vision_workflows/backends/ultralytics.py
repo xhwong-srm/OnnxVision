@@ -7,7 +7,7 @@ from typing import Any
 from ..domain.errors import ConfigurationError
 from ..domain.results import ArtifactRef
 from ..workflows.context import WorkflowContext, optional_import
-from ..workflows.requests import ResolvedExportRequest, ResolvedTestRequest, ResolvedTrainRequest, ResolvedValidateRequest
+from ..workflows.requests import ResolvedExportRequest, ResolvedTestRequest, ResolvedTrainRequest, ResolvedTuneRequest, ResolvedValidateRequest
 from ..workflows.runs import artifact
 from .base import BackendExecution
 from .common import (
@@ -57,7 +57,7 @@ class UltralyticsBackend:
             raise ValueError(f"unsupported Ultralytics task: {task}")
         self._task = task
 
-    def _data(self, request: ResolvedTrainRequest | ResolvedValidateRequest | ResolvedTestRequest) -> Path:
+    def _data(self, request: ResolvedTrainRequest | ResolvedTuneRequest | ResolvedValidateRequest | ResolvedTestRequest) -> Path:
         if request.data is None:
             raise ConfigurationError("this operation requires a dataset")
         data = request.data.expanduser().resolve()
@@ -67,7 +67,7 @@ class UltralyticsBackend:
             return data
         return require_file(data, "YOLO dataset YAML")
 
-    def _model(self, request: ResolvedTrainRequest | ResolvedExportRequest | ResolvedValidateRequest | ResolvedTestRequest):
+    def _model(self, request: ResolvedTrainRequest | ResolvedTuneRequest | ResolvedExportRequest | ResolvedValidateRequest | ResolvedTestRequest):
         module = optional_import("ultralytics")
         checkpoint = getattr(request, "weights", None) or getattr(request, "checkpoint", None) or getattr(request, "target", None)
         if checkpoint is None:
@@ -97,6 +97,35 @@ class UltralyticsBackend:
         weights = context.run_dir / "weights"
         best, last = weights / "best.pt", weights / "last.pt"
         return Execution(artifacts_for([(best, "checkpoint"), (last, "checkpoint")]))
+
+    def tune(self, request: ResolvedTuneRequest, context: WorkflowContext) -> BackendExecution:
+        data = self._data(request)
+        model = self._model(request)
+        options: dict[str, Any] = {
+            "data": str(data),
+            "epochs": request.epochs,
+            "iterations": request.iterations,
+            "optimizer": request.optimizer,
+            "project": str(context.run_dir.parent),
+            "name": context.run_dir.name,
+            "exist_ok": True,
+            "plots": False,
+            "save": False,
+            "val": False,
+        }
+        if request.device != "auto":
+            options["device"] = request.device
+        if self._task == "classification":
+            options["dropout"] = request.dropout
+        else:
+            options["mosaic"] = request.mosaic
+        context.emit("backend_tune_started", {"framework": "ultralytics", "task": self._task, "data": str(data)})
+        result = model.tune(**options)
+        if isinstance(result, dict):
+            metrics = result
+        else:
+            metrics = getattr(result, "results_dict", {})
+        return Execution(metrics=dict(metrics) if isinstance(metrics, dict) else {})
 
     def export(self, request: ResolvedExportRequest, context: WorkflowContext) -> BackendExecution:
         checkpoint = require_file(request.checkpoint, "checkpoint")

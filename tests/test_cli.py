@@ -68,6 +68,20 @@ def test_cli_exposes_timm_loader_and_amp_options() -> None:
     assert args.amp_dtype == "bfloat16"
 
 
+def test_cli_exposes_timm_albumentations_and_optuna_tuning() -> None:
+    argv = [
+        "tune", "--task", "classification", "--framework", "timm",
+        "--model", "mobilenetv4_conv_small_050.e3000_r224_in1k", "--data", "data", "--output", "run",
+        "--augmentation", "albumentations", "--trials", "3", "--learning-rate-min", "0.00001",
+        "--learning-rate-max", "0.001",
+    ]
+    args = _parse(argv)
+    assert args.augmentation == "albumentations"
+    assert args.trials == 3
+    assert args.learning_rate_min == 0.00001
+    assert args.learning_rate_max == 0.001
+
+
 def test_cli_accepts_timm_pretrained_configuration_name() -> None:
     model = "mobilenetv4_conv_small_050.e3000_r224_in1k"
     argv = [

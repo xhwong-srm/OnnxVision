@@ -19,6 +19,15 @@ class TrainRequest:
 
 
 @dataclass(frozen=True)
+class TuneRequest:
+    selection: ModelSelection
+    data: Path
+    output: Path
+    overwrite: bool = False
+    parameters: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ExportRequest:
     selection: ModelSelection
     checkpoint: Path
@@ -53,6 +62,26 @@ class ResolvedTrainRequest:
     output: Path
     weights: Path | None
     resume: bool
+    overwrite: bool
+    parameters: Mapping[str, Any]
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self.parameters[name]
+        except KeyError as error:
+            raise AttributeError(name) from error
+
+    @property
+    def options(self) -> Mapping[str, Any]:
+        return self.parameters
+
+
+@dataclass(frozen=True)
+class ResolvedTuneRequest:
+    selection: ModelSelection
+    model: ModelInfo
+    data: Path
+    output: Path
     overwrite: bool
     parameters: Mapping[str, Any]
 
@@ -127,4 +156,4 @@ class ResolvedTestRequest:
         return self.parameters
 
 
-ResolvedRequest = ResolvedTrainRequest | ResolvedExportRequest | ResolvedValidateRequest | ResolvedTestRequest
+ResolvedRequest = ResolvedTrainRequest | ResolvedTuneRequest | ResolvedExportRequest | ResolvedValidateRequest | ResolvedTestRequest

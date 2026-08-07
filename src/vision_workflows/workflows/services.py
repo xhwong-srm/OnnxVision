@@ -9,15 +9,17 @@ from typing import Any
 from ..backends.registry import plugin_for
 from ..domain.errors import ConfigurationError, ValidationFailedError
 from ..domain.models import ModelInfo, Operation, ParameterContext
-from ..domain.results import ExportResult, RunStatus, TestResult, TrainResult, ValidationResult
+from ..domain.results import ExportResult, RunStatus, TestResult, TrainResult, TuneResult, ValidationResult
 from .requests import (
     ExportRequest,
     ResolvedExportRequest,
     ResolvedTestRequest,
     ResolvedTrainRequest,
+    ResolvedTuneRequest,
     ResolvedValidateRequest,
     TestRequest,
     TrainRequest,
+    TuneRequest,
     ValidateRequest,
 )
 from .runs import RunStore
@@ -50,6 +52,8 @@ def _resolve(request, operation: Operation):
     effective = schema.resolve(request.parameters, ParameterContext(request.selection, model, request))
     if operation is Operation.TRAIN:
         resolved = ResolvedTrainRequest(request.selection, model, request.data, request.output, request.weights, request.resume, request.overwrite, effective)
+    elif operation is Operation.TUNE:
+        resolved = ResolvedTuneRequest(request.selection, model, request.data, request.output, request.overwrite, effective)
     elif operation is Operation.EXPORT:
         resolved = ResolvedExportRequest(request.selection, model, request.checkpoint, request.output, request.data, effective)
     elif operation is Operation.VALIDATE:
@@ -121,6 +125,24 @@ class TrainService:
         best = next((item for item in execution.artifacts if item.name == "best.pt"), None)
         last = next((item for item in execution.artifacts if item.name == "last.pt"), None)
         return TrainResult(run, best, last, dict(execution.metrics))
+
+
+class TuneService:
+    def run(self, request: TuneRequest) -> TuneResult:
+        handler, resolved, config = _resolve(request, Operation.TUNE)
+        store = RunStore(request.output.parent)
+        context, run_id = store.start("tune", config, device=resolved.device, run_dir=request.output, overwrite=request.overwrite)
+        try:
+            execution = handler.execute(resolved, context)
+        except Exception as error:
+            run = store.finish(run_id, "tune", config, status=RunStatus.FAILED, error=str(error))
+            context.emit("run_failed", {"error": str(error)})
+            raise
+        run = store.finish(run_id, "tune", config, status=RunStatus.SUCCEEDED, artifacts=execution.artifacts, metrics=dict(execution.metrics))
+        context.emit("run_finished", {"status": "succeeded"})
+        best = next((item for item in execution.artifacts if item.name == "best.pt"), None)
+        last = next((item for item in execution.artifacts if item.name == "last.pt"), None)
+        return TuneResult(run, best, last, dict(execution.metrics))
 
 
 class ExportService:

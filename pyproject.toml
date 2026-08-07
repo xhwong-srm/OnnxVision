@@ -24,6 +24,13 @@ timm = [
     "torch>=2.11.0",
     "torchvision>=0.26.0",
 ]
+albumentations = [
+    "albumentations>=2.0",
+    "numpy>=2.0",
+]
+optuna = [
+    "optuna>=4.0",
+]
 ultralytics = [
     "onnx>=1.22.0",
     "onnxruntime>=1.27.0",

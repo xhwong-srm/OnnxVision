@@ -71,8 +71,30 @@ def _timm_train(_: ModelInfo) -> ParameterSchema:
         ParameterSpec("amp", bool, "use automatic mixed precision", False),
         ParameterSpec("amp_dtype", str, "AMP data type", None, choices=("float16", "bfloat16"), allow_none=True),
         ParameterSpec("compile", bool, "compile the model with torch.compile", False),
+        ParameterSpec("weight_decay", float, "AdamW weight decay", 0.01, minimum=0.0),
+        ParameterSpec("augmentation", str, "training image augmentation backend", "torchvision", choices=("torchvision", "albumentations")),
     ).with_origin(ParameterOrigin.FRAMEWORK)
     return _training(None).compose(framework)
+
+
+def _timm_tune(_: ModelInfo) -> ParameterSchema:
+    framework = _timm_train(_)
+    search = _schema(
+        ParameterSpec("trials", int, "number of Optuna trials", 10, minimum=1),
+        ParameterSpec("learning_rate_min", float, "minimum log-scaled learning rate to search", 1e-5, minimum=0.0),
+        ParameterSpec("learning_rate_max", float, "maximum log-scaled learning rate to search", 1e-2, minimum=0.0),
+        ParameterSpec("weight_decay_min", float, "minimum weight decay to search", 0.0, minimum=0.0),
+        ParameterSpec("weight_decay_max", float, "maximum weight decay to search", 0.1, minimum=0.0),
+        ParameterSpec("storage", str, "optional Optuna storage URL", None, allow_none=True),
+        ParameterSpec("study_name", str, "Optuna study name", "timm-classification"),
+    ).with_origin(ParameterOrigin.FRAMEWORK)
+    return framework.compose(
+        _schema(
+            ParameterSpec("epochs", int, "number of training epochs per Optuna trial", 10, minimum=1),
+            ParameterSpec("patience", int, "early-stopping patience per Optuna trial", 3, minimum=0),
+        ),
+        search,
+    )
 
 
 def _ultralytics_train(task: TaskKind):
@@ -87,6 +109,21 @@ def _ultralytics_train(task: TaskKind):
             ParameterSpec("compile", bool, "compile the model", False),
         ).with_origin(ParameterOrigin.FRAMEWORK)
         return _training(224 if task is TaskKind.CLASSIFICATION else 640).compose(framework, task_schema)
+    return factory
+
+
+def _ultralytics_tune(task: TaskKind):
+    def factory(model: ModelInfo) -> ParameterSchema:
+        base = _ultralytics_train(task)(model)
+        tuning = _schema(
+            ParameterSpec("iterations", int, "number of native Ultralytics tuning iterations", 10, minimum=1),
+            ParameterSpec("optimizer", str, "native Ultralytics tuning optimizer", "AdamW", choices=("auto", "SGD", "Adam", "AdamW")),
+        ).with_origin(ParameterOrigin.FRAMEWORK)
+        return base.compose(
+            _schema(ParameterSpec("epochs", int, "epochs per tuning iteration", 10, minimum=1)),
+            tuning,
+        )
+
     return factory
 
 
@@ -110,13 +147,16 @@ def _libre_export(model: ModelInfo) -> ParameterSchema:
     return _export(image_size, nms_configurable=True)
 
 
-def _all_handlers(backend, train_schema, export_size: int, dataset: DatasetRequirement, *, nms_configurable: bool = False):
-    return {
+def _all_handlers(backend, train_schema, export_size: int, dataset: DatasetRequirement, *, nms_configurable: bool = False, tune_schema=None):
+    handlers = {
         Operation.TRAIN: OperationHandler(train_schema, backend.train, dataset),
         Operation.EXPORT: OperationHandler(lambda _: _export(export_size, nms_configurable=nms_configurable), backend.export),
         Operation.VALIDATE: OperationHandler(lambda _: _evaluation("cpu"), backend.validate),
         Operation.TEST: OperationHandler(lambda _: _evaluation("auto"), backend.test, dataset),
     }
+    if tune_schema is not None:
+        handlers[Operation.TUNE] = OperationHandler(tune_schema, backend.tune, dataset)
+    return handlers
 
 
 _TIMM_CLASSIFICATION_MODELS = (
@@ -154,11 +194,12 @@ def _plugins() -> tuple[FrameworkTaskPlugin, ...]:
             (Operation.TEST, lambda _: _evaluation("auto")),
         )
     }
+    standard_operations = frozenset({Operation.TRAIN, Operation.EXPORT, Operation.VALIDATE, Operation.TEST})
     return (
-        FrameworkTaskPlugin(ProviderDescriptor("timm", TaskKind.CLASSIFICATION, frozenset(Operation), "timm image classifier", "timm"), StaticModelCatalog(_TIMM_CLASSIFICATION_MODELS), _all_handlers(timm_backend, _timm_train, 224, classification_data)),
-        FrameworkTaskPlugin(ProviderDescriptor("ultralytics", TaskKind.CLASSIFICATION, frozenset(Operation), "Ultralytics classifier", "ultralytics"), StaticModelCatalog(yolo26_cls), _all_handlers(ultralytics_cls, _ultralytics_train(TaskKind.CLASSIFICATION), 224, classification_data)),
-        FrameworkTaskPlugin(ProviderDescriptor("ultralytics", TaskKind.OBJECT_DETECTION, frozenset(Operation), "Ultralytics detector", "ultralytics"), StaticModelCatalog(yolo26), _all_handlers(ultralytics_det, _ultralytics_train(TaskKind.OBJECT_DETECTION), 640, yolo_data, nms_configurable=True)),
-        FrameworkTaskPlugin(ProviderDescriptor("libreyolo", TaskKind.OBJECT_DETECTION, frozenset(Operation), "LibreYOLO detector", "libreyolo"), StaticModelCatalog(libre_models), libre_handlers),
+        FrameworkTaskPlugin(ProviderDescriptor("timm", TaskKind.CLASSIFICATION, standard_operations | {Operation.TUNE}, "timm image classifier", "timm"), StaticModelCatalog(_TIMM_CLASSIFICATION_MODELS), _all_handlers(timm_backend, _timm_train, 224, classification_data, tune_schema=_timm_tune)),
+        FrameworkTaskPlugin(ProviderDescriptor("ultralytics", TaskKind.CLASSIFICATION, standard_operations | {Operation.TUNE}, "Ultralytics classifier", "ultralytics"), StaticModelCatalog(yolo26_cls), _all_handlers(ultralytics_cls, _ultralytics_train(TaskKind.CLASSIFICATION), 224, classification_data, tune_schema=_ultralytics_tune(TaskKind.CLASSIFICATION))),
+        FrameworkTaskPlugin(ProviderDescriptor("ultralytics", TaskKind.OBJECT_DETECTION, standard_operations | {Operation.TUNE}, "Ultralytics detector", "ultralytics"), StaticModelCatalog(yolo26), _all_handlers(ultralytics_det, _ultralytics_train(TaskKind.OBJECT_DETECTION), 640, yolo_data, nms_configurable=True, tune_schema=_ultralytics_tune(TaskKind.OBJECT_DETECTION))),
+        FrameworkTaskPlugin(ProviderDescriptor("libreyolo", TaskKind.OBJECT_DETECTION, standard_operations, "LibreYOLO detector", "libreyolo"), StaticModelCatalog(libre_models), libre_handlers),
     )
 
 
