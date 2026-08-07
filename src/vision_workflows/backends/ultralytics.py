@@ -38,6 +38,13 @@ class Execution(BackendExecution):
         object.__setattr__(self, "contract", self.contract or {})
 
 
+def _validation_options(data: Path, split: str, device: str) -> dict[str, Any]:
+    options: dict[str, Any] = {"data": str(data), "split": split}
+    if device != "auto":
+        options["device"] = device
+    return options
+
+
 class UltralyticsBackend:
     def __init__(self, task: str = "detection"):
         if task not in {"classification", "detection"}:
@@ -160,7 +167,7 @@ class UltralyticsBackend:
         artifacts = [artifact(path, "onnx") for path in paths]
         if request.data is not None:
             data = self._data(request)
-            native = model.val(data=str(data), split="val", device=request.device)
+            native = model.val(**_validation_options(data, "val", request.device))
             metrics.update(native_validation_metrics(native))
             if self._task == "classification":
                 metrics.update(validate_classification_wrappers(
@@ -199,7 +206,7 @@ class UltralyticsBackend:
             return Execution((artifact(target, "onnx"),), {}, contract, checks)
         model = self._model(request)
         if request.data:
-            values = model.val(data=str(self._data(request)), split=request.split, device=request.device)
+            values = model.val(**_validation_options(self._data(request), request.split, request.device))
             metrics = getattr(values, "results_dict", {})
         else:
             metrics = {}
@@ -207,5 +214,5 @@ class UltralyticsBackend:
 
     def test(self, request: ResolvedTestRequest, context: WorkflowContext) -> BackendExecution:
         model = self._model(request)
-        values = model.val(data=str(self._data(request)), split=request.split, device=request.device)
+        values = model.val(**_validation_options(self._data(request), request.split, request.device))
         return Execution((artifact(require_file(request.target, "model artifact"), "model"),), getattr(values, "results_dict", {}), {}, ())

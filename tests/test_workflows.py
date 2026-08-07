@@ -85,6 +85,20 @@ def test_libreyolo_picodet_export_defaults_to_native_image_size() -> None:
     assert schema.resolve({}, context)["image_size"] == 320
 
 
+def test_ultralytics_auto_validation_omits_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    import vision_workflows.backends.ultralytics as integration
+
+    assert integration._validation_options(Path("data.yaml"), "val", "auto") == {
+        "data": str(Path("data.yaml")),
+        "split": "val",
+    }
+    assert integration._validation_options(Path("data.yaml"), "val", "0") == {
+        "data": str(Path("data.yaml")),
+        "split": "val",
+        "device": "0",
+    }
+
+
 def test_ultralytics_classification_translates_only_its_supported_parameters(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured: dict[str, object] = {}
 
