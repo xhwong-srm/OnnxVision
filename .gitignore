@@ -8,6 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+.venv-paddleclas/
 
 # Datasets
 images/
@@ -17,6 +18,8 @@ datasets/
 runs/
 *pt
 artifacts/
+experiments/paddleclas_pplcnetv2/PaddleClas/
+experiments/paddleclas_pplcnetv2/artifacts/
 tmp/
 
 # Agents
