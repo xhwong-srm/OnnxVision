@@ -138,3 +138,8 @@ uv run --extra timm python experiments/paddleclas_pplcnetv2/export_contract.py `
 The actual experiment also simplified the wrapped graph while preserving
 dynamic source height/width, using one representative raw image shape only
 for simplifier validation.
+
+The final production decision is documented in
+[`docs/experiments/pplcnetv2-seal-v6.2.md`](../../docs/experiments/pplcnetv2-seal-v6.2.md):
+keep PP-LCNetV2 as an experiment and do not add it to `vision_workflows` as a
+supported model.

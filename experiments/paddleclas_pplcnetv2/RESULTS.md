@@ -148,3 +148,12 @@ cost, not an ONNX graph-management problem. Larger gains would require a
 smaller PP-LCNetV2 configuration, lower input resolution, quantization, or a
 more suitable accelerator/provider; simplifying the existing graph alone is
 unlikely to make it MobileNet-speed.
+
+## Final decision
+
+This experiment is concluded as **not for implementation in
+`vision_workflows` as a supported model**. PP-LCNetV2 is contract-compatible
+and accurate, but remains substantially slower than the existing MobileNetV4
+reference under identical C# input, resolution, batch, and CPU conditions.
+The complete decision record is in
+[`docs/experiments/pplcnetv2-seal-v6.2.md`](../../docs/experiments/pplcnetv2-seal-v6.2.md).
