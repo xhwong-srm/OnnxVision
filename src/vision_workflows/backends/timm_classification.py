@@ -29,6 +29,7 @@ from .timm_training import (
     seed_everything,
     worker_seed,
 )
+from .export_validation import validate_classification_wrappers
 
 
 logger = logging.getLogger(__name__)
@@ -389,53 +390,145 @@ class TimmClassificationBackend:
             )
             set_onnx_metadata(path, metadata_for_contract(variant_contract))
             checks.extend({**check, "variant": variant} for check in validate_onnx(path, variant_contract))
-        return Execution(tuple(artifact(path, "onnx") for path in paths), {}, contract, tuple(checks))
+
+        metrics: dict[str, Any] = {}
+        artifacts = [artifact(path, "onnx") for path in paths]
+        if request.data is not None:
+            metrics = self._validate_export_dataset(
+                model,
+                classes,
+                value,
+                outputs,
+                request.data,
+                image_size=size,
+                batch_size=request.batch_size,
+                device=request.device,
+            )
+            report = context.write_json("dataset-validation.json", metrics)
+            artifacts.append(artifact(report, "report"))
+            checks.append({
+                "name": "checkpoint_native_validation",
+                "status": "passed",
+                "split": "val",
+                "images": metrics["native_images"],
+            })
+            for variant in ("bw8", "c24"):
+                checks.append({
+                    "name": "wrapped_dataset_validation",
+                    "status": "passed",
+                    "variant": variant,
+                    "split": "val",
+                    "images": metrics[f"{variant}_images"],
+                })
+        return Execution(tuple(artifacts), metrics, contract, tuple(checks))
+
+    def _validate_export_dataset(
+        self,
+        model: Any,
+        classes: list[str],
+        value: dict[str, Any],
+        outputs: dict[str, Path],
+        data: Path | None,
+        *,
+        image_size: int,
+        batch_size: int | None,
+        device: str,
+    ) -> dict[str, Any]:
+        native_metrics, native_probabilities, labels = self._evaluate_predictions(
+            model,
+            classes,
+            value,
+            data,
+            "val",
+            device,
+            image_size=image_size,
+        )
+        metrics = dict(native_metrics)
+        wrapped = validate_classification_wrappers(
+            outputs,
+            data,
+            classes=classes,
+            image_size=image_size,
+            batch_size=batch_size,
+            reference_probabilities=native_probabilities,
+        )
+        metrics.update(wrapped)
+        metrics["validation_split"] = "val"
+        return metrics
 
     def _evaluate(self, request: ResolvedValidateRequest | ResolvedTestRequest):
-        _, torch, _ = self._imports()
         model, classes, value = self._load(request.target, request.device)
-        data = request.data
-        split = request.split
+        metrics, _, _ = self._evaluate_predictions(
+            model, classes, value, request.data, request.split, request.device
+        )
+        return metrics
+
+    def _evaluate_predictions(
+        self,
+        model: Any,
+        classes: list[str],
+        value: dict[str, Any],
+        data: Path | None,
+        split: str,
+        device_name: str,
+        *,
+        image_size: int | None = None,
+    ) -> tuple[dict[str, Any], Any, Any]:
+        _, torch, _ = self._imports()
         if data is None:
             raise ValueError("evaluation requires a classification dataset")
         _, _, torchvision = self._imports()
         data_config = value.get("data_config", {})
+        size = int(image_size or data_config.get("input_size", [3, 224, 224])[-1])
         transform_ops = torchvision.transforms.Compose([
-            torchvision.transforms.Resize((int(data_config.get("input_size", [3, 224, 224])[-1]),) * 2),
+            torchvision.transforms.Resize((size,) * 2),
             torchvision.transforms.ToTensor(),
             torchvision.transforms.Normalize(tuple(data_config.get("mean", _DEFAULT_MEAN)), tuple(data_config.get("std", _DEFAULT_STD))),
         ])
         dataset = torchvision.datasets.ImageFolder(str(data / split), transform=transform_ops)
         if dataset.classes != classes:
             raise ValueError("dataset classes differ from checkpoint classes")
+        if len(dataset) == 0:
+            raise ValueError("classification validation split is empty")
         loader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=False)
         device = torch.device(
-            "cuda" if request.device in {"auto", "cuda"} and torch.cuda.is_available()
-            else request.device if request.device != "auto" else "cpu"
+            "cuda" if device_name in {"auto", "cuda"} and torch.cuda.is_available()
+            else device_name if device_name != "auto" else "cpu"
         )
         model.to(device)
         criterion = torch.nn.CrossEntropyLoss()
         loss_total = 0.0
         correct = total = 0
+        probabilities: list[Any] = []
+        collected_labels: list[Any] = []
         with torch.inference_mode():
             for images, labels in loader:
                 labels = labels.to(device)
                 logits = model(images.to(device))
+                batch_probabilities = torch.softmax(logits, dim=1)
                 loss_total += float(criterion(logits, labels).item()) * len(labels)
                 correct += int((logits.argmax(1) == labels).sum())
                 total += len(labels)
+                probabilities.append(batch_probabilities.detach().cpu())
+                collected_labels.append(labels.detach().cpu())
+        native_probabilities = torch.cat(probabilities).numpy()
+        collected_labels_array = torch.cat(collected_labels).numpy()
         metrics = {
             "split": split,
             "loss": loss_total / max(1, total),
             "accuracy": correct / max(1, total),
             "correct": correct,
             "images": total,
+            "native_accuracy": correct / max(1, total),
+            "native_loss": loss_total / max(1, total),
+            "native_correct": correct,
+            "native_images": total,
         }
         logger.info(
             "Evaluation complete: split=%s images=%d loss=%.6f accuracy=%.4f correct=%d",
-            split, total, metrics["loss"], metrics["accuracy"], correct,
+            split, total, metrics["native_loss"], metrics["native_accuracy"], correct,
         )
-        return metrics
+        return metrics, native_probabilities, collected_labels_array
 
     def validate(self, request: ResolvedValidateRequest, context: WorkflowContext) -> BackendExecution:
         if request.target.suffix.casefold() == ".onnx":

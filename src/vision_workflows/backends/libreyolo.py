@@ -22,6 +22,7 @@ from .common import (
     wrap_embedded_variants,
 )
 from .libreyolo_picodet import export_picodet_core
+from .export_validation import native_validation_metrics, validate_detection_wrappers
 
 
 @dataclass(frozen=True)
@@ -177,7 +178,32 @@ class LibreYoloBackend:
             )
             set_onnx_metadata(path, metadata_for_contract(variant_contract))
             checks.extend({**check, "variant": variant} for check in validate_onnx(path, variant_contract))
-        return Execution(tuple(artifact(path, "onnx") for path in paths), {}, contract, tuple(checks))
+
+        metrics: dict[str, Any] = {}
+        artifacts = [artifact(path, "onnx") for path in paths]
+        if request.data is not None:
+            data = require_file(request.data, "dataset YAML")
+            values = model.val(data=str(data), split="val", device=request.device)
+            metrics.update(native_validation_metrics(values))
+            metrics.update(validate_detection_wrappers(
+                outputs,
+                data,
+                class_count=len(names),
+                image_size=request.image_size,
+                batch_size=request.batch_size,
+            ))
+            report = context.write_json("dataset-validation.json", metrics)
+            artifacts.append(artifact(report, "report"))
+            checks.append({"name": "checkpoint_native_validation", "status": "passed", "split": "val"})
+            for variant in ("bw8", "c24"):
+                checks.append({
+                    "name": "wrapped_dataset_validation",
+                    "status": "passed",
+                    "variant": variant,
+                    "split": "val",
+                    "images": metrics["validation_images"],
+                })
+        return Execution(tuple(artifacts), metrics, contract, tuple(checks))
 
     def validate(self, request: ResolvedValidateRequest, context: WorkflowContext) -> BackendExecution:
         target = require_file(request.target, "model artifact")
