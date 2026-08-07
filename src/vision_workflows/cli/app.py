@@ -228,7 +228,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     selection = _selection(args)
     parameters = _parameters(args, operation)
     if operation is Operation.TRAIN:
-        result = TrainService().run(TrainRequest(selection, args.data, args.output, args.weights, args.resume, args.overwrite, parameters))
+        TrainService().run(TrainRequest(selection, args.data, args.output, args.weights, args.resume, args.overwrite, parameters))
+        return 0
     elif operation is Operation.EXPORT:
         ExportService().run(ExportRequest(selection, args.checkpoint, args.output, args.data, parameters))
         return 0

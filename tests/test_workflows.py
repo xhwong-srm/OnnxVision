@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -168,7 +169,8 @@ def test_optional_import_does_not_eagerly_load_optional_exports() -> None:
     assert libreyolo.LibrePICODET is not None
 
 
-def test_train_service_records_requested_and_effective_parameters(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_train_service_records_requested_and_effective_parameters(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path) -> None:
+    caplog.set_level(logging.INFO, logger="vision_workflows.workflows.services")
     from vision_workflows.backends import registry
 
     selection = ModelSelection(TaskKind.CLASSIFICATION, "fake", "unit")
@@ -192,6 +194,10 @@ def test_train_service_records_requested_and_effective_parameters(monkeypatch: p
     assert manifest["config"]["resolved_model"]["native_id"] == "native-unit"
     assert manifest["config"]["parameters"]["requested"] == {"epochs": 1}
     assert manifest["config"]["parameters"]["effective"] == {"device": "cpu", "epochs": 1}
+    assert "Training outputs saved under" in caplog.text
+    assert "config.json" in caplog.text
+    assert "manifest.json" in caplog.text
+    assert "best.pt" in caplog.text
 
 
 def test_export_service_saves_result_json(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

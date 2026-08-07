@@ -101,6 +101,23 @@ class TrainService:
             raise
         run = store.finish(run_id, "train", config, status=RunStatus.SUCCEEDED, artifacts=execution.artifacts, metrics=dict(execution.metrics))
         context.emit("run_finished", {"status": "succeeded"})
+        saved_paths = [
+            run.run_dir / name
+            for name in ("config.json", "metrics.json", "manifest.json", "events.jsonl")
+        ]
+        saved_paths.extend(artifact.path for artifact in run.artifacts)
+        saved_paths = list(dict.fromkeys(path for path in saved_paths if path.is_file()))
+        saved_names = []
+        for path in saved_paths:
+            try:
+                saved_names.append(str(path.relative_to(run.run_dir)))
+            except ValueError:
+                saved_names.append(str(path))
+        logger.info(
+            "Training outputs saved under %s: %s",
+            run.run_dir,
+            ", ".join(saved_names),
+        )
         best = next((item for item in execution.artifacts if item.name == "best.pt"), None)
         last = next((item for item in execution.artifacts if item.name == "last.pt"), None)
         return TrainResult(run, best, last, dict(execution.metrics))
