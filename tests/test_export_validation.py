@@ -38,6 +38,8 @@ def test_classification_wrappers_report_accuracy_and_agreement(monkeypatch: pyte
     second = validation_root / "second" / "two.png"
     Image.new("RGB", (4, 4), "white").save(first)
     Image.new("RGB", (4, 4), "black").save(second)
+    assert validation._classification_raw_image(str(first), "bw8", np).shape == (1, 4, 4)
+    assert validation._classification_raw_image(str(first), "c24", np).shape == (4, 4, 3)
 
     class Dataset:
         classes = ["first", "second"]
@@ -86,6 +88,8 @@ def test_detection_wrappers_report_map_and_variant_agreement(monkeypatch: pytest
     labels.mkdir(parents=True)
     image = images / "sample.png"
     Image.new("RGB", (4, 4), "white").save(image)
+    assert validation._raw_image(image, "bw8", np).shape == (1, 4, 4)
+    assert validation._raw_image(image, "c24", np).shape == (4, 4, 3)
     (labels / "sample.txt").write_text("0 0.5 0.5 0.5 0.5\n", encoding="utf-8")
     data_yaml = tmp_path / "data.yaml"
     data_yaml.write_text("path: .\nval: images/val\nnames: [seal]\n", encoding="utf-8")

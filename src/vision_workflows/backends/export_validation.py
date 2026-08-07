@@ -108,7 +108,8 @@ def _classification_raw_image(path: str, variant: str, np: Any) -> Any:
     image = image_module.open(path)
     try:
         if variant == "bw8":
-            return np.asarray(image.convert("L"), dtype=np.uint8)
+            # Keep the channel axis per image; batching then produces [B, 1, H, W].
+            return np.asarray(image.convert("L"), dtype=np.uint8)[None, ...]
         rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
         return np.ascontiguousarray(rgb[..., ::-1])
     finally:
@@ -255,7 +256,8 @@ def _raw_image(path: Path, variant: str, np: Any) -> Any:
     image = image_module.open(path)
     try:
         if variant == "bw8":
-            return np.asarray(image.convert("L"), dtype=np.uint8)
+            # Keep the channel axis per image; batching then produces [B, 1, H, W].
+            return np.asarray(image.convert("L"), dtype=np.uint8)[None, ...]
         rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
         return np.ascontiguousarray(rgb[..., ::-1])
     finally:
