@@ -327,7 +327,10 @@ def _timm_trial_objective(
 
 
 def _run_timm_optuna_worker(
-    request: ResolvedTuneRequest,
+    selection,
+    model,
+    data: Path,
+    options: dict[str, Any],
     root_dir: Path,
     study_name: str,
     storage: str | None,
@@ -339,6 +342,7 @@ def _run_timm_optuna_worker(
     worker_index: int,
 ) -> list[int]:
     optuna = optional_import("optuna")
+    request = ResolvedTuneRequest(selection, model, data, root_dir, False, options)
     study_storage = _journal_storage(optuna, journal_path) if journal_path is not None else storage
     study = _create_optuna_study(
         optuna,
@@ -850,7 +854,10 @@ class TimmClassificationBackend:
                 trial_counts.append(base_count + (1 if worker_index < remainder else 0))
             worker_arguments = [
                 (
-                    request,
+                    request.selection,
+                    request.model,
+                    request.data,
+                    dict(request.options),
                     context.run_dir,
                     request.study_name,
                     request.storage,

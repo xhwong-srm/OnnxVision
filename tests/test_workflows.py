@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import pickle
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,7 @@ from vision_workflows.domain.errors import ConfigurationError
 from vision_workflows.domain.models import ModelInfo, ModelSelection, Operation, ParameterSchema, ParameterSpec, ProviderDescriptor, StaticModelCatalog
 from vision_workflows.domain.results import ArtifactRef, RunStatus
 from vision_workflows.workflows.context import optional_import
-from vision_workflows.workflows.requests import ExportRequest, TrainRequest, TuneRequest
+from vision_workflows.workflows.requests import ExportRequest, ResolvedTuneRequest, TrainRequest, TuneRequest
 from vision_workflows.workflows.runs import RunStore
 from vision_workflows.workflows.services import ExportService, TrainService, TuneService
 
@@ -73,6 +74,26 @@ def test_timm_training_and_tuning_schemas_expose_first_class_integrations() -> N
     assert tune["label_smoothing_min"] < tune["label_smoothing_max"]
     assert tune["learning_rate_min"] < tune["learning_rate_max"]
     assert tune["weight_decay_min"] < tune["weight_decay_max"]
+
+
+def test_resolved_tune_request_can_cross_a_spawn_process() -> None:
+    selection = ModelSelection(TaskKind.CLASSIFICATION, "timm", "unit")
+    model = ModelInfo("unit", "native-unit")
+    request = ResolvedTuneRequest(
+        selection,
+        model,
+        Path("data"),
+        Path("run"),
+        False,
+        {"epochs": 2, "device": "cuda:0"},
+    )
+
+    restored = pickle.loads(pickle.dumps(request))
+
+    assert restored.selection == selection
+    assert restored.model == model
+    assert restored.epochs == 2
+    assert restored.device == "cuda:0"
 
 
 def test_provider_schema_rejects_parameters_owned_by_another_provider() -> None:

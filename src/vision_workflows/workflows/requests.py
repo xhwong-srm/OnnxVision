@@ -7,6 +7,17 @@ from typing import Any, Mapping
 from ..domain.models import ModelInfo, ModelSelection
 
 
+def _resolved_parameter(instance: object, name: str) -> Any:
+    try:
+        parameters = object.__getattribute__(instance, "parameters")
+    except AttributeError as error:
+        raise AttributeError(name) from error
+    try:
+        return parameters[name]
+    except KeyError as error:
+        raise AttributeError(name) from error
+
+
 @dataclass(frozen=True)
 class TrainRequest:
     selection: ModelSelection
@@ -66,10 +77,7 @@ class ResolvedTrainRequest:
     parameters: Mapping[str, Any]
 
     def __getattr__(self, name: str) -> Any:
-        try:
-            return self.parameters[name]
-        except KeyError as error:
-            raise AttributeError(name) from error
+        return _resolved_parameter(self, name)
 
     @property
     def options(self) -> Mapping[str, Any]:
@@ -86,10 +94,7 @@ class ResolvedTuneRequest:
     parameters: Mapping[str, Any]
 
     def __getattr__(self, name: str) -> Any:
-        try:
-            return self.parameters[name]
-        except KeyError as error:
-            raise AttributeError(name) from error
+        return _resolved_parameter(self, name)
 
     @property
     def options(self) -> Mapping[str, Any]:
@@ -106,10 +111,7 @@ class ResolvedExportRequest:
     parameters: Mapping[str, Any]
 
     def __getattr__(self, name: str) -> Any:
-        try:
-            return self.parameters[name]
-        except KeyError as error:
-            raise AttributeError(name) from error
+        return _resolved_parameter(self, name)
 
     @property
     def options(self) -> Mapping[str, Any]:
@@ -126,10 +128,7 @@ class ResolvedValidateRequest:
     parameters: Mapping[str, Any]
 
     def __getattr__(self, name: str) -> Any:
-        try:
-            return self.parameters[name]
-        except KeyError as error:
-            raise AttributeError(name) from error
+        return _resolved_parameter(self, name)
 
     @property
     def options(self) -> Mapping[str, Any]:
@@ -146,10 +145,7 @@ class ResolvedTestRequest:
     parameters: Mapping[str, Any]
 
     def __getattr__(self, name: str) -> Any:
-        try:
-            return self.parameters[name]
-        except KeyError as error:
-            raise AttributeError(name) from error
+        return _resolved_parameter(self, name)
 
     @property
     def options(self) -> Mapping[str, Any]:
