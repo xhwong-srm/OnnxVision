@@ -11,19 +11,7 @@ namespace OnnxVision.Runtime
         {
             "Microsoft.ML.OnnxRuntime.dll",
             "onnxruntime.dll",
-            "onnxruntime_providers_shared.dll",
-            "onnxruntime_providers_openvino.dll",
-            "openvino.dll",
-            "openvino_c.dll",
-            "openvino_auto_plugin.dll",
-            "openvino_hetero_plugin.dll",
-            "openvino_intel_cpu_plugin.dll",
-            "openvino_intel_gpu_plugin.dll",
-            "openvino_onnx_frontend.dll",
-            "tbb12.dll",
-            "tbbbind_2_5.dll",
-            "tbbmalloc.dll",
-            "tbbmalloc_proxy.dll"
+            "onnxruntime_providers_shared.dll"
         };
 
         private static readonly List<IntPtr> VisualCppRuntimeHandles = new List<IntPtr>();
@@ -46,7 +34,7 @@ namespace OnnxVision.Runtime
 
             errorMessage = missingDlls.Count == 0
                 ? ""
-                : "Missing ONNX/OpenVINO runtime DLLs: " + string.Join(", ", missingDlls);
+                : "Missing Microsoft ONNX Runtime DLLs: " + string.Join(", ", missingDlls);
             return missingDlls.Count == 0;
         }
 

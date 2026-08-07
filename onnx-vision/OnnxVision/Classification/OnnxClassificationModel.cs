@@ -303,15 +303,10 @@ namespace OnnxVision.Classification
 
         private static InferenceSession CreateSession(string modelPath, OnnxExecutionProvider provider)
         {
-            if (provider == OnnxExecutionProvider.Cpu)
-                return new InferenceSession(modelPath);
-
-            using (var options = new SessionOptions())
-            {
-                options.AppendExecutionProvider_OpenVINO(
-                    provider == OnnxExecutionProvider.OpenVinoGpu ? "GPU" : "CPU");
-                return new InferenceSession(modelPath, options);
-            }
+            if (provider != OnnxExecutionProvider.Cpu)
+                throw new ArgumentOutOfRangeException("provider", provider,
+                    "Only the Microsoft ONNX Runtime CPU execution provider is supported.");
+            return new InferenceSession(modelPath);
         }
 
         private static unsafe void CopyRows(IntPtr source, int sourceRowStride, IntPtr destination,

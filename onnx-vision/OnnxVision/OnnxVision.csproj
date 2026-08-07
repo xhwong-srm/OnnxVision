@@ -10,6 +10,7 @@
     <AssemblyName>OnnxVision</AssemblyName>
     <TargetFrameworkVersion>v4.6.1</TargetFrameworkVersion>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
     <FileAlignment>512</FileAlignment>
     <Deterministic>true</Deterministic>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -89,12 +90,12 @@
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="Intel.ML.OnnxRuntime.OpenVino"
-                      Version="1.24.1"
+    <PackageReference Include="Microsoft.ML.OnnxRuntime"
+                      Version="1.28.0"
                       GeneratePathProperty="true" />
   </ItemGroup>
   <ItemGroup>
-    <Content Include="$(PkgIntel_ML_OnnxRuntime_OpenVino)\runtimes\win-x64\native\*.dll">
+    <Content Include="$(PkgMicrosoft_ML_OnnxRuntime)\runtimes\win-x64\native\*.dll">
       <Link>%(Filename)%(Extension)</Link>
       <Visible>false</Visible>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

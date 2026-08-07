@@ -225,26 +225,14 @@ namespace OnnxVision
         private static bool TryParseProvider(
             string value, out OnnxExecutionProvider[] providers)
         {
-            OnnxExecutionProvider provider;
             if (string.IsNullOrWhiteSpace(value) ||
                 string.Equals(value, "cpu", StringComparison.OrdinalIgnoreCase))
             {
                 providers = new[] { OnnxExecutionProvider.Cpu };
                 return true;
             }
-
-            if (string.Equals(value, "openvino-cpu", StringComparison.OrdinalIgnoreCase))
-                provider = OnnxExecutionProvider.OpenVinoCpu;
-            else if (string.Equals(value, "openvino-gpu", StringComparison.OrdinalIgnoreCase))
-                provider = OnnxExecutionProvider.OpenVinoGpu;
-            else
-            {
-                providers = null;
-                return false;
-            }
-
-            providers = new[] { provider, OnnxExecutionProvider.Cpu };
-            return true;
+            providers = null;
+            return false;
         }
 
         private static bool TryParseThreshold(string value, out float threshold)

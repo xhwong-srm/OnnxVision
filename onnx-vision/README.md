@@ -40,9 +40,9 @@ Both variants intentionally produce the `OnnxVision` assembly and contain the sa
 - Visual Studio 2019/MSBuild for the legacy Vision Studio configuration, or a compatible .NET SDK for SDK-style builds.
 - Euresys Open eVision 22.12. The projects currently expect:
   `C:\VisionRef64\Open_eVision_NetApi_22_12.dll`
-- NuGet restore access to `Intel.ML.OnnxRuntime.OpenVino` version `1.24.1`.
+- NuGet restore access to `Microsoft.ML.OnnxRuntime` version `1.28.0`.
 
-The Intel OpenVINO package supplies the managed ONNX Runtime dependency transitively. Visual Studio MSBuild resolves that dependency for the legacy project, so no separate Microsoft ONNX Runtime assembly reference is required. The projects copy the package's `win-x64` native OpenVINO/ONNX Runtime DLLs to their output directories.
+Both projects reference Microsoft's standard CPU ONNX Runtime package directly. Visual Studio MSBuild resolves the managed and `win-x64` native runtime assets, and the projects copy the package's native DLLs to their output directories.
 
 ## Build
 
@@ -67,7 +67,7 @@ MSBuild.exe .\onnx-vision\OnnxVision\OnnxVision.csproj /t:Restore /p:Configurati
 MSBuild.exe .\onnx-vision\OnnxVision\OnnxVision.csproj /p:Configuration=Debug_22_12 /p:Platform=AnyCPU /m /nologo
 ```
 
-The legacy project declares `win-x64` so current NuGet/MSBuild versions select the OpenVINO native assets consistently.
+The legacy project declares `win-x64` so current NuGet/MSBuild versions select the Microsoft CPU native assets consistently.
 
 ## CLI
 
@@ -133,7 +133,7 @@ Detection validation reports IoU-0.50 precision/recall/F1, mAP50, mAP50-95,
 and per-class AP and matching counts. Validation is rejected for a single
 image or an unlabeled image directory.
 
-Supported providers are `cpu`, `openvino-cpu`, and `openvino-gpu`. The report includes both the requested and actual provider because provider initialization may fall back to CPU.
+The supported provider is `cpu`, backed by Microsoft's standard CPU execution provider. The report includes both the requested and actual provider.
 
 The former `benchmark-detect` command is no longer required. It remains accepted as a compatibility alias and routes through the same detection path with a default of three repeats.
 
@@ -175,7 +175,7 @@ The application must run as a 64-bit process and have these files beside the fin
 - `OnnxVision.dll`
 - `Microsoft.ML.OnnxRuntime.dll`
 - `onnxruntime.dll` and provider DLLs
-- OpenVINO and TBB native DLLs
+- Microsoft ONNX Runtime CPU native DLLs
 - The Microsoft Visual C++ x64 runtime
 
 `OnnxRuntimeEnvironment.ValidateDeployment` can validate the final application directory before inference starts. A successful library build alone does not prove that the final Vision Studio application output contains every native runtime DLL.

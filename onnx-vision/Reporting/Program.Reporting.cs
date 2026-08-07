@@ -340,7 +340,7 @@ namespace OnnxVision
             Console.WriteLine("  Validation is available only when a labeled dataset is supplied; " +
                 "default dataset set is val when present.");
             Console.WriteLine("  'detect' remains an optional object-detection command alias.");
-            Console.WriteLine("Providers: cpu, openvino-cpu, openvino-gpu");
+            Console.WriteLine("Providers: cpu");
             Console.WriteLine("Models are classified automatically from their ONNX metadata contract.");
         }
 
