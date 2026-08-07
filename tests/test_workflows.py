@@ -22,12 +22,13 @@ def test_registry_exposes_framework_task_plugins() -> None:
     values = {(item.framework, item.task) for item in frameworks()}
     assert values == {
         ("timm", TaskKind.CLASSIFICATION),
-        ("pytorch", TaskKind.OBJECT_DETECTION),
         ("ultralytics", TaskKind.CLASSIFICATION),
         ("ultralytics", TaskKind.OBJECT_DETECTION),
         ("libreyolo", TaskKind.OBJECT_DETECTION),
     }
     assert all(Operation.TRAIN in item.operations for item in frameworks())
+    with pytest.raises(ConfigurationError, match="unsupported framework/task: pytorch/object-detection"):
+        plugin_for(ModelSelection(TaskKind.OBJECT_DETECTION, "pytorch", "timm-obd-v1"))
 
 
 def test_model_selection_is_explicit_and_catalog_resolves_native_model() -> None:

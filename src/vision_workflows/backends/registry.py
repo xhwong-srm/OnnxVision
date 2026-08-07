@@ -16,7 +16,6 @@ from ..domain.models import (
 from .base import FrameworkTaskPlugin, OperationHandler
 from .libreyolo import LibreYoloBackend
 from .timm_classification import TimmClassificationBackend
-from .timm_detection import TimmDetectionBackend
 from .ultralytics import UltralyticsBackend
 
 
@@ -76,21 +75,6 @@ def _timm_train(_: ModelInfo) -> ParameterSchema:
     return _training(None).compose(framework)
 
 
-def _query_train(_: ModelInfo) -> ParameterSchema:
-    model = _schema(
-        ParameterSpec("backbone", str, "timm feature-extractor model", "mobilenetv4_conv_small.e3600_r256_in1k"),
-        ParameterSpec("num_queries", int, "detector query count; zero chooses from the dataset", 0, minimum=0),
-        ParameterSpec("validate_every", int, "run validation every N epochs", 1, minimum=1),
-        ParameterSpec("prefetch_factor", int, "batches prefetched per worker", None, allow_none=True, minimum=1),
-        ParameterSpec("persistent_workers", bool, "keep workers alive between epochs", False),
-        ParameterSpec("pin_memory", bool, "pin data-loader memory", False),
-        ParameterSpec("amp", bool, "use automatic mixed precision", False),
-        ParameterSpec("amp_dtype", str, "AMP data type", None, choices=("float16", "bfloat16"), allow_none=True),
-        ParameterSpec("compile", bool, "compile the model with torch.compile", False),
-    ).with_origin(ParameterOrigin.MODEL)
-    return _training(640).compose(model)
-
-
 def _ultralytics_train(task: TaskKind):
     def factory(_: ModelInfo) -> ParameterSchema:
         task_schema = (
@@ -143,10 +127,8 @@ _TIMM_CLASSIFICATION_MODELS = (
 def _plugins() -> tuple[FrameworkTaskPlugin, ...]:
     classification_data = DatasetRequirement((DatasetFormat.IMAGE_FOLDER,), ("train", "val"))
     yolo_data = DatasetRequirement((DatasetFormat.YOLO,), ("train", "val"))
-    coco_data = DatasetRequirement((DatasetFormat.COCO,), ("train", "val"))
 
     timm_backend = TimmClassificationBackend()
-    query_backend = TimmDetectionBackend()
     ultralytics_cls = UltralyticsBackend("classification")
     ultralytics_det = UltralyticsBackend("detection")
     yolo26 = tuple(ModelInfo(f"yolo26{size}", f"yolo26{size}.pt", metadata={"variant": size}) for size in "nsmlx")
@@ -174,7 +156,6 @@ def _plugins() -> tuple[FrameworkTaskPlugin, ...]:
     }
     return (
         FrameworkTaskPlugin(ProviderDescriptor("timm", TaskKind.CLASSIFICATION, frozenset(Operation), "timm image classifier", "timm"), StaticModelCatalog(_TIMM_CLASSIFICATION_MODELS), _all_handlers(timm_backend, _timm_train, 224, classification_data)),
-        FrameworkTaskPlugin(ProviderDescriptor("pytorch", TaskKind.OBJECT_DETECTION, frozenset(Operation), "PyTorch timm object detector v1", "torch,timm,torchvision"), StaticModelCatalog((ModelInfo("timm-obd-v1", "timm-obd-v1"),)), _all_handlers(query_backend, _query_train, 640, coco_data)),
         FrameworkTaskPlugin(ProviderDescriptor("ultralytics", TaskKind.CLASSIFICATION, frozenset(Operation), "Ultralytics classifier", "ultralytics"), StaticModelCatalog(yolo26_cls), _all_handlers(ultralytics_cls, _ultralytics_train(TaskKind.CLASSIFICATION), 224, classification_data)),
         FrameworkTaskPlugin(ProviderDescriptor("ultralytics", TaskKind.OBJECT_DETECTION, frozenset(Operation), "Ultralytics detector", "ultralytics"), StaticModelCatalog(yolo26), _all_handlers(ultralytics_det, _ultralytics_train(TaskKind.OBJECT_DETECTION), 640, yolo_data, nms_configurable=True)),
         FrameworkTaskPlugin(ProviderDescriptor("libreyolo", TaskKind.OBJECT_DETECTION, frozenset(Operation), "LibreYOLO detector", "libreyolo"), StaticModelCatalog(libre_models), libre_handlers),
