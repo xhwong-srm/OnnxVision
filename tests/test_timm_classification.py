@@ -222,6 +222,18 @@ def test_resized_disk_cache_integrates_with_albumentations(monkeypatch, tmp_path
 
     assert tuple(image.shape) == (3, 4, 4)
     assert label == 0
+    validation_dataset = TimmClassificationBackend._datasets(
+        data,
+        4,
+        False,
+        augmentation_enabled=False,
+        cache_mode="disk",
+    )
+    validation_image, validation_label = validation_dataset[0]
+
+    assert tuple(validation_image.shape) == (3, 4, 4)
+    assert validation_label == 0
+    assert (data / ".vision_workflows_cache" / "timm_classification" / "size-4" / "val" / "manifest.json").is_file()
 
 
 def test_timm_tune_uses_optuna_trials_and_copies_best_checkpoints(monkeypatch, tmp_path) -> None:

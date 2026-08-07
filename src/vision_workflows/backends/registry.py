@@ -78,6 +78,7 @@ def _timm_train(_: ModelInfo) -> ParameterSchema:
         ParameterSpec("augmentation_backend", str, "random training augmentation backend", "torchvision", choices=("torchvision", "albumentations")),
         ParameterSpec("augmentation_policy", str, "augmentation intensity policy", "standard", choices=("standard", "robust")),
         ParameterSpec("cache", str, "resized image cache mode", "none", choices=("none", "ram", "disk")),
+        ParameterSpec("val_workers", int, "validation data-loader worker processes", 0, minimum=0),
     ).with_origin(ParameterOrigin.FRAMEWORK)
     return _training(None).compose(framework)
 

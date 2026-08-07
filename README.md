@@ -88,14 +88,17 @@ augmentation. Validation and evaluation never apply random augmentation. For
 timm classification, `--cache disk` or `--cache ram` caches
 the resized RGB training images before augmentation; `--cache disk` is the
 safer choice for larger datasets. The cache is keyed by image size and
-source-file metadata and is rebuilt when the sources change. Ultralytics and
-LibreYOLO retain their provider-native augmentation controls.
+source-file metadata and is rebuilt when the sources change. The same cache
+mode applies independently to train and validation splits; use `--val-workers`
+to choose a separate validation worker count. Ultralytics and LibreYOLO retain
+their provider-native augmentation controls.
 
 ```powershell
 uv run --extra timm vision-workflows train `
   --task classification --framework timm `
   --model mobilenetv4_conv_small_050.e3000_r224_in1k `
-  --data data --output runs/timm-cached --cache disk --workers 4
+  --data data --output runs/timm-cached --cache disk --workers 4 `
+  --val-workers 2 --persistent-workers --pin-memory
 ```
 
 Optuna tuning is a first-class timm classification operation. It searches

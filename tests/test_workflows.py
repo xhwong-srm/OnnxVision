@@ -61,6 +61,7 @@ def test_timm_training_and_tuning_schemas_expose_first_class_integrations() -> N
     assert train["augmentation_backend"] == "torchvision"
     assert train["augmentation_policy"] == "standard"
     assert train["cache"] == "none"
+    assert train["val_workers"] == 0
     assert train["weight_decay"] == 0.01
     assert train["label_smoothing"] == 0.0
     assert train["warmup_epochs"] == 2

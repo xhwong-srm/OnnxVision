@@ -295,13 +295,12 @@ class TimmClassificationBackend:
             raise ValueError(f"unsupported augmentation policy: {augmentation_policy}")
         if cache_mode not in {"none", "ram", "disk"}:
             raise ValueError(f"unsupported resized image cache mode: {cache_mode}")
-        if not train and cache_mode != "none":
-            raise ValueError("resized image caching is only supported for training")
         transforms = torchvision.transforms
         resize = transforms.Resize((image_size, image_size))
         cache_loader = None
-        if train and cache_mode != "none":
-            cache_dir = data / ".vision_workflows_cache" / "timm_classification" / f"size-{image_size}" / "train"
+        split = "train" if train else "val"
+        if cache_mode != "none":
+            cache_dir = data / ".vision_workflows_cache" / "timm_classification" / f"size-{image_size}" / split
             cache_loader = ResizedImageLoader(cache_mode, cache_dir if cache_mode == "disk" else None, image_size, resize)
         operations = [] if cache_loader is not None else [resize]
         if train and augmentation_enabled:
@@ -395,6 +394,9 @@ class TimmClassificationBackend:
         augmentation_backend = str(request.options.get("augmentation_backend", "torchvision"))
         augmentation_policy = str(request.options.get("augmentation_policy", "standard"))
         cache_mode = str(request.options.get("cache", "none"))
+        val_workers = int(request.options.get("val_workers", 0))
+        if val_workers < 0:
+            raise ValueError("val_workers must be non-negative")
         train_set = self._datasets(
             data,
             image_size,
@@ -415,7 +417,7 @@ class TimmClassificationBackend:
             False,
             augmentation_backend,
             augmentation_policy,
-            "none",
+            cache_mode,
         )
         logger.info("Dataset ready: train=%d val=%d classes=%s cache=%s", len(train_set), len(val_set), ", ".join(train_set.classes), cache_mode)
         if request.weights and not request.resume:
@@ -429,10 +431,16 @@ class TimmClassificationBackend:
         loader_generator = torch.Generator().manual_seed(request.seed)
         worker_init_fn = worker_seed if workers > 0 else None
         loader_options = training_options.data_loader_kwargs(workers)
+        val_worker_init_fn = worker_seed if val_workers > 0 else None
+        val_loader_options = (
+            training_options.data_loader_kwargs(val_workers)
+            if val_workers > 0
+            else {"num_workers": 0, "pin_memory": training_options.pin_memory}
+        )
         validation_interval = _positive_int_option(dict(request.options), "validate_every", 1)
         loader = torch.utils.data.DataLoader(train_set, batch_size=request.batch, shuffle=True, generator=loader_generator, worker_init_fn=worker_init_fn, **loader_options)
-        val_loader = torch.utils.data.DataLoader(val_set, batch_size=request.batch, shuffle=False, worker_init_fn=worker_init_fn, **loader_options)
-        logger.info("DataLoaders ready: batch=%d requested_workers=%d effective_workers=%d validate_every=%d", request.batch, requested_workers, workers, validation_interval)
+        val_loader = torch.utils.data.DataLoader(val_set, batch_size=request.batch, shuffle=False, worker_init_fn=val_worker_init_fn, **val_loader_options)
+        logger.info("DataLoaders ready: batch=%d train_workers=%d val_workers=%d validate_every=%d", request.batch, workers, val_workers, validation_interval)
         optimizer = torch.optim.AdamW(model.parameters(), lr=request.learning_rate, weight_decay=float(request.options.get("weight_decay", 0.01)))
         label_smoothing = float(request.options.get("label_smoothing", 0.0))
         if not 0.0 <= label_smoothing <= 1.0:
