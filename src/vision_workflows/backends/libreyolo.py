@@ -189,7 +189,12 @@ class LibreYoloBackend:
         artifacts = [artifact(path, "onnx") for path in paths]
         if request.data is not None:
             data = require_file(request.data, "dataset YAML")
-            values = model.val(data=str(data), split="val", device=request.device)
+            values = model.val(
+                data=str(data),
+                split="val",
+                imgsz=request.image_size,
+                device=request.device,
+            )
             metrics.update(native_validation_metrics(values))
             native_export_metrics, native_export_predictions = validate_detection_native_export(
                 exported,
