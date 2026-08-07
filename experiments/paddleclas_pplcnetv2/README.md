@@ -49,7 +49,17 @@ git clone --depth 1 --branch release/2.6 `
   https://github.com/PaddlePaddle/PaddleClas `
   experiments\paddleclas_pplcnetv2\PaddleClas
 & .\.venv-paddleclas\Scripts\python.exe -c `
-  "import paddle; print(paddle.__version__); print(paddle.device.get_device())"
+  "import paddle; print(paddle.__version__); print(paddle.device.get_device()); paddle.utils.run_check()"
+```
+
+PaddlePaddle 2.6.1 expects cuDNN 8.9 DLLs. Keep those DLLs scoped to the
+dedicated environment when running commands:
+
+```powershell
+$cuda = Join-Path $repo '.venv-paddleclas\Lib\site-packages\nvidia'
+$env:PATH = (Join-Path $cuda 'cudnn\bin') + ';' +
+  (Join-Path $cuda 'cublas\bin') + ';' +
+  (Join-Path $cuda 'cuda_nvrtc\bin') + ';' + $env:PATH
 ```
 
 If the prebuilt GPU wheel is unavailable for the selected Python/platform,

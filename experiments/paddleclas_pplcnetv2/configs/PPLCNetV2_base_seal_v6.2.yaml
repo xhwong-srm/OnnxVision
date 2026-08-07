@@ -11,6 +11,8 @@ Global:
   use_visualdl: False
   image_shape: [3, 224, 224]
   save_inference_dir: ../../../experiments/paddleclas_pplcnetv2/artifacts/inference
+
+AMP:
   use_amp: True
   use_fp16_test: False
   scale_loss: 128.0
@@ -62,7 +64,6 @@ DataLoader:
             mean: [0.485, 0.456, 0.406]
             std: [0.229, 0.224, 0.225]
             order: ''
-      is_training: True
     sampler:
       name: DistributedBatchSampler
       batch_size: 64
@@ -89,7 +90,6 @@ DataLoader:
             mean: [0.485, 0.456, 0.406]
             std: [0.229, 0.224, 0.225]
             order: ''
-      is_training: False
     sampler:
       name: DistributedBatchSampler
       batch_size: 64
@@ -115,7 +115,7 @@ Infer:
         mean: [0.485, 0.456, 0.406]
         std: [0.229, 0.224, 0.225]
         order: ''
-    - ToCHWImage: {}
+    - ToCHWImage:
   PostProcess:
     name: Topk
     topk: 2
