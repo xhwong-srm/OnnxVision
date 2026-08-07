@@ -122,3 +122,19 @@ dotnet build onnx-vision\OnnxVisionCLI.csproj -c Release --no-restore
 
 Use batch 1 for this dataset: the source crops have varying dimensions, and
 the CLI requires equal raw-image dimensions within a dynamic batch.
+
+For the batch-1 optimization experiment, simplify the fixed-shape float core
+with `onnxsim` using `[1,3,224,224]`, then wrap it with `--batch-size 1`:
+
+```powershell
+uv run --cache-dir .tmp-uv-cache --with onnxsim --extra timm python -c `
+  "import onnx; from onnxsim import simplify; model,ok=simplify('experiments/paddleclas_pplcnetv2/artifacts/pplcnetv2_seal_float-core-opset18.onnx', overwrite_input_shapes={'x':[1,3,224,224]}, check_n=3); assert ok; onnx.save(model, 'experiments/paddleclas_pplcnetv2/artifacts/pplcnetv2_seal_float-core-fixed1-simplified.onnx')"
+uv run --extra timm python experiments/paddleclas_pplcnetv2/export_contract.py `
+  --core experiments/paddleclas_pplcnetv2/artifacts/pplcnetv2_seal_float-core-fixed1-simplified.onnx `
+  --output experiments/paddleclas_pplcnetv2/artifacts/pplcnetv2_seal_float-fixed1.onnx `
+  --batch-size 1
+```
+
+The actual experiment also simplified the wrapped graph while preserving
+dynamic source height/width, using one representative raw image shape only
+for simplifier validation.
