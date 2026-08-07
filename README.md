@@ -81,6 +81,9 @@ split with the native checkpoint and both wrapped artifacts. Classification
 reports accuracy, loss, prediction agreement, and probability error; detection
 reports native provider metrics plus contract-based BW8/C24 mAP50, precision,
 recall, F1, and prediction agreement in `dataset-validation.json`.
+The export command saves its complete JSON result beside the requested output
+using the same stem (`model.onnx` produces `model.json`) and logs that path
+instead of printing the result.
 Provider-owned exports use confidence `0` and IoU `0.7`; consumer-side
 class-aware NMS runs at IoU `0.7` only when `nms_required=true`.
 LibreYOLO PicoDet exports use a family-specific embedded-NMS adapter and

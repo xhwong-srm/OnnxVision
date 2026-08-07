@@ -12,9 +12,9 @@ from vision_workflows.domain.errors import ConfigurationError
 from vision_workflows.domain.models import ModelInfo, ModelSelection, Operation, ParameterSchema, ParameterSpec, ProviderDescriptor, StaticModelCatalog
 from vision_workflows.domain.results import ArtifactRef, RunStatus
 from vision_workflows.workflows.context import optional_import
-from vision_workflows.workflows.requests import TrainRequest
+from vision_workflows.workflows.requests import ExportRequest, TrainRequest
 from vision_workflows.workflows.runs import RunStore
-from vision_workflows.workflows.services import TrainService
+from vision_workflows.workflows.services import ExportService, TrainService
 
 
 def test_registry_exposes_framework_task_plugins() -> None:
@@ -192,6 +192,33 @@ def test_train_service_records_requested_and_effective_parameters(monkeypatch: p
     assert manifest["config"]["resolved_model"]["native_id"] == "native-unit"
     assert manifest["config"]["parameters"]["requested"] == {"epochs": 1}
     assert manifest["config"]["parameters"]["effective"] == {"device": "cpu", "epochs": 1}
+
+
+def test_export_service_saves_result_json(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from vision_workflows.backends import registry
+
+    selection = ModelSelection(TaskKind.CLASSIFICATION, "fake", "unit")
+
+    def export(request, context):
+        output = context.run_dir / "model-bw8.onnx"
+        output.write_bytes(b"onnx")
+        return OperationExecution((ArtifactRef(output.name, output, "onnx"),), {"images": 2}, {"name": "contract"})
+
+    schema = ParameterSchema((ParameterSpec("device", str, "device", "auto"),))
+    plugin = FrameworkTaskPlugin(
+        ProviderDescriptor("fake", TaskKind.CLASSIFICATION, frozenset({Operation.EXPORT}), "fake"),
+        StaticModelCatalog((ModelInfo("unit", "native-unit"),)),
+        {Operation.EXPORT: OperationHandler(lambda _: schema, export)},
+    )
+    monkeypatch.setattr(registry, "_PLUGINS", (plugin,))
+
+    result = ExportService().run(ExportRequest(selection, tmp_path / "checkpoint.pt", tmp_path / "model.onnx"))
+    saved = tmp_path / "model.json"
+    payload = json.loads(saved.read_text(encoding="utf-8"))
+
+    assert payload["run"]["status"] == "succeeded"
+    assert payload["contract"] == {"name": "contract"}
+    assert payload["validation"]["metrics"] == {"images": 2}
 
 
 def test_run_store_creates_unique_immutable_run_directories(tmp_path: Path) -> None:

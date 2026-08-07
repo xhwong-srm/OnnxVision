@@ -230,7 +230,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if operation is Operation.TRAIN:
         result = TrainService().run(TrainRequest(selection, args.data, args.output, args.weights, args.resume, args.overwrite, parameters))
     elif operation is Operation.EXPORT:
-        result = ExportService().run(ExportRequest(selection, args.checkpoint, args.output, args.data, parameters))
+        ExportService().run(ExportRequest(selection, args.checkpoint, args.output, args.data, parameters))
+        return 0
     elif operation is Operation.VALIDATE:
         result = ValidationService().run(ValidateRequest(selection, args.target, args.data, args.split, parameters))
     else:
