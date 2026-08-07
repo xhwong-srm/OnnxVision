@@ -67,6 +67,9 @@ namespace OnnxVision
             public IReadOnlyList<OnnxClassification> Classify(
                 OnnxClassificationModel model, RoiPlacement roi)
             {
+                if (Images.Count == 1)
+                    return new[] { Images[0].Classify(model, roi) };
+
                 return model.ClassifyBatch(Images.Select(image => image.CreateBuffer(roi)).ToArray());
             }
 
