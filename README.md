@@ -99,17 +99,21 @@ uv run --extra timm vision-workflows train `
 ```
 
 Optuna tuning is a first-class timm classification operation. It searches
-learning rate and weight decay, reports validation accuracy each validation
-epoch for pruning, stores trial summaries in `optuna.json`, and copies the
-best trial checkpoints to the requested output. Ultralytics `tune` delegates
-to its native tuning API; LibreYOLO does not advertise tuning without a
-verified provider implementation.
+learning rate, weight decay, and label smoothing, trains with linear warmup
+followed by cosine learning-rate decay, and reports validation accuracy each
+validation epoch for pruning. The default budget is 20 trials with patience 5.
+Training and evaluation also report macro precision, macro F1, balanced
+accuracy, and per-class precision/recall/F1. Trial summaries are stored in
+`optuna.json`, and the best trial checkpoints are copied to the requested
+output. Augmentation settings remain fixed for the whole study. Ultralytics
+`tune` delegates to its native tuning API; LibreYOLO does not advertise tuning
+without a verified provider implementation.
 
 ```powershell
 uv run --extra timm --extra optuna vision-workflows tune `
   --task classification --framework timm `
   --model mobilenetv4_conv_small_050.e3000_r224_in1k `
-  --data data --output runs/timm-tune --trials 10
+  --data data --output runs/timm-tune --trials 20 --patience 5
 ```
 
 ONNX exports are self-describing. Classification artifacts use the

@@ -72,6 +72,8 @@ def _timm_train(_: ModelInfo) -> ParameterSchema:
         ParameterSpec("amp_dtype", str, "AMP data type", None, choices=("float16", "bfloat16"), allow_none=True),
         ParameterSpec("compile", bool, "compile the model with torch.compile", False),
         ParameterSpec("weight_decay", float, "AdamW weight decay", 0.01, minimum=0.0),
+        ParameterSpec("label_smoothing", float, "cross-entropy label smoothing", 0.0, minimum=0.0, maximum=1.0),
+        ParameterSpec("warmup_epochs", int, "linear learning-rate warmup epochs before cosine decay", 2, minimum=0),
         ParameterSpec("augmentation", bool, "enable random training augmentation", True),
         ParameterSpec("augmentation_backend", str, "random training augmentation backend", "torchvision", choices=("torchvision", "albumentations")),
         ParameterSpec("augmentation_policy", str, "augmentation intensity policy", "standard", choices=("standard", "robust")),
@@ -81,20 +83,24 @@ def _timm_train(_: ModelInfo) -> ParameterSchema:
 
 
 def _timm_tune(_: ModelInfo) -> ParameterSchema:
-    framework = _timm_train(_)
+    framework = ParameterSchema(tuple(
+        item for item in _timm_train(_).parameters if item.name != "label_smoothing"
+    ))
     search = _schema(
-        ParameterSpec("trials", int, "number of Optuna trials", 10, minimum=1),
+        ParameterSpec("trials", int, "number of Optuna trials", 20, minimum=1),
         ParameterSpec("learning_rate_min", float, "minimum log-scaled learning rate to search", 1e-5, minimum=0.0),
         ParameterSpec("learning_rate_max", float, "maximum log-scaled learning rate to search", 1e-2, minimum=0.0),
         ParameterSpec("weight_decay_min", float, "minimum weight decay to search", 0.0, minimum=0.0),
         ParameterSpec("weight_decay_max", float, "maximum weight decay to search", 0.1, minimum=0.0),
+        ParameterSpec("label_smoothing_min", float, "minimum label smoothing to search", 0.0, minimum=0.0, maximum=1.0),
+        ParameterSpec("label_smoothing_max", float, "maximum label smoothing to search", 0.1, minimum=0.0, maximum=1.0),
         ParameterSpec("storage", str, "optional Optuna storage URL", None, allow_none=True),
         ParameterSpec("study_name", str, "Optuna study name", "timm-classification"),
     ).with_origin(ParameterOrigin.FRAMEWORK)
     return framework.compose(
         _schema(
             ParameterSpec("epochs", int, "number of training epochs per Optuna trial", 10, minimum=1),
-            ParameterSpec("patience", int, "early-stopping patience per Optuna trial", 3, minimum=0),
+            ParameterSpec("patience", int, "early-stopping patience per Optuna trial", 5, minimum=0),
         ),
         search,
     )

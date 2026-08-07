@@ -7,8 +7,13 @@ from PIL import Image
 
 torch = pytest.importorskip("torch")
 
-from vision_workflows.backends.timm_classification import ResizedImageLoader, TimmClassificationBackend
-from vision_workflows.backends.timm_classification import Execution
+from vision_workflows.backends.timm_classification import (
+    Execution,
+    ResizedImageLoader,
+    TimmClassificationBackend,
+    _classification_metrics,
+    _create_scheduler,
+)
 from vision_workflows.workflows.context import WorkflowContext
 
 
@@ -56,7 +61,36 @@ def test_timm_classification_evaluation_reports_loss_and_counts(monkeypatch, tmp
     assert metrics["images"] == 2
     assert metrics["correct"] == 2
     assert metrics["accuracy"] == 1.0
+    assert metrics["macro_f1"] == 1.0
+    assert metrics["balanced_accuracy"] == 1.0
     assert metrics["loss"] > 0.0
+
+
+def test_classification_metrics_report_macro_and_per_class_values() -> None:
+    metrics = _classification_metrics(
+        torch.tensor([[2, 1], [0, 1]], dtype=torch.int64),
+        ["first", "second"],
+    )
+
+    assert metrics["macro_precision"] == pytest.approx(0.75)
+    assert metrics["macro_f1"] == pytest.approx((0.8 + (2 / 3)) / 2)
+    assert metrics["balanced_accuracy"] == pytest.approx((2 / 3 + 1.0) / 2)
+    assert metrics["per_class_recall"] == {"first": pytest.approx(2 / 3), "second": 1.0}
+
+
+def test_scheduler_warms_up_then_decays_cosine() -> None:
+    parameter = torch.nn.Parameter(torch.ones(()))
+    optimizer = torch.optim.SGD([parameter], lr=1.0)
+    scheduler = _create_scheduler(torch, optimizer, total_epochs=6, warmup_epochs=2)
+    learning_rates = []
+
+    for _ in range(6):
+        learning_rates.append(optimizer.param_groups[0]["lr"])
+        optimizer.step()
+        scheduler.step()
+
+    assert learning_rates[0] < learning_rates[1] < learning_rates[2]
+    assert learning_rates[-1] < learning_rates[2]
 
 
 def test_albumentations_robust_policy_adds_lighting_and_camera_variation(monkeypatch) -> None:
@@ -238,8 +272,8 @@ def test_timm_tune_uses_optuna_trials_and_copies_best_checkpoints(monkeypatch, t
             return self.best_trial.params
 
     fake_optuna = SimpleNamespace(
-        samplers=SimpleNamespace(TPESampler=lambda seed: SimpleNamespace(seed=seed)),
-        pruners=SimpleNamespace(MedianPruner=lambda: object()),
+        samplers=SimpleNamespace(TPESampler=lambda **kwargs: SimpleNamespace(**kwargs)),
+        pruners=SimpleNamespace(MedianPruner=lambda **kwargs: SimpleNamespace(**kwargs)),
         create_study=lambda **kwargs: Study(),
         TrialPruned=RuntimeError,
     )
@@ -266,6 +300,8 @@ def test_timm_tune_uses_optuna_trials_and_copies_best_checkpoints(monkeypatch, t
             "learning_rate_max": 1e-3,
             "weight_decay_min": 0.0,
             "weight_decay_max": 0.1,
+            "label_smoothing_min": 0.0,
+            "label_smoothing_max": 0.1,
             "storage": None,
             "study_name": "unit-study",
             "seed": 7,
@@ -275,6 +311,8 @@ def test_timm_tune_uses_optuna_trials_and_copies_best_checkpoints(monkeypatch, t
         learning_rate_max=1e-3,
         weight_decay_min=0.0,
         weight_decay_max=0.1,
+        label_smoothing_min=0.0,
+        label_smoothing_max=0.1,
         storage=None,
         study_name="unit-study",
         seed=7,

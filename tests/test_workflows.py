@@ -62,9 +62,12 @@ def test_timm_training_and_tuning_schemas_expose_first_class_integrations() -> N
     assert train["augmentation_policy"] == "standard"
     assert train["cache"] == "none"
     assert train["weight_decay"] == 0.01
-    assert tune["trials"] == 10
+    assert train["label_smoothing"] == 0.0
+    assert train["warmup_epochs"] == 2
+    assert tune["trials"] == 20
     assert tune["epochs"] == 10
-    assert tune["patience"] == 3
+    assert tune["patience"] == 5
+    assert tune["label_smoothing_min"] < tune["label_smoothing_max"]
     assert tune["learning_rate_min"] < tune["learning_rate_max"]
     assert tune["weight_decay_min"] < tune["weight_decay_max"]
 

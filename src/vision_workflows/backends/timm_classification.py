@@ -42,6 +42,69 @@ _DEFAULT_MEAN = (0.485, 0.456, 0.406)
 _DEFAULT_STD = (0.229, 0.224, 0.225)
 
 
+def _nonnegative_int_option(options: dict[str, Any], name: str, default: int) -> int:
+    value = options.get(name, default)
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a non-negative integer")
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a non-negative integer") from error
+    if result < 0 or str(value).strip() != str(result):
+        raise ValueError(f"{name} must be a non-negative integer")
+    return result
+
+
+def _classification_metrics(confusion, classes: list[str]) -> dict[str, Any]:
+    true_positive = confusion.diag().float()
+    support = confusion.sum(dim=1).float()
+    predicted = confusion.sum(dim=0).float()
+    precision = true_positive / predicted.clamp_min(1.0)
+    recall = true_positive / support.clamp_min(1.0)
+    f1 = 2.0 * true_positive / (support + predicted).clamp_min(1.0)
+    present = support > 0
+    if bool(present.any().item()):
+        macro_precision = float(precision[present].mean().item())
+        macro_f1 = float(f1[present].mean().item())
+        balanced_accuracy = float(recall[present].mean().item())
+    else:
+        macro_precision = macro_f1 = balanced_accuracy = 0.0
+    return {
+        "macro_precision": macro_precision,
+        "macro_f1": macro_f1,
+        "balanced_accuracy": balanced_accuracy,
+        "per_class_precision": {name: float(value) for name, value in zip(classes, precision.tolist())},
+        "per_class_recall": {name: float(value) for name, value in zip(classes, recall.tolist())},
+        "per_class_f1": {name: float(value) for name, value in zip(classes, f1.tolist())},
+    }
+
+
+def _create_scheduler(torch, optimizer, total_epochs: int, warmup_epochs: int):
+    if total_epochs < 1:
+        raise ValueError("epochs must be at least 1")
+    if not 0 <= warmup_epochs < total_epochs:
+        raise ValueError("warmup_epochs must be at least 0 and less than epochs")
+    cosine_epochs = max(1, total_epochs - warmup_epochs)
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=cosine_epochs,
+        eta_min=0.0,
+    )
+    if warmup_epochs == 0:
+        return cosine
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=0.1,
+        end_factor=1.0,
+        total_iters=warmup_epochs,
+    )
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[warmup_epochs],
+    )
+
+
 class AlbumentationsAugmentation:
     """Pickleable ImageFolder transform for Windows DataLoader workers."""
 
@@ -371,7 +434,12 @@ class TimmClassificationBackend:
         val_loader = torch.utils.data.DataLoader(val_set, batch_size=request.batch, shuffle=False, worker_init_fn=worker_init_fn, **loader_options)
         logger.info("DataLoaders ready: batch=%d requested_workers=%d effective_workers=%d validate_every=%d", request.batch, requested_workers, workers, validation_interval)
         optimizer = torch.optim.AdamW(model.parameters(), lr=request.learning_rate, weight_decay=float(request.options.get("weight_decay", 0.01)))
-        criterion = torch.nn.CrossEntropyLoss()
+        label_smoothing = float(request.options.get("label_smoothing", 0.0))
+        if not 0.0 <= label_smoothing <= 1.0:
+            raise ValueError("label_smoothing must be between 0 and 1")
+        warmup_epochs = _nonnegative_int_option(dict(request.options), "warmup_epochs", 2)
+        scheduler = _create_scheduler(torch, optimizer, request.epochs, warmup_epochs)
+        criterion = torch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         scaler = training_options.grad_scaler(torch, device)
         start_epoch = 1
         best_accuracy = -1.0
@@ -403,6 +471,8 @@ class TimmClassificationBackend:
                 logger.warning("Resume checkpoint has no RNG state; continuation is not bitwise identical")
             if scaler is not None and resume_state.get("scaler_state_dict") is not None:
                 scaler.load_state_dict(resume_state["scaler_state_dict"])
+            if resume_state.get("scheduler_state_dict") is not None:
+                scheduler.load_state_dict(resume_state["scheduler_state_dict"])
             logger.info("Resume state: start_epoch=%d best_epoch=%d best_val_accuracy=%.4f stale_epochs=%d", start_epoch, best_epoch, best_accuracy, stale_epochs)
         training_model = model
         if training_options.compile:
@@ -439,10 +509,16 @@ class TimmClassificationBackend:
             train_accuracy = float(train_correct.item()) / train_samples
             training_model.eval()
             validate = epoch == start_epoch or epoch == request.epochs or (epoch - start_epoch) % validation_interval == 0
+            val_classification = None
             if validate:
                 correct = torch.zeros((), device=device, dtype=torch.int64)
                 total = torch.zeros((), device=device, dtype=torch.int64)
                 val_loss_total = torch.zeros((), device=device, dtype=torch.float32)
+                val_confusion = torch.zeros(
+                    (len(train_set.classes), len(train_set.classes)),
+                    device=device,
+                    dtype=torch.int64,
+                )
                 with torch.inference_mode():
                     with tqdm(val_loader, desc=f"Epoch {epoch}/{request.epochs} val", unit="batch", leave=False) as progress:
                         for images, labels in progress:
@@ -455,9 +531,17 @@ class TimmClassificationBackend:
                             val_loss_total.add_(loss.float() * labels.numel())
                             correct.add_((predictions == labels).sum())
                             total.add_(labels.numel())
+                            indices = labels * len(train_set.classes) + predictions
+                            val_confusion.add_(
+                                torch.bincount(
+                                    indices,
+                                    minlength=len(train_set.classes) ** 2,
+                                ).reshape(len(train_set.classes), len(train_set.classes))
+                            )
                 val_samples = max(1, int(total.item()))
                 val_loss = float(val_loss_total.item()) / val_samples
                 val_accuracy = float(correct.item()) / val_samples
+                val_classification = _classification_metrics(val_confusion, train_set.classes)
             else:
                 val_loss = None
                 val_accuracy = None
@@ -467,6 +551,10 @@ class TimmClassificationBackend:
                 "train_accuracy": train_accuracy,
                 "val_loss": val_loss,
                 "val_accuracy": val_accuracy,
+                "val_macro_precision": val_classification["macro_precision"] if val_classification else None,
+                "val_macro_f1": val_classification["macro_f1"] if val_classification else None,
+                "val_balanced_accuracy": val_classification["balanced_accuracy"] if val_classification else None,
+                "val_per_class_recall": val_classification["per_class_recall"] if val_classification else None,
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
                 "validated": validate,
             }
@@ -483,6 +571,7 @@ class TimmClassificationBackend:
                 stale_epochs = 0
             elif validate:
                 stale_epochs += 1
+            scheduler.step()
             payload = {
                 "task": "classification", "model_name": request.model.variant, "classes": train_set.classes,
                 "data_config": {
@@ -495,6 +584,13 @@ class TimmClassificationBackend:
                     "cache_mode": cache_mode,
                 },
                 "epoch": epoch, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "training_config": {
+                    "optimizer": "AdamW",
+                    "label_smoothing": label_smoothing,
+                    "scheduler": "cosine",
+                    "warmup_epochs": warmup_epochs,
+                },
                 "metrics": row, "best_accuracy": best_accuracy, "best_epoch": best_epoch,
                 "stale_epochs": stale_epochs, "history": history, "rng_state": capture_rng_state(torch, loader_generator),
                 "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
@@ -532,11 +628,19 @@ class TimmClassificationBackend:
             "history": history,
             "best_val_accuracy": best_accuracy,
             "best_val_loss": best_metrics.get("val_loss"),
+            "best_val_macro_precision": best_metrics.get("val_macro_precision"),
+            "best_val_macro_f1": best_metrics.get("val_macro_f1"),
+            "best_val_balanced_accuracy": best_metrics.get("val_balanced_accuracy"),
+            "best_val_per_class_recall": best_metrics.get("val_per_class_recall"),
             "best_epoch": best_epoch,
             "last_train_loss": last_metrics.get("train_loss"),
             "last_train_accuracy": last_metrics.get("train_accuracy"),
             "last_val_loss": last_metrics.get("val_loss"),
             "last_val_accuracy": last_metrics.get("val_accuracy"),
+            "last_val_macro_precision": last_metrics.get("val_macro_precision"),
+            "last_val_macro_f1": last_metrics.get("val_macro_f1"),
+            "last_val_balanced_accuracy": last_metrics.get("val_balanced_accuracy"),
+            "last_val_per_class_recall": last_metrics.get("val_per_class_recall"),
             "epochs": completed_epochs,
             "stopped_early": stopped_early,
             "image_size": image_size,
@@ -554,16 +658,27 @@ class TimmClassificationBackend:
         learning_rate_max = float(request.learning_rate_max)
         weight_decay_min = float(request.weight_decay_min)
         weight_decay_max = float(request.weight_decay_max)
+        label_smoothing_min = float(request.label_smoothing_min)
+        label_smoothing_max = float(request.label_smoothing_max)
         if not 0.0 < learning_rate_min < learning_rate_max:
             raise ValueError("learning_rate_min must be less than learning_rate_max and greater than zero")
         if not 0.0 <= weight_decay_min < weight_decay_max:
             raise ValueError("weight_decay_min must be less than weight_decay_max")
+        if not 0.0 <= label_smoothing_min < label_smoothing_max <= 1.0:
+            raise ValueError("label_smoothing_min must be less than label_smoothing_max and both must be between 0 and 1")
 
-        sampler = optuna.samplers.TPESampler(seed=int(request.seed))
+        startup_trials = min(5, max(1, int(request.trials) // 4))
+        sampler = optuna.samplers.TPESampler(
+            seed=int(request.seed),
+            n_startup_trials=startup_trials,
+        )
         study = optuna.create_study(
             direction="maximize",
             sampler=sampler,
-            pruner=optuna.pruners.MedianPruner(),
+            pruner=optuna.pruners.MedianPruner(
+                n_startup_trials=startup_trials,
+                n_warmup_steps=1,
+            ),
             storage=request.storage,
             study_name=request.study_name,
             load_if_exists=request.storage is not None,
@@ -577,6 +692,9 @@ class TimmClassificationBackend:
             )
             trial_options["weight_decay"] = trial.suggest_float(
                 "weight_decay", weight_decay_min, weight_decay_max
+            )
+            trial_options["label_smoothing"] = trial.suggest_float(
+                "label_smoothing", label_smoothing_min, label_smoothing_max
             )
             trial_dir = context.run_dir / f"trial-{trial.number:04d}"
             trial_dir.mkdir(parents=True, exist_ok=True)
@@ -835,6 +953,11 @@ class TimmClassificationBackend:
         criterion = torch.nn.CrossEntropyLoss()
         loss_total = 0.0
         correct = total = 0
+        confusion = torch.zeros(
+            (len(classes), len(classes)),
+            device=device,
+            dtype=torch.int64,
+        )
         probabilities: list[Any] = []
         collected_labels: list[Any] = []
         with torch.inference_mode():
@@ -843,22 +966,38 @@ class TimmClassificationBackend:
                 logits = model(images.to(device))
                 batch_probabilities = torch.softmax(logits, dim=1)
                 loss_total += float(criterion(logits, labels).item()) * len(labels)
-                correct += int((logits.argmax(1) == labels).sum())
+                predictions = logits.argmax(1)
+                correct += int((predictions == labels).sum())
                 total += len(labels)
+                indices = labels * len(classes) + predictions
+                confusion.add_(
+                    torch.bincount(
+                        indices,
+                        minlength=len(classes) ** 2,
+                    ).reshape(len(classes), len(classes))
+                )
                 probabilities.append(batch_probabilities.detach().cpu())
                 collected_labels.append(labels.detach().cpu())
         native_probabilities = torch.cat(probabilities).numpy()
         collected_labels_array = torch.cat(collected_labels).numpy()
+        classification = _classification_metrics(confusion, classes)
         metrics = {
             "split": split,
             "loss": loss_total / max(1, total),
             "accuracy": correct / max(1, total),
             "correct": correct,
             "images": total,
+            **classification,
             "native_accuracy": correct / max(1, total),
             "native_loss": loss_total / max(1, total),
             "native_correct": correct,
             "native_images": total,
+            "native_macro_precision": classification["macro_precision"],
+            "native_macro_f1": classification["macro_f1"],
+            "native_balanced_accuracy": classification["balanced_accuracy"],
+            "native_per_class_precision": classification["per_class_precision"],
+            "native_per_class_recall": classification["per_class_recall"],
+            "native_per_class_f1": classification["per_class_f1"],
         }
         logger.info(
             "Evaluation complete: split=%s images=%d loss=%.6f accuracy=%.4f correct=%d",
