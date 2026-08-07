@@ -224,7 +224,10 @@ def test_export_service_saves_result_json(monkeypatch: pytest.MonkeyPatch, tmp_p
 
     assert payload["run"]["status"] == "succeeded"
     assert payload["contract"] == {"name": "contract"}
-    assert payload["validation"]["metrics"] == {"images": 2}
+    assert payload["run"]["artifacts"][0]["name"] == "model-bw8.onnx"
+    assert payload["run"]["metrics"] == {"images": 2}
+    assert payload["validation"] == {"checks": []}
+    assert "artifacts" not in payload
 
 
 def test_run_store_creates_unique_immutable_run_directories(tmp_path: Path) -> None:

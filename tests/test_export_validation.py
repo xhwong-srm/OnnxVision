@@ -30,6 +30,25 @@ class _Session:
         return [np.tile(np.asarray([[0.9, 0.1]], dtype=np.float32), (batch, 1))]
 
 
+def test_native_validation_metrics_use_one_normalized_namespace() -> None:
+    metrics = validation.native_validation_metrics({
+        "metrics/precision(B)": 0.8,
+        "metrics/recall(B)": 0.7,
+        "metrics/mAP50(B)": 0.9,
+        "metrics/mAP50-95(B)": 0.6,
+    })
+
+    assert metrics == {
+        "native": {
+            "precision": 0.8,
+            "recall": 0.7,
+            "map50": 0.9,
+            "map50_95": 0.6,
+            "metric_count": 4,
+        }
+    }
+
+
 def test_classification_wrappers_report_accuracy_and_agreement(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     validation_root = tmp_path / "val"
     for class_name in ("first", "second"):

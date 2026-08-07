@@ -140,7 +140,7 @@ class ExportService:
             context.emit("run_failed", {"error": error})
             raise ValidationFailedError(f"{error}; report: {context.run_dir / 'manifest.json'}")
         run = store.finish(run_id, "export", config, status=RunStatus.SUCCEEDED, artifacts=execution.artifacts, metrics=dict(execution.metrics))
-        result = ExportResult(run, execution.artifacts, dict(execution.contract), {"checks": execution.checks, "metrics": dict(execution.metrics)})
+        result = ExportResult(run, dict(execution.contract), {"checks": execution.checks})
         result_path = request.output.expanduser().absolute().with_suffix(".json")
         result_path.parent.mkdir(parents=True, exist_ok=True)
         result_path.write_text(json.dumps(asdict(result), indent=2, default=str) + "\n", encoding="utf-8")

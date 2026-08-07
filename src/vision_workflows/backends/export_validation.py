@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -12,26 +13,19 @@ _IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 def native_validation_metrics(values: Any) -> dict[str, Any]:
     raw = values.get("metrics", values) if isinstance(values, dict) else getattr(values, "results_dict", {})
     if not isinstance(raw, dict):
-        return {"native_metric_count": 0}
-    result: dict[str, Any] = {}
+        return {"native": {"metric_count": 0}}
+    native: dict[str, Any] = {}
     for key, value in raw.items():
         scalar = value.item() if hasattr(value, "item") else value
         if not isinstance(scalar, (int, float)):
             continue
-        result[f"native_{key}"] = scalar
-        normalized = str(key).casefold().replace("_", "-")
-        if "map50-95" in normalized:
-            result.setdefault("native_map50_95", scalar)
-        elif "map50" in normalized:
-            result.setdefault("native_map50", scalar)
-        if "precision" in normalized:
-            result.setdefault("native_precision", scalar)
-        if "recall" in normalized:
-            result.setdefault("native_recall", scalar)
-        if "accuracy" in normalized:
-            result.setdefault("native_accuracy", scalar)
-    result["native_metric_count"] = len(raw)
-    return result
+        name = str(key).rsplit("/", 1)[-1]
+        name = re.sub(r"\([^)]*\)$", "", name)
+        name = re.sub(r"[^a-zA-Z0-9]+", "_", name).strip("_").casefold()
+        if name:
+            native[name] = scalar
+    native["metric_count"] = len(raw)
+    return {"native": native}
 
 
 def validate_classification_wrappers(

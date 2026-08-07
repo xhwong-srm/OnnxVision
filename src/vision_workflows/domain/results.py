@@ -73,7 +73,6 @@ class TrainResult:
 @dataclass(frozen=True)
 class ExportResult:
     run: RunManifest
-    artifacts: tuple[ArtifactRef, ...]
     contract: dict[str, Any]
     validation: dict[str, Any]
 
