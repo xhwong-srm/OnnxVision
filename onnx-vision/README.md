@@ -27,8 +27,8 @@ onnx-vision/
 
 Use only one shared-project variant per consumer:
 
-- Existing `lead-2000` Vision Studio projects should reference `OnnxVision.csproj`.
-- New SDK-style projects and `OnnxVisionCLI` should reference `OnnxVision.Sdk.csproj`.
+- Existing `lead-2000` Vision Studio projects and `OnnxVisionCLI` should reference `OnnxVision.csproj`.
+- New SDK-style consumers may reference `OnnxVision.Sdk.csproj`.
 - Do not reference both variants from the same application.
 
 Both variants intentionally produce the `OnnxVision` assembly and contain the same source/API surface. Their outputs are separated to prevent build collisions.
@@ -42,15 +42,16 @@ Both variants intentionally produce the `OnnxVision` assembly and contain the sa
   `C:\VisionRef64\Open_eVision_NetApi_22_12.dll`
 - NuGet restore access to `Intel.ML.OnnxRuntime.OpenVino` version `1.24.1`.
 
-The Intel OpenVINO package supplies the managed ONNX Runtime dependency transitively to the SDK-style build. The legacy project includes an assembly hint to the same package version because old-style MSBuild does not expose that transitive compile reference reliably. The projects copy the package's `win-x64` native OpenVINO/ONNX Runtime DLLs to their output directories.
+The Intel OpenVINO package supplies the managed ONNX Runtime dependency transitively. Visual Studio MSBuild resolves that dependency for the legacy project, so no separate Microsoft ONNX Runtime assembly reference is required. The projects copy the package's `win-x64` native OpenVINO/ONNX Runtime DLLs to their output directories.
 
 ## Build
 
-From the repository root, restore and build the CLI:
+From the repository root, restore and build the CLI with Visual Studio MSBuild:
 
 ```powershell
-dotnet restore .\onnx-vision\OnnxVisionCLI.csproj
-dotnet build .\onnx-vision\OnnxVisionCLI.csproj -c Release --no-restore --nologo
+$msbuild = "C:\Program Files (x86)\Microsoft Visual Studio\2019\Professional\MSBuild\Current\Bin\MSBuild.exe"
+& $msbuild .\onnx-vision\OnnxVisionCLI.csproj /t:Restore /p:Configuration=Release /p:Platform=AnyCPU /m /nologo
+& $msbuild .\onnx-vision\OnnxVisionCLI.csproj /t:Rebuild /p:Configuration=Release /p:Platform=AnyCPU /m /nologo
 ```
 
 Build the SDK-style shared library directly:

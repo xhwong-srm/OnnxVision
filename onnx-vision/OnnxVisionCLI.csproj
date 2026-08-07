@@ -22,7 +22,7 @@
     <Compile Include="Imaging\Program.ImageLoading.cs" />
     <Compile Include="Reporting\Program.Reporting.cs" />
     <Compile Include="Reporting\Program.RocPoint.cs" />
-    <ProjectReference Include="OnnxVision\OnnxVision.Sdk.csproj" />
+    <ProjectReference Include="OnnxVision\OnnxVision.csproj" />
     <Reference Include="Open_eVision_NetApi_22_12">
       <HintPath>C:\VisionRef64\Open_eVision_NetApi_22_12.dll</HintPath>
       <Private>true</Private>

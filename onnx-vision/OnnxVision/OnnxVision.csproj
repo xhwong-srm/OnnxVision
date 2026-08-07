@@ -65,10 +65,6 @@
       <HintPath>$(UserProfile)\.nuget\packages\system.memory\4.5.5\lib\net461\System.Memory.dll</HintPath>
       <Private>True</Private>
     </Reference>
-    <Reference Include="Microsoft.ML.OnnxRuntime">
-      <HintPath>$(UserProfile)\.nuget\packages\microsoft.ml.onnxruntime.managed\1.24.1\lib\netstandard2.0\Microsoft.ML.OnnxRuntime.dll</HintPath>
-      <Private>True</Private>
-    </Reference>
     <Reference Include="Open_eVision_NetApi_22_12">
       <HintPath>C:\VisionRef64\Open_eVision_NetApi_22_12.dll</HintPath>
       <Private>False</Private>
