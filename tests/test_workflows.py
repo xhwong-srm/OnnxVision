@@ -57,7 +57,9 @@ def test_timm_training_and_tuning_schemas_expose_first_class_integrations() -> N
 
     train = plugin.handlers[Operation.TRAIN].schema(model).resolve({}, context)
     tune = plugin.handlers[Operation.TUNE].schema(model).resolve({}, context)
-    assert train["augmentation"] == "torchvision"
+    assert train["augmentation"] is True
+    assert train["augmentation_backend"] == "torchvision"
+    assert train["augmentation_policy"] == "standard"
     assert train["weight_decay"] == 0.01
     assert tune["trials"] == 10
     assert tune["epochs"] == 10

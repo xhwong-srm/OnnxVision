@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from PIL import Image
+
 from ..domain.results import ArtifactRef
 from ..workflows.context import WorkflowContext, optional_import
 from ..workflows.requests import ResolvedExportRequest, ResolvedTestRequest, ResolvedTrainRequest, ResolvedTuneRequest, ResolvedValidateRequest
@@ -74,16 +76,32 @@ class TimmClassificationBackend:
         return timm, torch, torchvision
 
     @staticmethod
-    def _albumentations_transform(image_size: int, train: bool, mean: tuple[float, ...], std: tuple[float, ...], torch):
+    def _albumentations_augmentation(train: bool, enabled: bool, policy: str):
+        if not train or not enabled:
+            return None
+        if policy not in {"standard", "robust"}:
+            raise ValueError(f"unsupported augmentation policy: {policy}")
         albumentations = optional_import("albumentations")
         numpy = optional_import("numpy")
-        operations = [albumentations.Resize(height=image_size, width=image_size)]
-        if train:
+        operations = [
+            albumentations.HorizontalFlip(p=0.5),
+            albumentations.Rotate(limit=5, p=0.5),
+        ]
+        if policy == "robust":
             operations.extend([
-                albumentations.HorizontalFlip(p=0.5),
-                albumentations.Rotate(limit=5, p=0.5),
+                albumentations.RandomBrightnessContrast(
+                    brightness_limit=0.2,
+                    contrast_limit=0.2,
+                    p=0.55,
+                ),
+                albumentations.RandomGamma(gamma_limit=(80, 120), p=0.25),
+                albumentations.GaussNoise(std_range=(0.01, 0.03), p=0.15),
+                albumentations.GaussianBlur(
+                    blur_limit=(3, 5),
+                    sigma_limit=(0.1, 1.2),
+                    p=0.1,
+                ),
             ])
-        operations.append(albumentations.Normalize(mean=mean, std=std))
         pipeline = albumentations.Compose(operations)
 
         def transform(image):
@@ -91,11 +109,7 @@ class TimmClassificationBackend:
                 image = image.convert("RGB")
             array = numpy.asarray(image)
             result = pipeline(image=array)["image"]
-            if result.ndim == 2:
-                result = result[..., None]
-            if result.shape[-1] == 1:
-                result = numpy.repeat(result, 3, axis=-1)
-            return torch.from_numpy(numpy.ascontiguousarray(result, dtype=numpy.float32)).permute(2, 0, 1)
+            return Image.fromarray(numpy.ascontiguousarray(result))
 
         return transform
 
@@ -106,24 +120,27 @@ class TimmClassificationBackend:
         train: bool,
         mean: tuple[float, ...] = _DEFAULT_MEAN,
         std: tuple[float, ...] = _DEFAULT_STD,
-        augmentation: str = "torchvision",
+        augmentation_enabled: bool = True,
+        augmentation_backend: str = "torchvision",
+        augmentation_policy: str = "standard",
     ):
         _, torch, torchvision = TimmClassificationBackend._imports()
-        if augmentation == "albumentations":
-            transform = TimmClassificationBackend._albumentations_transform(image_size, train, mean, std, torch)
-        elif augmentation == "torchvision":
-            transform = None
-        else:
-            raise ValueError(f"unsupported augmentation backend: {augmentation}")
-        if transform is not None:
-            root = data / ("train" if train else "val")
-            if not root.is_dir():
-                raise FileNotFoundError(f"classification split does not exist: {root}")
-            return torchvision.datasets.ImageFolder(str(root), transform=transform)
+        if augmentation_backend not in {"torchvision", "albumentations"}:
+            raise ValueError(f"unsupported augmentation backend: {augmentation_backend}")
+        if augmentation_policy not in {"standard", "robust"}:
+            raise ValueError(f"unsupported augmentation policy: {augmentation_policy}")
         transforms = torchvision.transforms
         operations = [transforms.Resize((image_size, image_size))]
-        if train:
-            operations.extend([transforms.RandomHorizontalFlip(), transforms.RandomRotation(5)])
+        if train and augmentation_enabled:
+            if augmentation_backend == "albumentations":
+                operations.insert(0, TimmClassificationBackend._albumentations_augmentation(True, True, augmentation_policy))
+            else:
+                operations.extend([transforms.RandomHorizontalFlip(), transforms.RandomRotation(5)])
+                if augmentation_policy == "robust":
+                    operations.extend([
+                        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.02),
+                        transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.2))], p=0.1),
+                    ])
         operations.extend([transforms.ToTensor(), transforms.Normalize(mean, std)])
         transform = transforms.Compose(operations)
         root = data / ("train" if train else "val")
@@ -195,9 +212,29 @@ class TimmClassificationBackend:
         mean = tuple(float(value) for value in model_data_config.get("mean", _DEFAULT_MEAN))
         std = tuple(float(value) for value in model_data_config.get("std", _DEFAULT_STD))
         logger.info("Effective image size: %d (requested=%s, model_suggested=%s)", image_size, request.image_size, input_size[-1])
-        augmentation = str(request.options.get("augmentation", "torchvision"))
-        train_set = self._datasets(data, image_size, True, mean, std, augmentation)
-        val_set = self._datasets(data, image_size, False, mean, std, augmentation)
+        augmentation_enabled = bool(request.options.get("augmentation", True))
+        augmentation_backend = str(request.options.get("augmentation_backend", "torchvision"))
+        augmentation_policy = str(request.options.get("augmentation_policy", "standard"))
+        train_set = self._datasets(
+            data,
+            image_size,
+            True,
+            mean,
+            std,
+            augmentation_enabled,
+            augmentation_backend,
+            augmentation_policy,
+        )
+        val_set = self._datasets(
+            data,
+            image_size,
+            False,
+            mean,
+            std,
+            False,
+            augmentation_backend,
+            augmentation_policy,
+        )
         logger.info("Dataset ready: train=%d val=%d classes=%s", len(train_set), len(val_set), ", ".join(train_set.classes))
         if request.weights and not request.resume:
             logger.info("Loading custom weights from %s", request.weights)
@@ -329,7 +366,14 @@ class TimmClassificationBackend:
                 stale_epochs += 1
             payload = {
                 "task": "classification", "model_name": request.model.variant, "classes": train_set.classes,
-                "data_config": {"input_size": [3, image_size, image_size], "mean": list(mean), "std": list(std), "augmentation": augmentation},
+                "data_config": {
+                    "input_size": [3, image_size, image_size],
+                    "mean": list(mean),
+                    "std": list(std),
+                    "augmentation_enabled": augmentation_enabled,
+                    "augmentation_backend": augmentation_backend,
+                    "augmentation_policy": augmentation_policy,
+                },
                 "epoch": epoch, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(),
                 "metrics": row, "best_accuracy": best_accuracy, "best_epoch": best_epoch,
                 "stale_epochs": stale_epochs, "history": history, "rng_state": capture_rng_state(torch, loader_generator),
@@ -652,14 +696,11 @@ class TimmClassificationBackend:
         size = int(image_size or data_config.get("input_size", [3, 224, 224])[-1])
         mean = tuple(float(item) for item in data_config.get("mean", _DEFAULT_MEAN))
         std = tuple(float(item) for item in data_config.get("std", _DEFAULT_STD))
-        if data_config.get("augmentation", "torchvision") == "albumentations":
-            transform_ops = self._albumentations_transform(size, False, mean, std, torch)
-        else:
-            transform_ops = torchvision.transforms.Compose([
-                torchvision.transforms.Resize((size,) * 2),
-                torchvision.transforms.ToTensor(),
-                torchvision.transforms.Normalize(mean, std),
-            ])
+        transform_ops = torchvision.transforms.Compose([
+            torchvision.transforms.Resize((size,) * 2),
+            torchvision.transforms.ToTensor(),
+            torchvision.transforms.Normalize(mean, std),
+        ])
         dataset = torchvision.datasets.ImageFolder(str(data / split), transform=transform_ops)
         if dataset.classes != classes:
             raise ValueError("dataset classes differ from checkpoint classes")

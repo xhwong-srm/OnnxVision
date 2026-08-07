@@ -72,7 +72,9 @@ def _timm_train(_: ModelInfo) -> ParameterSchema:
         ParameterSpec("amp_dtype", str, "AMP data type", None, choices=("float16", "bfloat16"), allow_none=True),
         ParameterSpec("compile", bool, "compile the model with torch.compile", False),
         ParameterSpec("weight_decay", float, "AdamW weight decay", 0.01, minimum=0.0),
-        ParameterSpec("augmentation", str, "training image augmentation backend", "torchvision", choices=("torchvision", "albumentations")),
+        ParameterSpec("augmentation", bool, "enable random training augmentation", True),
+        ParameterSpec("augmentation_backend", str, "random training augmentation backend", "torchvision", choices=("torchvision", "albumentations")),
+        ParameterSpec("augmentation_policy", str, "augmentation intensity policy", "standard", choices=("standard", "robust")),
     ).with_origin(ParameterOrigin.FRAMEWORK)
     return _training(None).compose(framework)
 

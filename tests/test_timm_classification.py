@@ -58,18 +58,28 @@ def test_timm_classification_evaluation_reports_loss_and_counts(monkeypatch, tmp
     assert metrics["loss"] > 0.0
 
 
-def test_albumentations_transform_returns_normalized_chw_tensor(monkeypatch) -> None:
+def test_albumentations_robust_policy_adds_lighting_and_camera_variation(monkeypatch) -> None:
     numpy = pytest.importorskip("numpy")
+    created: list[str] = []
 
     class FakePipeline:
         def __call__(self, *, image):
-            return {"image": image.astype(numpy.float32) / 255.0}
+            return {"image": image}
+
+    def operation(name):
+        def factory(**kwargs):
+            created.append(name)
+            return (name, kwargs)
+
+        return factory
 
     fake_albumentations = SimpleNamespace(
-        Resize=lambda **kwargs: kwargs,
-        HorizontalFlip=lambda **kwargs: kwargs,
-        Rotate=lambda **kwargs: kwargs,
-        Normalize=lambda **kwargs: kwargs,
+        HorizontalFlip=operation("HorizontalFlip"),
+        Rotate=operation("Rotate"),
+        RandomBrightnessContrast=operation("RandomBrightnessContrast"),
+        RandomGamma=operation("RandomGamma"),
+        GaussNoise=operation("GaussNoise"),
+        GaussianBlur=operation("GaussianBlur"),
         Compose=lambda operations: FakePipeline(),
     )
     import vision_workflows.backends.timm_classification as integration
@@ -79,11 +89,18 @@ def test_albumentations_transform_returns_normalized_chw_tensor(monkeypatch) -> 
         "optional_import",
         lambda name: fake_albumentations if name == "albumentations" else numpy,
     )
-    transform = TimmClassificationBackend._albumentations_transform(2, True, (0.5,) * 3, (0.5,) * 3, torch)
+    transform = TimmClassificationBackend._albumentations_augmentation(True, True, "robust")
     output = transform(numpy.zeros((2, 2, 3), dtype=numpy.uint8))
 
-    assert tuple(output.shape) == (3, 2, 2)
-    assert output.dtype is torch.float32
+    assert output.size == (2, 2)
+    assert created == [
+        "HorizontalFlip",
+        "Rotate",
+        "RandomBrightnessContrast",
+        "RandomGamma",
+        "GaussNoise",
+        "GaussianBlur",
+    ]
 
 
 def test_timm_tune_uses_optuna_trials_and_copies_best_checkpoints(monkeypatch, tmp_path) -> None:

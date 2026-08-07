@@ -67,11 +67,25 @@ uv run vision-workflows train --task classification --framework timm --model mob
 The same settings can be supplied through `TrainRequest.parameters` when using
 the Python API. Unknown parameters are rejected before a run starts.
 
-Timm classification accepts `--augmentation albumentations` for an
-Albumentations `Compose` pipeline. The selected preprocessing backend, image
-size, mean, and standard deviation are stored in the checkpoint and reused by
-evaluation. Ultralytics and LibreYOLO retain their provider-native
-augmentation controls.
+Timm classification separates deterministic preprocessing from random
+augmentation. Augmentation is enabled by default with the existing standard
+flip/rotation policy. Select Albumentations and the stronger lighting/camera
+policy explicitly when desired:
+
+```powershell
+uv run --extra timm --extra albumentations vision-workflows train `
+  --task classification --framework timm `
+  --model mobilenetv4_conv_small_050.e3000_r224_in1k `
+  --data data --output runs/timm-robust `
+  --augmentation-backend albumentations --augmentation-policy robust
+```
+
+Use `--no-augmentation` to disable random transforms. The robust policy adds
+moderate brightness/contrast, gamma, sensor-noise, and blur variation while
+keeping small flips and rotations. Resize, tensor conversion, and
+normalization are always applied as common preprocessing. Validation and
+evaluation never apply random augmentation. Ultralytics and LibreYOLO retain
+their provider-native augmentation controls.
 
 Optuna tuning is a first-class timm classification operation. It searches
 learning rate and weight decay, reports validation accuracy each validation

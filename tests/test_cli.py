@@ -72,14 +72,26 @@ def test_cli_exposes_timm_albumentations_and_optuna_tuning() -> None:
     argv = [
         "tune", "--task", "classification", "--framework", "timm",
         "--model", "mobilenetv4_conv_small_050.e3000_r224_in1k", "--data", "data", "--output", "run",
-        "--augmentation", "albumentations", "--trials", "3", "--learning-rate-min", "0.00001",
+        "--augmentation-backend", "albumentations", "--augmentation-policy", "robust", "--augmentation",
+        "--trials", "3", "--learning-rate-min", "0.00001",
         "--learning-rate-max", "0.001",
     ]
     args = _parse(argv)
-    assert args.augmentation == "albumentations"
+    assert args.augmentation is True
+    assert args.augmentation_backend == "albumentations"
+    assert args.augmentation_policy == "robust"
     assert args.trials == 3
     assert args.learning_rate_min == 0.00001
     assert args.learning_rate_max == 0.001
+
+
+def test_cli_can_disable_timm_augmentation() -> None:
+    argv = [
+        "train", "--task", "classification", "--framework", "timm",
+        "--model", "mobilenetv4_conv_small_050.e3000_r224_in1k", "--data", "data", "--output", "run",
+        "--no-augmentation",
+    ]
+    assert _parse(argv).augmentation is False
 
 
 def test_cli_accepts_timm_pretrained_configuration_name() -> None:
