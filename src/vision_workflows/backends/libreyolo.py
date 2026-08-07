@@ -191,7 +191,7 @@ class LibreYoloBackend:
             data = require_file(request.data, "dataset YAML")
             values = model.val(data=str(data), split="val", device=request.device)
             metrics.update(native_validation_metrics(values))
-            metrics.update(validate_detection_native_export(
+            native_export_metrics, native_export_predictions = validate_detection_native_export(
                 exported,
                 data,
                 class_count=len(names),
@@ -202,13 +202,15 @@ class LibreYoloBackend:
                 pixel_scale=pixel_scale,
                 resize_mode=resize_mode,
                 resize_antialias=resize_antialias,
-            ))
+            )
+            metrics.update(native_export_metrics)
             metrics.update(validate_detection_wrappers(
                 outputs,
                 data,
                 class_count=len(names),
                 image_size=request.image_size,
                 batch_size=request.batch_size,
+                reference_predictions=native_export_predictions,
             ))
             report = context.write_json("dataset-validation.json", metrics)
             artifacts.append(artifact(report, "report"))

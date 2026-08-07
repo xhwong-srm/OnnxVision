@@ -201,7 +201,7 @@ class UltralyticsBackend:
                     reference_name="native_export",
                 ))
             else:
-                metrics.update(validate_detection_native_export(
+                native_export_metrics, native_export_predictions = validate_detection_native_export(
                     exported,
                     data,
                     class_count=len(names),
@@ -212,13 +212,15 @@ class UltralyticsBackend:
                     pixel_scale=255.0,
                     resize_mode="letterbox",
                     resize_antialias=False,
-                ))
+                )
+                metrics.update(native_export_metrics)
                 metrics.update(validate_detection_wrappers(
                     outputs,
                     data,
                     class_count=len(names),
                     image_size=request.image_size,
                     batch_size=request.batch_size,
+                    reference_predictions=native_export_predictions,
                 ))
             report = context.write_json("dataset-validation.json", metrics)
             artifacts.append(artifact(report, "report"))

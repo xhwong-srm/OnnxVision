@@ -150,7 +150,7 @@ def test_detection_wrappers_report_map_and_variant_agreement(monkeypatch: pytest
     assert metrics["c24"]["map50_95"] == pytest.approx(0.995)
     assert metrics["bw8_c24_agreement50"] == pytest.approx(1.0)
 
-    native_export = validation.validate_detection_native_export(
+    native_export, native_predictions = validation.validate_detection_native_export(
         tmp_path / "model-core.onnx",
         data_yaml,
         class_count=1,
@@ -163,6 +163,36 @@ def test_detection_wrappers_report_map_and_variant_agreement(monkeypatch: pytest
         resize_antialias=False,
     )
     assert native_export["native-export"]["map50"] == pytest.approx(0.995)
+
+    wrapper_metrics = validation.validate_detection_wrappers(
+        {"bw8": tmp_path / "model-bw8.onnx", "c24": tmp_path / "model-c24.onnx"},
+        data_yaml,
+        class_count=1,
+        image_size=4,
+        batch_size=1,
+        reference_predictions=native_predictions,
+    )
+    assert wrapper_metrics["bw8_native_export_agreement50"] == pytest.approx(1.0)
+    assert wrapper_metrics["c24_native_export_agreement50"] == pytest.approx(1.0)
+
+
+def test_variant_agreement_ignores_identical_zero_area_candidates() -> None:
+    boxes = np.asarray([[[0.1, 0.1, 0.1, 0.2], [0.1, 0.1, 0.4, 0.4]]], dtype=np.float32)
+    scores = np.asarray([[0.9, 0.8]], dtype=np.float32)
+    class_ids = np.asarray([[0, 0]], dtype=np.int64)
+
+    metrics = validation._variant_agreement(
+        [(boxes[0], scores[0], class_ids[0])],
+        [(boxes[0].copy(), scores[0].copy(), class_ids[0].copy())],
+        prefix="bw8_c24",
+        confidence=0.0,
+        iou_threshold=0.5,
+        np=np,
+    )
+
+    assert metrics["bw8_c24_agreement50"] == 1.0
+    assert metrics["bw8_c24_matched_predictions50"] == 1
+    assert metrics["bw8_c24_score_mae"] == 0.0
 
 
 def test_label_path_uses_the_dataset_images_component() -> None:

@@ -219,7 +219,7 @@ def validate_detection_native_export(
     pixel_scale: float,
     resize_mode: str,
     resize_antialias: bool,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], list[tuple[Any, Any, Any]]]:
     """Evaluate the standardized exported detection core with native input."""
     if resize_mode not in {"stretch", "letterbox"}:
         raise ValueError("native-export resize_mode must be stretch or letterbox")
@@ -280,12 +280,12 @@ def validate_detection_native_export(
         iou_threshold=0.5,
         np=np,
     )
-    return {
+    return ({
         "native-export": {
             key.removeprefix("native_export_"): value
             for key, value in metrics.items()
         }
-    }
+    }, predictions)
 
 
 def _native_detection_image(
@@ -356,6 +356,7 @@ def validate_detection_wrappers(
     batch_size: int | None,
     confidence: float = 0.0,
     iou_threshold: float = 0.5,
+    reference_predictions: list[tuple[Any, Any, Any]] | None = None,
 ) -> dict[str, Any]:
     """Evaluate standardized detection wrappers on the YOLO validation split.
 
@@ -411,10 +412,28 @@ def validate_detection_wrappers(
     result.update(_variant_agreement(
         predictions_by_variant["bw8"],
         predictions_by_variant["c24"],
+        prefix="bw8_c24",
         confidence=confidence,
         iou_threshold=iou_threshold,
         np=np,
     ))
+    if reference_predictions is not None:
+        result.update(_variant_agreement(
+            predictions_by_variant["bw8"],
+            reference_predictions,
+            prefix="bw8_native_export",
+            confidence=confidence,
+            iou_threshold=iou_threshold,
+            np=np,
+        ))
+        result.update(_variant_agreement(
+            predictions_by_variant["c24"],
+            reference_predictions,
+            prefix="c24_native_export",
+            confidence=confidence,
+            iou_threshold=iou_threshold,
+            np=np,
+        ))
     return result
 
 
@@ -670,45 +689,94 @@ def _variant_agreement(
     first: list[tuple[Any, Any, Any]],
     second: list[tuple[Any, Any, Any]],
     *,
+    prefix: str,
     confidence: float,
     iou_threshold: float,
     np: Any,
 ) -> dict[str, Any]:
+    if len(first) != len(second):
+        raise ValueError("variant agreement requires predictions for the same images")
     matched = total = 0
     score_error: list[float] = []
     for (first_boxes, first_scores, first_ids), (second_boxes, second_scores, second_ids) in zip(first, second):
-        left = [
-            (tuple(float(value) for value in box), float(score), int(class_id))
-            for box, score, class_id in zip(first_boxes, first_scores, first_ids)
-            if float(score) > confidence
-        ]
-        right = [
-            (tuple(float(value) for value in box), float(score), int(class_id))
-            for box, score, class_id in zip(second_boxes, second_scores, second_ids)
-            if float(score) > confidence
-        ]
-        used: set[int] = set()
+        left = _valid_detection_candidates(first_boxes, first_scores, first_ids, confidence=confidence, np=np)
+        right = _valid_detection_candidates(second_boxes, second_scores, second_ids, confidence=confidence, np=np)
         total += max(len(left), len(right))
-        for box, score, class_id in left:
-            candidates = [
-                (index, _iou(box, other_box))
-                for index, (other_box, other_score, other_class_id) in enumerate(right)
-                if index not in used and other_class_id == class_id
-            ]
-            if not candidates:
-                continue
-            index, overlap = max(candidates, key=lambda value: value[1])
-            if overlap >= iou_threshold:
-                used.add(index)
-                matched += 1
-                score_error.append(abs(score - right[index][1]))
+        pairs = _maximum_iou_matching(left, right, iou_threshold)
+        matched += len(pairs)
+        score_error.extend(abs(left[left_index][1] - right[right_index][1]) for left_index, right_index in pairs)
     agreement = 1.0 if total == 0 else matched / total
     return {
-        "bw8_c24_agreement50": agreement,
-        "bw8_c24_agreement": agreement,
-        "bw8_c24_score_mae": float(np.mean(score_error)) if score_error else 0.0,
-        "bw8_c24_matched_predictions50": matched,
+        f"{prefix}_agreement50": agreement,
+        f"{prefix}_agreement": agreement,
+        f"{prefix}_score_mae": float(np.mean(score_error)) if score_error else 0.0,
+        f"{prefix}_matched_predictions50": matched,
     }
+
+
+def _valid_detection_candidates(
+    boxes: Any,
+    scores: Any,
+    class_ids: Any,
+    *,
+    confidence: float,
+    np: Any,
+) -> list[tuple[tuple[float, float, float, float], float, int]]:
+    candidates: list[tuple[tuple[float, float, float, float], float, int]] = []
+    for box, score, class_id in zip(boxes, scores, class_ids):
+        score = float(score)
+        coordinates = tuple(float(value) for value in box)
+        class_id = int(class_id)
+        if (
+            not np.isfinite(score)
+            or score <= confidence
+            or len(coordinates) != 4
+            or not np.isfinite(np.asarray(coordinates, dtype=np.float32)).all()
+            or any(value < 0.0 or value > 1.0 for value in coordinates)
+            or coordinates[2] <= coordinates[0]
+            or coordinates[3] <= coordinates[1]
+            or class_id < 0
+        ):
+            continue
+        candidates.append((coordinates, score, class_id))
+    return candidates
+
+
+def _maximum_iou_matching(
+    first: list[tuple[tuple[float, float, float, float], float, int]],
+    second: list[tuple[tuple[float, float, float, float], float, int]],
+    iou_threshold: float,
+) -> list[tuple[int, int]]:
+    edges: dict[int, list[tuple[int, float]]] = {}
+    for first_index, (first_box, _, first_class_id) in enumerate(first):
+        candidates: list[tuple[int, float]] = []
+        for second_index, (second_box, _, second_class_id) in enumerate(second):
+            if first_class_id != second_class_id:
+                continue
+            overlap = _iou(first_box, second_box)
+            if overlap >= iou_threshold:
+                candidates.append((second_index, overlap))
+        edges[first_index] = sorted(
+            candidates,
+            key=lambda value: (-value[1], value[0]),
+        )
+
+    second_to_first: dict[int, int] = {}
+
+    def augment(first_index: int, visited: set[int]) -> bool:
+        for second_index, _ in edges[first_index]:
+            if second_index in visited:
+                continue
+            visited.add(second_index)
+            previous = second_to_first.get(second_index)
+            if previous is None or augment(previous, visited):
+                second_to_first[second_index] = first_index
+                return True
+        return False
+
+    for first_index in sorted(edges, key=lambda index: (len(edges[index]), index)):
+        augment(first_index, set())
+    return sorted((first_index, second_index) for second_index, first_index in second_to_first.items())
 
 
 def _iou(first: tuple[float, float, float, float], second: tuple[float, float, float, float]) -> float:

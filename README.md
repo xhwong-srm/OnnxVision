@@ -85,9 +85,11 @@ mAP50, mAP50-95, precision, recall, F1, and IoU metrics. The top-level
 `bw8_c24_*` fields compare the two wrapped variants directly. For detection,
 `bw8_c24_agreement50` and its current alias `bw8_c24_agreement` are matched
 BW8/C24 predictions divided by the larger prediction count per image, where
-class IDs must match and IoU must be at least 0.5. `bw8_c24_score_mae` is the
-mean absolute confidence-score difference for those matched pairs only; it is
-not compared with the native checkpoint or `native-export` core.
+zero-area, non-finite, and below-confidence candidates are excluded, class IDs
+must match, and IoU must be at least 0.5. `bw8_c24_score_mae` is the mean
+absolute confidence-score difference for those matched pairs only. The report
+also includes `bw8_native_export_*` and `c24_native_export_*` fields, using the
+same matching rules against the `native-export` core.
 The export command saves its complete JSON result beside the requested output
 using the same stem (`model.onnx` produces `model.json`) and logs that path
 instead of printing the result.
