@@ -356,6 +356,7 @@ def validate_detection_wrappers(
     batch_size: int | None,
     confidence: float = 0.0,
     iou_threshold: float = 0.5,
+    deployment_confidence: float = 0.5,
     reference_predictions: list[tuple[Any, Any, Any]] | None = None,
 ) -> dict[str, Any]:
     """Evaluate standardized detection wrappers on the YOLO validation split.
@@ -368,6 +369,8 @@ def validate_detection_wrappers(
         raise ValueError("confidence must be in [0, 1)")
     if not 0.0 < iou_threshold <= 1.0:
         raise ValueError("iou_threshold must be in (0, 1]")
+    if not 0.0 <= deployment_confidence < 1.0:
+        raise ValueError("deployment_confidence must be in [0, 1)")
 
     np = optional_import("numpy")
     ort = optional_import("onnxruntime")
@@ -409,31 +412,39 @@ def validate_detection_wrappers(
             for key, value in metrics.items()
         }
 
-    result.update(_variant_agreement(
+    result["agreement_raw_confidence"] = confidence
+    result["agreement_deployment_confidence"] = deployment_confidence
+    _add_agreement_metrics(
+        result,
         predictions_by_variant["bw8"],
         predictions_by_variant["c24"],
         prefix="bw8_c24",
         confidence=confidence,
+        deployment_confidence=deployment_confidence,
         iou_threshold=iou_threshold,
         np=np,
-    ))
+    )
     if reference_predictions is not None:
-        result.update(_variant_agreement(
+        _add_agreement_metrics(
+            result,
             predictions_by_variant["bw8"],
             reference_predictions,
             prefix="bw8_native_export",
             confidence=confidence,
+            deployment_confidence=deployment_confidence,
             iou_threshold=iou_threshold,
             np=np,
-        ))
-        result.update(_variant_agreement(
+        )
+        _add_agreement_metrics(
+            result,
             predictions_by_variant["c24"],
             reference_predictions,
             prefix="c24_native_export",
             confidence=confidence,
+            deployment_confidence=deployment_confidence,
             iou_threshold=iou_threshold,
             np=np,
-        ))
+        )
     return result
 
 
@@ -683,6 +694,38 @@ def _best_match(box: tuple[float, float, float, float], expected: list[tuple[flo
         if overlap > best_iou:
             best_index, best_iou = index, overlap
     return best_index, best_iou
+
+
+def _add_agreement_metrics(
+    result: dict[str, Any],
+    first: list[tuple[Any, Any, Any]],
+    second: list[tuple[Any, Any, Any]],
+    *,
+    prefix: str,
+    confidence: float,
+    deployment_confidence: float,
+    iou_threshold: float,
+    np: Any,
+) -> None:
+    raw_prefix = f"{prefix}_raw"
+    result.update(_variant_agreement(
+        first,
+        second,
+        prefix=raw_prefix,
+        confidence=confidence,
+        iou_threshold=iou_threshold,
+        np=np,
+    ))
+    for suffix in ("agreement50", "agreement", "score_mae", "matched_predictions50"):
+        result[f"{prefix}_{suffix}"] = result[f"{raw_prefix}_{suffix}"]
+    result.update(_variant_agreement(
+        first,
+        second,
+        prefix=f"{prefix}_deployment",
+        confidence=deployment_confidence,
+        iou_threshold=iou_threshold,
+        np=np,
+    ))
 
 
 def _variant_agreement(

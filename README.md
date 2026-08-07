@@ -88,8 +88,11 @@ BW8/C24 predictions divided by the larger prediction count per image, where
 zero-area, non-finite, and below-confidence candidates are excluded, class IDs
 must match, and IoU must be at least 0.5. `bw8_c24_score_mae` is the mean
 absolute confidence-score difference for those matched pairs only. The report
-also includes `bw8_native_export_*` and `c24_native_export_*` fields, using the
-same matching rules against the `native-export` core.
+also includes explicit `_raw_*` agreement fields with score threshold `0` and
+`_deployment_*` fields with score threshold `0.5`, matching the ONNX consumer's
+default detection threshold. This applies to both `bw8_c24_*` and the
+`bw8_native_export_*`/`c24_native_export_*` comparisons; the unsuffixed fields
+remain aliases of the raw agreement.
 The export command saves its complete JSON result beside the requested output
 using the same stem (`model.onnx` produces `model.json`) and logs that path
 instead of printing the result.
