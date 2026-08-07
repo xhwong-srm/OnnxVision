@@ -41,6 +41,20 @@ _DEFAULT_MEAN = (0.485, 0.456, 0.406)
 _DEFAULT_STD = (0.229, 0.224, 0.225)
 
 
+class AlbumentationsAugmentation:
+    """Pickleable ImageFolder transform for Windows DataLoader workers."""
+
+    def __init__(self, pipeline):
+        self.pipeline = pipeline
+
+    def __call__(self, image):
+        numpy = optional_import("numpy")
+        if hasattr(image, "convert"):
+            image = image.convert("RGB")
+        result = self.pipeline(image=numpy.asarray(image))["image"]
+        return Image.fromarray(numpy.ascontiguousarray(result))
+
+
 def _positive_int_option(options: dict[str, Any], name: str, default: int) -> int:
     value = options.get(name, default)
     if isinstance(value, bool):
@@ -82,7 +96,6 @@ class TimmClassificationBackend:
         if policy not in {"standard", "robust"}:
             raise ValueError(f"unsupported augmentation policy: {policy}")
         albumentations = optional_import("albumentations")
-        numpy = optional_import("numpy")
         operations = [
             albumentations.HorizontalFlip(p=0.5),
             albumentations.Rotate(limit=5, p=0.5),
@@ -103,15 +116,7 @@ class TimmClassificationBackend:
                 ),
             ])
         pipeline = albumentations.Compose(operations)
-
-        def transform(image):
-            if hasattr(image, "convert"):
-                image = image.convert("RGB")
-            array = numpy.asarray(image)
-            result = pipeline(image=array)["image"]
-            return Image.fromarray(numpy.ascontiguousarray(result))
-
-        return transform
+        return AlbumentationsAugmentation(pipeline)
 
     @staticmethod
     def _datasets(
