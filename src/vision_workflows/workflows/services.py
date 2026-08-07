@@ -126,7 +126,7 @@ class TrainService:
 class ExportService:
     def run(self, request: ExportRequest) -> ExportResult:
         handler, resolved, config = _resolve(request, Operation.EXPORT)
-        store = RunStore(request.output.parent / ".seal-runs")
+        store = RunStore(request.output.parent / ".runs")
         context, run_id = store.start("export", config, device=resolved.device)
         try:
             execution = handler.execute(resolved, context)
@@ -151,7 +151,7 @@ class ExportService:
 class ValidationService:
     def run(self, request: ValidateRequest) -> ValidationResult:
         handler, resolved, config = _resolve(request, Operation.VALIDATE)
-        store = RunStore(request.target.parent / ".seal-runs")
+        store = RunStore(request.target.parent / ".runs")
         context, run_id = store.start("validate", config, device=resolved.device)
         try:
             execution = handler.execute(resolved, context)
@@ -168,7 +168,7 @@ class ValidationService:
 class TestService:
     def run(self, request: TestRequest) -> TestResult:
         handler, resolved, config = _resolve(request, Operation.TEST)
-        store = RunStore(request.target.parent / ".seal-runs")
+        store = RunStore(request.target.parent / ".runs")
         context, run_id = store.start("test", config, device=resolved.device)
         try:
             execution = handler.execute(resolved, context)

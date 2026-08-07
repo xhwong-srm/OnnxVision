@@ -131,8 +131,10 @@ def test_detection_wrappers_report_map_and_variant_agreement(monkeypatch: pytest
         batch_size=1,
     )
 
-    assert metrics["bw8_map50"] == pytest.approx(1.0)
+    assert metrics["bw8_map50"] == pytest.approx(0.995)
+    assert metrics["bw8_map50_95"] == pytest.approx(0.995)
     assert metrics["c24_recall50"] == pytest.approx(1.0)
+    assert metrics["c24_map50_95"] == pytest.approx(0.995)
     assert metrics["bw8_c24_agreement50"] == pytest.approx(1.0)
 
 

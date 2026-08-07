@@ -268,16 +268,12 @@ def _detection_metrics(
     iou_threshold: float,
     np: Any,
 ) -> dict[str, Any]:
-    per_class: list[float] = []
     true_positive = false_positive = false_negative = 0
     matched_ious: list[float] = []
     prediction_count = 0
     for class_id in range(class_count):
-        detections: list[tuple[float, bool, float]] = []
-        ground_truth_count = 0
         for (boxes, scores, ids), expected in zip(predictions, annotations):
             expected_boxes = [box for label, box in expected if label == class_id]
-            ground_truth_count += len(expected_boxes)
             candidates = [
                 (float(score), tuple(float(value) for value in box))
                 for box, score, label in zip(boxes, scores, ids)
@@ -291,22 +287,31 @@ def _detection_metrics(
                 matched = best_index is not None and best_iou >= iou_threshold
                 if matched:
                     used.add(best_index)
-                detections.append((score, matched, best_iou if matched else 0.0))
                 if matched:
                     true_positive += 1
                     matched_ious.append(best_iou)
                 else:
                     false_positive += 1
             false_negative += len(expected_boxes) - len(used)
-        average_precision = _average_precision(detections, ground_truth_count)
-        if average_precision is not None:
-            per_class.append(average_precision)
-
     images = len(predictions)
     precision = true_positive / max(1, true_positive + false_positive)
     recall = true_positive / max(1, true_positive + false_negative)
     return {
-        f"{prefix}_map50": float(np.mean(per_class)) if per_class else 0.0,
+        f"{prefix}_map50": _mean_average_precision_at_iou(
+            predictions,
+            annotations,
+            class_count=class_count,
+            confidence=confidence,
+            np=np,
+            iou_thresholds=[0.5],
+        ),
+        f"{prefix}_map50_95": _mean_average_precision_at_iou(
+            predictions,
+            annotations,
+            class_count=class_count,
+            confidence=confidence,
+            np=np,
+        ),
         f"{prefix}_precision50": precision,
         f"{prefix}_recall50": recall,
         f"{prefix}_f1_50": 2.0 * precision * recall / max(1e-12, precision + recall),
@@ -319,7 +324,73 @@ def _detection_metrics(
     }
 
 
-def _average_precision(detections: list[tuple[float, bool, float]], ground_truth_count: int) -> float | None:
+def _mean_average_precision_at_iou(
+    predictions: list[tuple[Any, Any, Any]],
+    annotations: list[list[tuple[int, tuple[float, float, float, float]]]],
+    *,
+    class_count: int,
+    confidence: float,
+    np: Any,
+    iou_thresholds: Any | None = None,
+) -> float:
+    """Compute the Ultralytics-style mean AP over IoU 0.50:0.95."""
+    average_precisions: list[float] = []
+    thresholds = np.linspace(0.5, 0.95, 10) if iou_thresholds is None else iou_thresholds
+    for iou_threshold in thresholds:
+        per_class: list[float] = []
+        for class_id in range(class_count):
+            detections: list[tuple[float, bool, float]] = []
+            ground_truth_count = 0
+            for (boxes, scores, ids), expected in zip(predictions, annotations):
+                expected_boxes = [box for label, box in expected if label == class_id]
+                ground_truth_count += len(expected_boxes)
+                candidates = [
+                    (float(score), tuple(float(value) for value in box))
+                    for box, score, label in zip(boxes, scores, ids)
+                    if int(label) == class_id and float(score) > confidence
+                ]
+                matched = _matched_prediction_indices(candidates, expected_boxes, float(iou_threshold), np=np)
+                detections.extend(
+                    (score, index in matched, 0.0)
+                    for index, (score, _) in enumerate(candidates)
+                )
+            average_precision = _ultralytics_average_precision(detections, ground_truth_count, np)
+            if average_precision is not None:
+                per_class.append(average_precision)
+        average_precisions.append(float(np.mean(per_class)) if per_class else 0.0)
+    return float(np.mean(average_precisions)) if average_precisions else 0.0
+
+
+def _matched_prediction_indices(
+    candidates: list[tuple[float, tuple[float, float, float, float]]],
+    expected: list[tuple[float, float, float, float]],
+    iou_threshold: float,
+    *,
+    np: Any,
+) -> set[int]:
+    if not candidates or not expected:
+        return set()
+    candidate_boxes = np.asarray([box for _, box in candidates], dtype=np.float32)
+    expected_boxes = np.asarray(expected, dtype=np.float32)
+    left_top = np.maximum(expected_boxes[:, None, :2], candidate_boxes[None, :, :2])
+    right_bottom = np.minimum(expected_boxes[:, None, 2:], candidate_boxes[None, :, 2:])
+    intersection = np.maximum(right_bottom - left_top, 0).prod(axis=2)
+    expected_area = (expected_boxes[:, 2:] - expected_boxes[:, :2]).prod(axis=1)[:, None]
+    candidate_area = (candidate_boxes[:, 2:] - candidate_boxes[:, :2]).prod(axis=1)[None, :]
+    iou = intersection / (expected_area + candidate_area - intersection + np.float32(1e-7))
+    matches = np.asarray(np.nonzero(iou >= iou_threshold)).T
+    if len(matches) > 1:
+        matches = matches[iou[matches[:, 0], matches[:, 1]].argsort()[::-1]]
+        matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
+        matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+    return {int(prediction_index) for _, prediction_index in matches}
+
+
+def _ultralytics_average_precision(
+    detections: list[tuple[float, bool, float]],
+    ground_truth_count: int,
+    np: Any,
+) -> float | None:
     if ground_truth_count == 0:
         return None
     detections.sort(key=lambda value: value[0], reverse=True)
@@ -333,10 +404,13 @@ def _average_precision(detections: list[tuple[float, bool, float]], ground_truth
             false_positive += 1
         precisions.append(true_positive / max(1, true_positive + false_positive))
         recalls.append(true_positive / ground_truth_count)
-    return sum(
-        max((precision for precision, recall in zip(precisions, recalls) if recall >= threshold), default=0.0)
-        for threshold in [index / 100.0 for index in range(101)]
-    ) / 101.0
+    modified_recall = np.asarray([0.0, *recalls, recalls[-1] if recalls else 1.0, 1.0], dtype=float)
+    precision_envelope = np.asarray([1.0, *precisions, 0.0, 0.0], dtype=float)
+    precision_envelope = np.flip(np.maximum.accumulate(np.flip(precision_envelope)))
+    x = np.linspace(0.0, 1.0, 101)
+    interpolated = np.interp(x, modified_recall, precision_envelope)
+    integrate = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    return float(integrate(interpolated, x))
 
 
 def _best_match(box: tuple[float, float, float, float], expected: list[tuple[float, float, float, float]], used: set[int]) -> tuple[int | None, float]:
