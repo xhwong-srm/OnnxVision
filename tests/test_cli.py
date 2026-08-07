@@ -77,6 +77,7 @@ def test_cli_exposes_timm_albumentations_and_optuna_tuning() -> None:
         "--augmentation-backend", "albumentations", "--augmentation-policy", "robust", "--augmentation",
         "--trials", "3", "--learning-rate-min", "0.00001",
         "--learning-rate-max", "0.001", "--label-smoothing-min", "0.01", "--label-smoothing-max", "0.1",
+        "--parallel-trials", "2", "--trial-devices", "cuda:0,cuda:1",
     ]
     args = _parse(argv)
     assert args.augmentation is True
@@ -87,6 +88,8 @@ def test_cli_exposes_timm_albumentations_and_optuna_tuning() -> None:
     assert args.learning_rate_max == 0.001
     assert args.label_smoothing_min == 0.01
     assert args.label_smoothing_max == 0.1
+    assert args.parallel_trials == 2
+    assert args.trial_devices == "cuda:0,cuda:1"
 
 
 def test_cli_can_disable_timm_augmentation() -> None:

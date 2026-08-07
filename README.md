@@ -112,11 +112,18 @@ output. Augmentation settings remain fixed for the whole study. Ultralytics
 `tune` delegates to its native tuning API; LibreYOLO does not advertise tuning
 without a verified provider implementation.
 
+Set `--parallel-trials` to run concurrent timm trials. When it is greater than
+one, the default `auto` device assigns one visible CUDA GPU to each worker and
+uses a local Optuna journal for process-safe coordination. Use
+`--trial-devices cuda:0,cuda:1` to choose the devices explicitly; the list must
+contain at least one device per concurrent trial.
+
 ```powershell
 uv run --extra timm --extra optuna vision-workflows tune `
   --task classification --framework timm `
   --model mobilenetv4_conv_small_050.e3000_r224_in1k `
-  --data data --output runs/timm-tune --trials 20 --patience 5
+  --data data --output runs/timm-tune --trials 20 --epochs 10 --patience 5 `
+  --parallel-trials 2 --trial-devices cuda:0,cuda:1
 ```
 
 ONNX exports are self-describing. Classification artifacts use the

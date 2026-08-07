@@ -13,6 +13,7 @@ from vision_workflows.backends.timm_classification import (
     TimmClassificationBackend,
     _classification_metrics,
     _create_scheduler,
+    _resolve_trial_devices,
 )
 from vision_workflows.workflows.context import WorkflowContext
 
@@ -338,3 +339,24 @@ def test_timm_tune_uses_optuna_trials_and_copies_best_checkpoints(monkeypatch, t
     assert (run_dir / "optuna.json").is_file()
     assert [item.kind for item in execution.artifacts] == ["checkpoint", "checkpoint", "report"]
     assert execution.metrics["completed_trials"] == 2
+
+
+def test_timm_parallel_trial_devices_are_explicit_or_auto_assigned() -> None:
+    assert _resolve_trial_devices(
+        {"device": "auto", "trial_devices": "cuda:0,cuda:1"},
+        2,
+    ) == ("cuda:0", "cuda:1")
+
+    class Cuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def device_count():
+            return 2
+
+    class Torch:
+        cuda = Cuda()
+
+    assert _resolve_trial_devices({"device": "auto"}, 2, Torch()) == ("cuda:0", "cuda:1")

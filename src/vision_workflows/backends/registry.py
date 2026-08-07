@@ -102,6 +102,14 @@ def _timm_tune(_: ModelInfo) -> ParameterSchema:
         _schema(
             ParameterSpec("epochs", int, "number of training epochs per Optuna trial", 10, minimum=1),
             ParameterSpec("patience", int, "early-stopping patience per Optuna trial", 5, minimum=0),
+            ParameterSpec("parallel_trials", int, "number of Optuna trials to run concurrently", 1, minimum=1),
+            ParameterSpec(
+                "trial_devices",
+                str,
+                "comma-separated devices assigned to concurrent Optuna trials",
+                None,
+                allow_none=True,
+            ),
         ),
         search,
     )

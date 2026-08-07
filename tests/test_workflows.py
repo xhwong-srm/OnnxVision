@@ -68,6 +68,8 @@ def test_timm_training_and_tuning_schemas_expose_first_class_integrations() -> N
     assert tune["trials"] == 20
     assert tune["epochs"] == 10
     assert tune["patience"] == 5
+    assert tune["parallel_trials"] == 1
+    assert tune["trial_devices"] is None
     assert tune["label_smoothing_min"] < tune["label_smoothing_max"]
     assert tune["learning_rate_min"] < tune["learning_rate_max"]
     assert tune["weight_decay_min"] < tune["weight_decay_max"]

@@ -3,12 +3,14 @@ from __future__ import annotations
 import io
 import json
 import logging
+import multiprocessing
 import shutil
 import time
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from PIL import Image
 
@@ -224,6 +226,137 @@ def _positive_int_option(options: dict[str, Any], name: str, default: int) -> in
     if result <= 0 or str(value).strip() != str(result):
         raise ValueError(f"{name} must be a positive integer")
     return result
+
+
+def _silent_event(_: str, __: dict[str, Any]) -> None:
+    return None
+
+
+def _create_optuna_study(optuna, study_name: str, storage, seed: int, startup_trials: int):
+    return optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(
+            seed=seed,
+            n_startup_trials=startup_trials,
+        ),
+        pruner=optuna.pruners.MedianPruner(
+            n_startup_trials=startup_trials,
+            n_warmup_steps=1,
+        ),
+        storage=storage,
+        study_name=study_name,
+        load_if_exists=storage is not None,
+    )
+
+
+def _journal_storage(optuna, journal_path: str):
+    return optuna.storages.JournalStorage(
+        optuna.storages.journal.JournalFileBackend(file_path=journal_path)
+    )
+
+
+def _resolve_trial_devices(
+    options: Mapping[str, Any],
+    parallel_trials: int,
+    torch=None,
+) -> tuple[str, ...]:
+    raw_devices = options.get("trial_devices")
+    if raw_devices is not None:
+        devices = tuple(item.strip() for item in str(raw_devices).split(",") if item.strip())
+        if len(devices) < parallel_trials:
+            raise ValueError("trial_devices must list at least one device per parallel trial")
+        return devices[:parallel_trials]
+
+    base_device = str(options.get("device", "auto")).strip()
+    if parallel_trials == 1:
+        return (base_device,)
+    if base_device == "cpu":
+        return ("cpu",) * parallel_trials
+    if base_device in {"auto", "cuda"}:
+        if torch is None:
+            raise ValueError("torch is required to resolve parallel CUDA devices")
+        if not torch.cuda.is_available():
+            if base_device == "auto":
+                return ("cpu",) * parallel_trials
+            raise ValueError("parallel CUDA trials require CUDA to be available")
+        device_count = int(torch.cuda.device_count())
+        if device_count < parallel_trials:
+            raise ValueError(
+                f"parallel_trials={parallel_trials} requires at least {parallel_trials} visible CUDA devices; found {device_count}"
+            )
+        return tuple(f"cuda:{index}" for index in range(parallel_trials))
+    raise ValueError("parallel_trials > 1 requires --trial-devices for an explicit non-CPU device")
+
+
+def _timm_trial_objective(
+    backend,
+    request: ResolvedTuneRequest,
+    root_dir: Path,
+    emit,
+    trial,
+    device: str,
+) -> float:
+    trial_options = dict(request.options)
+    trial_options["learning_rate"] = trial.suggest_float(
+        "learning_rate", float(request.learning_rate_min), float(request.learning_rate_max), log=True
+    )
+    trial_options["weight_decay"] = trial.suggest_float(
+        "weight_decay", float(request.weight_decay_min), float(request.weight_decay_max)
+    )
+    trial_options["label_smoothing"] = trial.suggest_float(
+        "label_smoothing", float(request.label_smoothing_min), float(request.label_smoothing_max)
+    )
+    trial_options["device"] = device
+    trial_dir = root_dir / f"trial-{trial.number:04d}"
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    trial.set_user_attr("run_dir", str(trial_dir))
+    trial.set_user_attr("device", device)
+    trial_request = ResolvedTrainRequest(
+        request.selection,
+        request.model,
+        request.data,
+        trial_dir,
+        None,
+        False,
+        False,
+        trial_options,
+    )
+    trial_context = WorkflowContext(trial_dir, emit, device)
+    execution = backend._train(trial_request, trial_context, trial)
+    return float(execution.metrics["best_val_accuracy"])
+
+
+def _run_timm_optuna_worker(
+    request: ResolvedTuneRequest,
+    root_dir: Path,
+    study_name: str,
+    storage: str | None,
+    journal_path: str | None,
+    seed: int,
+    startup_trials: int,
+    trial_count: int,
+    device: str,
+    worker_index: int,
+) -> list[int]:
+    optuna = optional_import("optuna")
+    study_storage = _journal_storage(optuna, journal_path) if journal_path is not None else storage
+    study = _create_optuna_study(
+        optuna,
+        study_name,
+        study_storage,
+        seed + worker_index,
+        startup_trials,
+    )
+    completed_trials: list[int] = []
+    backend = TimmClassificationBackend()
+
+    def objective(trial):
+        score = _timm_trial_objective(backend, request, root_dir, _silent_event, trial, device)
+        completed_trials.append(trial.number)
+        return score
+
+    study.optimize(objective, n_trials=trial_count)
+    return completed_trials
 
 
 @dataclass(frozen=True)
@@ -668,6 +801,7 @@ class TimmClassificationBackend:
         weight_decay_max = float(request.weight_decay_max)
         label_smoothing_min = float(request.label_smoothing_min)
         label_smoothing_max = float(request.label_smoothing_max)
+        parallel_trials = _positive_int_option(dict(request.options), "parallel_trials", 1)
         if not 0.0 < learning_rate_min < learning_rate_max:
             raise ValueError("learning_rate_min must be less than learning_rate_max and greater than zero")
         if not 0.0 <= weight_decay_min < weight_decay_max:
@@ -676,57 +810,83 @@ class TimmClassificationBackend:
             raise ValueError("label_smoothing_min must be less than label_smoothing_max and both must be between 0 and 1")
 
         startup_trials = min(5, max(1, int(request.trials) // 4))
-        sampler = optuna.samplers.TPESampler(
-            seed=int(request.seed),
-            n_startup_trials=startup_trials,
-        )
-        study = optuna.create_study(
-            direction="maximize",
-            sampler=sampler,
-            pruner=optuna.pruners.MedianPruner(
-                n_startup_trials=startup_trials,
-                n_warmup_steps=1,
-            ),
-            storage=request.storage,
-            study_name=request.study_name,
-            load_if_exists=request.storage is not None,
+        options = dict(request.options)
+        torch = optional_import("torch") if parallel_trials > 1 and options.get("trial_devices") is None else None
+        trial_devices = _resolve_trial_devices(options, parallel_trials, torch)
+        storage = request.storage
+        journal_path = None
+        if parallel_trials > 1 and storage is None:
+            journal_path = context.run_dir / ".optuna-journal.log"
+            storage = _journal_storage(optuna, str(journal_path))
+        study = _create_optuna_study(
+            optuna,
+            request.study_name,
+            storage,
+            int(request.seed),
+            startup_trials,
         )
         current_trials = []
+        completed_trial_numbers: list[int] = []
 
-        def objective(trial):
-            trial_options = dict(request.options)
-            trial_options["learning_rate"] = trial.suggest_float(
-                "learning_rate", learning_rate_min, learning_rate_max, log=True
-            )
-            trial_options["weight_decay"] = trial.suggest_float(
-                "weight_decay", weight_decay_min, weight_decay_max
-            )
-            trial_options["label_smoothing"] = trial.suggest_float(
-                "label_smoothing", label_smoothing_min, label_smoothing_max
-            )
-            trial_dir = context.run_dir / f"trial-{trial.number:04d}"
-            trial_dir.mkdir(parents=True, exist_ok=True)
-            trial_request = ResolvedTrainRequest(
-                request.selection,
-                request.model,
-                request.data,
-                trial_dir,
-                None,
-                False,
-                False,
-                trial_options,
-            )
-            trial_context = WorkflowContext(trial_dir, context.emit, context.device)
-            execution = self._train(trial_request, trial_context, trial)
-            score = float(execution.metrics["best_val_accuracy"])
-            trial.set_user_attr("run_dir", str(trial_dir))
-            current_trials.append(trial)
-            return score
+        if parallel_trials == 1:
+            def objective(trial):
+                score = _timm_trial_objective(
+                    self,
+                    request,
+                    context.run_dir,
+                    context.emit,
+                    trial,
+                    trial_devices[0],
+                )
+                current_trials.append(trial)
+                return score
 
-        study.optimize(objective, n_trials=int(request.trials))
-        if not current_trials:
+            study.optimize(objective, n_trials=int(request.trials))
+            candidate_trials = current_trials
+        else:
+            trial_counts = []
+            base_count, remainder = divmod(int(request.trials), parallel_trials)
+            for worker_index in range(parallel_trials):
+                trial_counts.append(base_count + (1 if worker_index < remainder else 0))
+            worker_arguments = [
+                (
+                    request,
+                    context.run_dir,
+                    request.study_name,
+                    request.storage,
+                    str(journal_path) if journal_path is not None else None,
+                    int(request.seed),
+                    startup_trials,
+                    trial_count,
+                    trial_devices[worker_index],
+                    worker_index,
+                )
+                for worker_index, trial_count in enumerate(trial_counts)
+                if trial_count > 0
+            ]
+            with ProcessPoolExecutor(
+                max_workers=parallel_trials,
+                mp_context=multiprocessing.get_context("spawn"),
+            ) as executor:
+                futures = [executor.submit(_run_timm_optuna_worker, *arguments) for arguments in worker_arguments]
+                for future in futures:
+                    completed_trial_numbers.extend(future.result())
+            study = _create_optuna_study(
+                optuna,
+                request.study_name,
+                storage,
+                int(request.seed),
+                startup_trials,
+            )
+            candidate_trials = [
+                trial
+                for trial in study.trials
+                if trial.number in completed_trial_numbers and trial.value is not None
+            ]
+
+        if not candidate_trials:
             raise ValueError("Optuna completed no trials")
-        best_trial = max(current_trials, key=lambda item: item.value)
+        best_trial = max(candidate_trials, key=lambda item: item.value)
         best_dir = Path(best_trial.user_attrs["run_dir"])
         for name in ("best.pt", "last.pt"):
             source = require_file(best_dir / name, f"Optuna trial {name}")
