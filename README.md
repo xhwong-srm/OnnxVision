@@ -82,10 +82,21 @@ uv run --extra timm --extra albumentations vision-workflows train `
 
 Use `--no-augmentation` to disable random transforms. The robust policy adds
 moderate brightness/contrast, gamma, sensor-noise, and blur variation while
-keeping small flips and rotations. Resize, tensor conversion, and
-normalization are always applied as common preprocessing. Validation and
-evaluation never apply random augmentation. Ultralytics and LibreYOLO retain
-their provider-native augmentation controls.
+keeping small flips and rotations. Resize is common preprocessing before
+random training augmentation; tensor conversion and normalization follow the
+augmentation. Validation and evaluation never apply random augmentation. For
+timm classification, `--cache disk` or `--cache ram` caches
+the resized RGB training images before augmentation; `--cache disk` is the
+safer choice for larger datasets. The cache is keyed by image size and
+source-file metadata and is rebuilt when the sources change. Ultralytics and
+LibreYOLO retain their provider-native augmentation controls.
+
+```powershell
+uv run --extra timm vision-workflows train `
+  --task classification --framework timm `
+  --model mobilenetv4_conv_small_050.e3000_r224_in1k `
+  --data data --output runs/timm-cached --cache disk --workers 4
+```
 
 Optuna tuning is a first-class timm classification operation. It searches
 learning rate and weight decay, reports validation accuracy each validation

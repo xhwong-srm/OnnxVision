@@ -57,7 +57,7 @@ def test_cli_exposes_timm_loader_and_amp_options() -> None:
     argv = [
         "train", "--task", "classification", "--framework", "timm",
         "--model", "mobilenetv4_conv_small_050.e3000_r224_in1k", "--data", "data", "--output", "run",
-        "--workers", "4", "--prefetch-factor", "3", "--persistent-workers",
+        "--workers", "4", "--prefetch-factor", "3", "--persistent-workers", "--cache", "disk",
         "--pin-memory", "--amp", "--amp-dtype", "bfloat16",
     ]
     args = _parse(argv)
@@ -66,6 +66,7 @@ def test_cli_exposes_timm_loader_and_amp_options() -> None:
     assert args.pin_memory is True
     assert args.amp is True
     assert args.amp_dtype == "bfloat16"
+    assert args.cache == "disk"
 
 
 def test_cli_exposes_timm_albumentations_and_optuna_tuning() -> None:

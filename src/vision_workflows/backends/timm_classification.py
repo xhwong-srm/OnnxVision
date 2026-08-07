@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import shutil
 import time
@@ -53,6 +54,100 @@ class AlbumentationsAugmentation:
             image = image.convert("RGB")
         result = self.pipeline(image=numpy.asarray(image))["image"]
         return Image.fromarray(numpy.ascontiguousarray(result))
+
+
+class ResizedImageLoader:
+    """Pickleable ImageFolder loader backed by resized RAM or disk images."""
+
+    _MANIFEST_VERSION = 1
+
+    def __init__(self, mode: str, cache_dir: Path | None, image_size: int, resize):
+        if mode not in {"ram", "disk"}:
+            raise ValueError(f"unsupported resized image cache mode: {mode}")
+        if mode == "disk" and cache_dir is None:
+            raise ValueError("disk resized image cache requires a cache directory")
+        self.mode = mode
+        self.cache_dir = cache_dir
+        self.image_size = image_size
+        self.resize = resize
+        self._paths: tuple[str, ...] = ()
+        self._indices: dict[str, int] = {}
+        self._ram_images: tuple[Image.Image, ...] = ()
+        self._disk_images: tuple[Path, ...] = ()
+
+    @staticmethod
+    def _resolved(path: str | Path) -> str:
+        return str(Path(path).expanduser().resolve())
+
+    @staticmethod
+    def _source_info(paths: tuple[str, ...]) -> list[dict[str, Any]]:
+        return [
+            {
+                "path": path,
+                "size": Path(path).stat().st_size,
+                "mtime_ns": Path(path).stat().st_mtime_ns,
+            }
+            for path in paths
+        ]
+
+    def _read_resized(self, path: str) -> Image.Image:
+        with Image.open(path) as image:
+            return self.resize(image.convert("RGB"))
+
+    def prepare(self, paths: tuple[str, ...]) -> None:
+        self._paths = tuple(self._resolved(path) for path in paths)
+        self._indices = {path: index for index, path in enumerate(self._paths)}
+        if self.mode == "ram":
+            started = time.perf_counter()
+            self._ram_images = tuple(self._read_resized(path) for path in self._paths)
+            logger.info(
+                "Prepared resized RAM image cache: images=%d size=%d build_seconds=%.1f",
+                len(self._ram_images),
+                self._ram_bytes(),
+                time.perf_counter() - started,
+            )
+            return
+
+        assert self.cache_dir is not None
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = self.cache_dir / "manifest.json"
+        manifest = {
+            "version": self._MANIFEST_VERSION,
+            "image_size": self.image_size,
+            "sources": self._source_info(self._paths),
+        }
+        self._disk_images = tuple(self.cache_dir / f"{index:06d}.npy" for index in range(len(self._paths)))
+        cached = False
+        try:
+            cached = json.loads(manifest_path.read_text(encoding="utf-8")) == manifest and all(path.is_file() for path in self._disk_images)
+        except (OSError, json.JSONDecodeError):
+            cached = False
+        started = time.perf_counter()
+        if not cached:
+            numpy = optional_import("numpy")
+            for target, source in zip(self._disk_images, self._paths):
+                numpy.save(target, numpy.asarray(self._read_resized(source), dtype=numpy.uint8))
+            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        logger.info(
+            "Prepared resized disk image cache: images=%d bytes=%d cached=%s build_seconds=%.1f path=%s",
+            len(self._disk_images),
+            sum(path.stat().st_size for path in self._disk_images),
+            cached,
+            time.perf_counter() - started,
+            self.cache_dir,
+        )
+
+    def _ram_bytes(self) -> int:
+        return sum(image.width * image.height * len(image.getbands()) for image in self._ram_images)
+
+    def __call__(self, path: str) -> Image.Image:
+        index = self._indices.get(self._resolved(path))
+        if index is None:
+            raise KeyError(f"image is not present in resized cache: {path}")
+        if self.mode == "ram":
+            return self._ram_images[index]
+        numpy = optional_import("numpy")
+        return Image.fromarray(numpy.load(self._disk_images[index], allow_pickle=False))
 
 
 def _positive_int_option(options: dict[str, Any], name: str, default: int) -> int:
@@ -128,17 +223,27 @@ class TimmClassificationBackend:
         augmentation_enabled: bool = True,
         augmentation_backend: str = "torchvision",
         augmentation_policy: str = "standard",
+        cache_mode: str = "none",
     ):
-        _, torch, torchvision = TimmClassificationBackend._imports()
+        _, _, torchvision = TimmClassificationBackend._imports()
         if augmentation_backend not in {"torchvision", "albumentations"}:
             raise ValueError(f"unsupported augmentation backend: {augmentation_backend}")
         if augmentation_policy not in {"standard", "robust"}:
             raise ValueError(f"unsupported augmentation policy: {augmentation_policy}")
+        if cache_mode not in {"none", "ram", "disk"}:
+            raise ValueError(f"unsupported resized image cache mode: {cache_mode}")
+        if not train and cache_mode != "none":
+            raise ValueError("resized image caching is only supported for training")
         transforms = torchvision.transforms
-        operations = [transforms.Resize((image_size, image_size))]
+        resize = transforms.Resize((image_size, image_size))
+        cache_loader = None
+        if train and cache_mode != "none":
+            cache_dir = data / ".vision_workflows_cache" / "timm_classification" / f"size-{image_size}" / "train"
+            cache_loader = ResizedImageLoader(cache_mode, cache_dir if cache_mode == "disk" else None, image_size, resize)
+        operations = [] if cache_loader is not None else [resize]
         if train and augmentation_enabled:
             if augmentation_backend == "albumentations":
-                operations.insert(0, TimmClassificationBackend._albumentations_augmentation(True, True, augmentation_policy))
+                operations.append(TimmClassificationBackend._albumentations_augmentation(True, True, augmentation_policy))
             else:
                 operations.extend([transforms.RandomHorizontalFlip(), transforms.RandomRotation(5)])
                 if augmentation_policy == "robust":
@@ -151,7 +256,13 @@ class TimmClassificationBackend:
         root = data / ("train" if train else "val")
         if not root.is_dir():
             raise FileNotFoundError(f"classification split does not exist: {root}")
-        return torchvision.datasets.ImageFolder(str(root), transform=transform)
+        dataset_options = {"transform": transform}
+        if cache_loader is not None:
+            dataset_options["loader"] = cache_loader
+        dataset = torchvision.datasets.ImageFolder(str(root), **dataset_options)
+        if cache_loader is not None:
+            cache_loader.prepare(tuple(path for path, _ in dataset.samples))
+        return dataset
 
     @staticmethod
     def _dataset_classes(data: Path, torchvision) -> tuple[list[str], list[str]]:
@@ -220,6 +331,7 @@ class TimmClassificationBackend:
         augmentation_enabled = bool(request.options.get("augmentation", True))
         augmentation_backend = str(request.options.get("augmentation_backend", "torchvision"))
         augmentation_policy = str(request.options.get("augmentation_policy", "standard"))
+        cache_mode = str(request.options.get("cache", "none"))
         train_set = self._datasets(
             data,
             image_size,
@@ -229,6 +341,7 @@ class TimmClassificationBackend:
             augmentation_enabled,
             augmentation_backend,
             augmentation_policy,
+            cache_mode,
         )
         val_set = self._datasets(
             data,
@@ -239,8 +352,9 @@ class TimmClassificationBackend:
             False,
             augmentation_backend,
             augmentation_policy,
+            "none",
         )
-        logger.info("Dataset ready: train=%d val=%d classes=%s", len(train_set), len(val_set), ", ".join(train_set.classes))
+        logger.info("Dataset ready: train=%d val=%d classes=%s cache=%s", len(train_set), len(val_set), ", ".join(train_set.classes), cache_mode)
         if request.weights and not request.resume:
             logger.info("Loading custom weights from %s", request.weights)
             checkpoint = torch.load(require_file(request.weights, "weights"), map_location="cpu", weights_only=False)
@@ -378,6 +492,7 @@ class TimmClassificationBackend:
                     "augmentation_enabled": augmentation_enabled,
                     "augmentation_backend": augmentation_backend,
                     "augmentation_policy": augmentation_policy,
+                    "cache_mode": cache_mode,
                 },
                 "epoch": epoch, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(),
                 "metrics": row, "best_accuracy": best_accuracy, "best_epoch": best_epoch,

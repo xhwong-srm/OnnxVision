@@ -3,10 +3,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 torch = pytest.importorskip("torch")
 
-from vision_workflows.backends.timm_classification import TimmClassificationBackend
+from vision_workflows.backends.timm_classification import ResizedImageLoader, TimmClassificationBackend
 from vision_workflows.backends.timm_classification import Execution
 from vision_workflows.workflows.context import WorkflowContext
 
@@ -101,6 +102,92 @@ def test_albumentations_robust_policy_adds_lighting_and_camera_variation(monkeyp
         "GaussNoise",
         "GaussianBlur",
     ]
+
+
+@pytest.mark.parametrize("mode", ["ram", "disk"])
+def test_resized_image_loader_caches_rgb_images(tmp_path, mode) -> None:
+    source = tmp_path / "source.png"
+    Image.new("RGB", (8, 6), (20, 40, 60)).save(source)
+    cache_dir = tmp_path / "cache" if mode == "disk" else None
+    loader = ResizedImageLoader(mode, cache_dir, 4, lambda image: image.resize((4, 4)))
+
+    loader.prepare((str(source),))
+    output = loader(str(source))
+
+    assert output.mode == "RGB"
+    assert output.size == (4, 4)
+    if mode == "disk":
+        assert (cache_dir / "manifest.json").is_file()
+        assert (cache_dir / "000000.npy").is_file()
+
+
+def test_albumentations_runs_after_common_resize(monkeypatch, tmp_path) -> None:
+    operations: list[str] = []
+
+    class Transform:
+        def __init__(self, name):
+            self.name = name
+            operations.append(name)
+
+    class Transforms:
+        Resize = lambda self, size: Transform("Resize")
+        ToTensor = lambda self: Transform("ToTensor")
+        Normalize = lambda self, mean, std: Transform("Normalize")
+        Compose = lambda self, values: values
+
+    root = tmp_path / "train"
+    root.mkdir()
+    dataset = SimpleNamespace(classes=["class"], samples=[])
+    torchvision = SimpleNamespace(
+        transforms=Transforms(),
+        datasets=SimpleNamespace(ImageFolder=lambda path, **kwargs: dataset),
+    )
+    monkeypatch.setattr(
+        TimmClassificationBackend,
+        "_imports",
+        staticmethod(lambda: (object(), torch, torchvision)),
+    )
+    monkeypatch.setattr(
+        TimmClassificationBackend,
+        "_albumentations_augmentation",
+        staticmethod(lambda train, enabled, policy: Transform("Albumentations")),
+    )
+
+    TimmClassificationBackend._datasets(
+        tmp_path,
+        4,
+        True,
+        augmentation_backend="albumentations",
+    )
+
+    assert operations == ["Resize", "Albumentations", "ToTensor", "Normalize"]
+
+
+def test_resized_disk_cache_integrates_with_albumentations(monkeypatch, tmp_path) -> None:
+    torchvision = pytest.importorskip("torchvision")
+    pytest.importorskip("albumentations")
+    data = tmp_path / "data"
+    (data / "train" / "class").mkdir(parents=True)
+    (data / "val" / "class").mkdir(parents=True)
+    Image.new("RGB", (8, 6), (20, 40, 60)).save(data / "train" / "class" / "source.png")
+    Image.new("RGB", (8, 6), (60, 40, 20)).save(data / "val" / "class" / "source.png")
+    monkeypatch.setattr(
+        TimmClassificationBackend,
+        "_imports",
+        staticmethod(lambda: (object(), torch, torchvision)),
+    )
+
+    dataset = TimmClassificationBackend._datasets(
+        data,
+        4,
+        True,
+        augmentation_backend="albumentations",
+        cache_mode="disk",
+    )
+    image, label = dataset[0]
+
+    assert tuple(image.shape) == (3, 4, 4)
+    assert label == 0
 
 
 def test_timm_tune_uses_optuna_trials_and_copies_best_checkpoints(monkeypatch, tmp_path) -> None:

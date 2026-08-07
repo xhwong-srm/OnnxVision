@@ -19,14 +19,17 @@ class RobustTransform:
     def __init__(self, image_size: int):
         import torchvision.transforms as transforms
 
+        self.image_size = image_size
+        self.resize = transforms.Resize((image_size, image_size))
         self.augmentation = TimmClassificationBackend._albumentations_augmentation(True, True, "robust")
         self.preprocessing = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ])
 
     def __call__(self, image):
+        if image.size != (self.image_size, self.image_size):
+            image = self.resize(image)
         return self.preprocessing(self.augmentation(image))
 
 
